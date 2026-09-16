@@ -80,10 +80,13 @@ node src/server.mjs    # :8787   管理台 GET /console
 
 ---
 
-## 欢迎支持
+## 交流与支持
 
-开源维护需要时间。扫码支持一下，谢谢。
+Telegram 群组：[t.me/VM2API](https://t.me/VM2API)（`@VM2API`）
 
+开源维护需要时间。扫码进群或支持一下，谢谢。
+
+<img src="docs/images/tg-vm2api.jpg" alt="Telegram @VM2API" width="220" />
 <img src="docs/images/support-wechat.png" alt="支持收款码" width="220" />
 
 感谢 liunx do 论坛支持。
