@@ -2,7 +2,7 @@
 
 本机或 Linux 主机自建一份 vm2api。推理走 **Rust 内核 + Claude Code**，不走 Go hop。
 
-推荐路径：clone → 写 `/etc/vm2api.env` → 放占位槽 → 装 Release 二进制 → systemd → nginx。
+推荐路径：仓库放到 `/opt/vm2api`，`docker compose up -d --build`。也可以本机 Node + systemd。
 
 先看路线：[技术路线.md](技术路线.md)。打二进制：[BUILD.md](BUILD.md)。仓库总览：[README](../README.md)。
 
@@ -62,7 +62,45 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 
 不要把这些值写进 git。
 
-## 第一次落地
+## Docker Compose
+
+能。控制面用 Compose 起；槽位仍由**宿主机** Docker 引擎创建。这不是把整套推理塞进一个无特权应用容器。
+
+| 在容器里 | 必须在宿主机 |
+|---|---|
+| Node 控制面、`/console`、`/v1` | Docker 引擎、槽位容器、`kin-os/*` 客户镜像 |
+| `docker` CLI（经 `docker.sock`） | Release 二进制目录 `bin/`（挂进去） |
+| `kin-egress` 进程 + iptables（`network_mode: host` + `NET_ADMIN`） | 桥接网卡、透明出口 |
+
+约束：
+
+1. 仓库放在 **`/opt/vm2api`**。槽位 `-v /opt/vm2api/vms/…` 由宿主机 Docker 解释，内外路径必须相同。
+2. `network_mode: host`。远程 SOCKS 出口要在主机网络命名空间里 REDIRECT。
+3. 挂 `/var/run/docker.sock`。这等于给容器宿主机级 Docker 权限。
+4. 先把 `kin-kernel` / `kin-egress` / `kin-worker` 放进 `./bin`（[Release](https://github.com/dofastted/vm2api/releases)）。
+5. 槽位镜像 `kin-os/ubuntu:24.04` 等要已经在宿主机 `docker images` 里。本仓不编这些 OS 镜像。
+
+```bash
+git clone https://github.com/dofastted/vm2api.git /opt/vm2api
+cd /opt/vm2api
+cp .env.example .env
+chmod 600 .env
+# 填写三项密钥
+
+mkdir -p bin
+# 下载 v1.0.0 linux amd64 到 bin/ 后：
+chmod +x bin/kin-kernel bin/kin-egress bin/kin-worker
+
+docker compose up -d --build
+docker compose logs -f
+curl -sS http://127.0.0.1:8787/health
+```
+
+升级控制面：`git pull && docker compose up -d --build`。槽位容器不会因此被 `docker rm`。静态管理台在镜像里，要带上新的 `web/dist` 就重新 `--build`。
+
+Windows / macOS Desktop 能编镜像、能打开 `/console`，但槽位、iptables、透明出口按 Linux 写，生产请用 Ubuntu 24.04。
+
+## 第一次落地（本机 Node）
 
 ```bash
 git clone https://github.com/dofastted/vm2api.git /opt/vm2api

@@ -8,7 +8,7 @@
 
 ## 落地
 
-- **[DEPLOY.md](DEPLOY.md)** — 环境要求、环境变量、占位槽、systemd、nginx、上线清单
+- **[DEPLOY.md](DEPLOY.md)** — Docker Compose、环境变量、占位槽、systemd、nginx
 - **[BUILD.md](BUILD.md)** — `v*` Release、本机构建、`VERSION`、升级
 - 抄本：[deploy/env.example](deploy/env.example) · [deploy/vm2api.service](deploy/vm2api.service)
 

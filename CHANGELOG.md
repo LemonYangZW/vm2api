@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 控制面可用 Docker Compose 部署（`network_mode: host` + `docker.sock`；槽位仍在宿主机引擎）
+
 ## 1.0.0 — 2026-09-16
 
 首个公开版本。

@@ -42,6 +42,8 @@ install -m 755 kin-kernel kin-egress kin-worker /opt/vm2api/bin/
 
 然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。
 
+控制面镜像：`docker compose build`（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 不在此工作流里编。
+
 ## 本机构建
 
 依赖：Node 22、Rust stable、Go 1.25、pnpm 10。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。

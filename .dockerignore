@@ -1,0 +1,17 @@
+.git
+.github
+node_modules
+web/node_modules
+web/dist
+bin
+vms
+data
+.env
+**/*.enc
+**/*.dek
+docs/images
+test
+crates/*/target
+worker/bin
+*.md
+!README.md

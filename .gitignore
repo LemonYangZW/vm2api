@@ -13,6 +13,7 @@ hypervisor/*.env
 **/credentials.json
 **/.env
 **/.env.*
+!.env.example
 *.bak*
 bin/
 .workflow/

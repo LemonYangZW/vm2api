@@ -41,7 +41,29 @@
 | 本机构建 | Rust stable、Go 1.25、pnpm 10 |
 | 网 | 每槽一条出口：远程 SOCKS5，或本地出口 |
 
-### 三步拉起控制面
+### Docker Compose（推荐）
+
+槽位本来就跑在宿主机 Docker 里。控制面也可以进容器：`network_mode: host` + 挂 `docker.sock`，这样它能建槽、改 iptables。仓库请放在 **`/opt/vm2api`**，路径必须和容器内一致。
+
+```bash
+git clone https://github.com/dofastted/vm2api.git /opt/vm2api
+cd /opt/vm2api
+cp .env.example .env
+# 填写 VM2API_API_KEY / VM2API_ADMIN_PASSWORD / VM2API_DB_SECRET
+
+mkdir -p bin
+# 从 https://github.com/dofastted/vm2api/releases 把 linux amd64
+# kin-kernel / kin-egress / kin-worker 放进 bin/ 并 chmod +x
+
+docker compose up -d --build
+curl -sS http://127.0.0.1:8787/health
+```
+
+槽位客户镜像（`kin-os/ubuntu:24.04` 等）要事先存在于**宿主机** Docker。Compose 只编控制面，不编槽位 OS。
+
+完整约束：[DEPLOY.md · Docker](docs/DEPLOY.md#docker-compose)。不要 systemd 的话也可以继续用下面的本机 Node。
+
+### 本机 Node
 
 1. **克隆并安装**
 
@@ -228,6 +250,9 @@ git push origin v1.0.0
 
 6. **密钥写进 git 了怎么办？**  
    立刻轮换 `VM2API_*`、Setup Token、面板密码。不要把密钥贴到 Issue。
+
+7. **Compose 起来了但建不了槽？**  
+   确认仓库在 `/opt/vm2api`、`bin/kin-kernel` 可执行、宿主机有 `kin-os/*` 镜像，并且挂了 `docker.sock`。
 
 ---
 
