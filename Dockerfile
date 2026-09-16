@@ -16,6 +16,7 @@ WORKDIR /opt/vm2api
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY src ./src
+COPY scripts ./scripts
 COPY --from=web /web/dist ./web/dist
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
 RUN chmod +x /usr/local/bin/vm2api-entrypoint \
