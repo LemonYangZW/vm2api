@@ -719,6 +719,7 @@ export async function buildProbeOne({ cfg, accountQuota, id, force = false, usag
       reset_7d: qAfter.reset_7d,
     },
     availability,
+    cred_status: credStatusFromAvailability(availability),
     fable: after?.unified?.fable || result.fable || q.fable || null,
     fable_probed: includeFable && !skipHop,
     account_tier: tier,

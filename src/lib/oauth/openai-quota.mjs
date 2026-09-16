@@ -372,11 +372,17 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
       : null,
     detailCredits,
   )
-  persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits })
+  const persistable =
+    resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
+  persistCodexQuotaSnapshot(projectRoot, vmId, {
+    extra,
+    ...(persistable ? { resetCredits: persistable } : {}),
+  })
   return {
     ok: true,
-    ...publicUsage(extra, resetCredits, pack.usage.payload || {}),
+    ...publicUsage(extra, persistable || resetCredits, pack.usage.payload || {}),
     fetched_at: resetCredits.fetched_at,
+    warning: persistable ? undefined : 'reset_credit_cache_refresh_failed',
   }
 }
 

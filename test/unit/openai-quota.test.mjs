@@ -182,6 +182,22 @@ test('resetOpenaiQuota posts redeem_request_id then re-queries', async () => {
   assert.match(body.redeem_request_id, /^[0-9a-f-]{36}$/i)
 })
 
+test('queryOpenaiQuota rejects Claude slots', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-claude-'))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'vms', 'vm-01.json'),
+    JSON.stringify({ id: 'vm-01', platform: 'anthropic', family: 'claude' }),
+  )
+  const result = await queryOpenaiQuota({
+    projectRoot: root,
+    vmId: 'vm-01',
+    fetchImpl: async () => ({ status: 200, json: async () => ({}) }),
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'not_gpt_slot')
+})
+
 test('persistCodexQuotaSnapshot keeps expiration list', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-snap-'))
   writeGptSlot(root)
