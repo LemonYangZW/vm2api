@@ -78,4 +78,12 @@ node src/server.mjs    # :8787   管理台 GET /console
 
 更多契约：[docs/](docs/README.md)
 
+---
+
+## 欢迎支持
+
+开源维护需要时间。扫码支持一下，谢谢。
+
+<img src="docs/images/support-wechat.png" alt="支持收款码" width="220" />
+
 感谢 liunx do 论坛支持。
