@@ -77,3 +77,5 @@ KIN_API_PROXY=http://127.0.0.1:8787 pnpm -C web dev
 ## 安全
 
 不要提交 OAuth、sessionKey、SOCKS 账密、`credentials.json`、含密钥的 JSON。`KIN_ADMIN_PASSWORD` 未设置则拒绝启动。
+
+感谢liunx do论坛支持
