@@ -1,0 +1,98 @@
+# 版本与构建
+
+源码在 git。ELF 只放 GitHub Release，不进仓库。
+
+## 版本怎么记
+
+| 记号 | 谁写 | 含义 |
+|---|---|---|
+| git tag `v*` | 人打 | 对外版本，触发 Release 工作流 |
+| `package.json` `"version"` | 人改 | npm 展示用，和 tag 对齐 |
+| `VERSION.txt` artifact | `.github/workflows/version.yml` 在 main 推送后 | 当时 `GITHUB_SHA` 前 7 位，给人对照部署，**不会**写回 git |
+
+建议：发版当天把 `package.json` 改成与 tag 相同的 semver，再打 annotated tag。
+
+## 打一个 Release
+
+仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
+
+```bash
+# 工作区干净、已在要发布的 commit 上
+git tag -a v0.1.0 -m "vm2api v0.1.0"
+git push origin v0.1.0
+```
+
+`v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：
+
+| 文件 | 角色 |
+|---|---|
+| `kin-kernel` | Claude Code Rust 内核（推理必带） |
+| `kin-egress` | 远程 SOCKS5 透明网关 |
+| `kin-worker` | **只** `telemetry`，不是 hop |
+| `kin-codex-kernel` | 仓内仍编，公开产品面不走 GPT |
+
+没有 tag、只点 workflow_dispatch 时，产物进 artifact，不会建 Release。
+
+装到机器上：
+
+```bash
+install -m 755 kin-kernel kin-egress kin-worker /opt/vm2api/bin/
+```
+
+然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。
+
+## 本机构建
+
+依赖：Node 22、Rust stable、Go 1.25、pnpm 10。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。
+
+```bash
+npm ci
+pnpm -C web install --frozen-lockfile
+
+npm run build:kernel      # bin/kin-kernel
+npm run build:egress      # bin/kin-egress
+npm run build:web         # web/dist
+npm run build:worker      # bin/kin-worker（telemetry）
+# 可选 npm run build:codex-kernel
+```
+
+对应命令：
+
+```bash
+CGO_ENABLED=0 go build -trimpath -o bin/kin-egress ./worker/cmd/kin-egress
+CGO_ENABLED=0 go build -trimpath -o bin/kin-worker ./worker/cmd/kin-worker
+cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
+cp crates/kin-kernel/target/release/kin-kernel bin/kin-kernel
+pnpm -C web build
+```
+
+`kin-worker` 不带参数会退出（hop 已删）。只要：
+
+```bash
+kin-worker telemetry --config /path/to/worker.json
+```
+
+## 验证
+
+```bash
+npm test                  # unit + worker Go（egress / proxy / config / telemetry）
+npm run test:web          # 要先 pnpm -C web install
+npm run test:kernel
+node --check src/server.mjs
+```
+
+CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、Rust kernel、web 测试和构建。
+
+## 升级一台已部署的机
+
+1. `git pull` 或检出目标 tag。
+2. `npm ci`；有 web 改动则 `pnpm -C web install --frozen-lockfile && npm run build:web`。
+3. 换 Release 二进制或本地重编 `bin/`。
+4. `node --check src/server.mjs`。
+5. `systemctl restart vm2api` **一次**。确认 `/health`。
+
+静态 HTML / `web/dist` 单独更新不必重启。同一轮不要 restart 两次，不要 `stop` 后不拉起。
+
+---
+
+交流与支持见仓库 [README](../README.md#交流与支持)。

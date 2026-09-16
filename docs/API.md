@@ -5,10 +5,10 @@
 ```mermaid
 flowchart LR
   C[客户端] -->|Bearer / x-api-key| N[Node /v1]
-  N -->|Unix socket| W[Go worker]
-  W -->|SOCKS5| A[api.anthropic.com]
-  A -->|SSE| W
-  W -->|SSE / JSON| N
+  N -->|cli-hop| K[Rust kernel / Claude Code]
+  K -->|SOCKS5 或本地出口| A[Console API]
+  A -->|SSE| K
+  K -->|SSE / JSON| N
   N -->|原协议| C
 ```
 

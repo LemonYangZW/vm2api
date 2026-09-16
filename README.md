@@ -74,6 +74,8 @@ export VM2API_API_KEY=... VM2API_ADMIN_PASSWORD=... VM2API_DB_SECRET=...
 node src/server.mjs    # :8787   管理台 GET /console
 ```
 
+自建：[部署说明](docs/DEPLOY.md) · 打二进制 / 打 tag：[版本构建](docs/BUILD.md)
+
 二进制走 GitHub Release，不要把 ELF 提交进 git。不要提交凭证。
 
 更多契约：[docs/](docs/README.md)

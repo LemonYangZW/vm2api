@@ -4,6 +4,11 @@
 
 - **[技术路线](技术路线.md)** — Console API、请求链路、虚拟机、遥测（主路线）
 
+落地：
+
+- **[DEPLOY.md](DEPLOY.md)** — 自建、环境变量、占位槽、systemd、反代
+- **[BUILD.md](BUILD.md)** — 本机构建、`v*` Release、`VERSION.txt`
+
 契约备查：
 
 - [API.md](API.md) — `/v1`
