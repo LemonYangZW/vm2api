@@ -1,16 +1,17 @@
 # 版本与构建
 
-源码在 git。ELF 只放 GitHub Release，不进仓库。
+源码在 git。ELF 只放 GitHub Release，不进仓库。当前发布线：**1.0.0**（tag `v1.0.0`）。
 
 ## 版本怎么记
 
 | 记号 | 谁写 | 含义 |
 |---|---|---|
-| git tag `v*` | 人打 | 对外版本，触发 Release 工作流 |
-| `package.json` `"version"` | 人改 | npm 展示用，和 tag 对齐 |
+| 仓库根 `VERSION` | 人改 | 对外 semver，和 tag 对齐 |
+| git tag `v*` | 人打 | 触发 Release 工作流 |
+| `package.json` `"version"` | 人改 | 和 `VERSION` 相同 |
 | `VERSION.txt` artifact | `.github/workflows/version.yml` 在 main 推送后 | 当时 `GITHUB_SHA` 前 7 位，给人对照部署，**不会**写回 git |
 
-建议：发版当天把 `package.json` 改成与 tag 相同的 semver，再打 annotated tag。
+发版当天三处一起改：`VERSION`、`package.json`、[CHANGELOG.md](../CHANGELOG.md)，再打 annotated tag。
 
 ## 打一个 Release
 
@@ -18,8 +19,8 @@
 
 ```bash
 # 工作区干净、已在要发布的 commit 上
-git tag -a v0.1.0 -m "vm2api v0.1.0"
-git push origin v0.1.0
+git tag -a v1.0.0 -m "vm2api v1.0.0"
+git push origin v1.0.0
 ```
 
 `v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：

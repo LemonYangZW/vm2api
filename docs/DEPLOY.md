@@ -2,7 +2,9 @@
 
 本机或 Linux 主机自建一份 vm2api。推理走 **Rust 内核 + Claude Code**，不走 Go hop。
 
-先看路线：[技术路线.md](技术路线.md)。打二进制：[BUILD.md](BUILD.md)。
+推荐路径：clone → 写 `/etc/vm2api.env` → 放占位槽 → 装 Release 二进制 → systemd → nginx。
+
+先看路线：[技术路线.md](技术路线.md)。打二进制：[BUILD.md](BUILD.md)。仓库总览：[README](../README.md)。
 
 ## 机器要什么
 

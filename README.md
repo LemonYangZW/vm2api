@@ -1,27 +1,113 @@
 # vm2api
 
-**claude2api。** 虚拟机拟真 + Claude Code 原生 subagent，把 Setup Token 做成 Console 可用 API。  
-Claude 看到的是 **Console API**，不是 OAuth。因此 **0 提示词注入**。
+**把 Setup Token 做成 Console 可用 API。**  
+虚拟机拟真 + Claude Code 原生 subagent。Claude 看到的是 **Console API**，不是 OAuth，因此 **0 提示词注入**。
 
-主路线：[技术路线](docs/技术路线.md)
+[![Release](https://img.shields.io/github/v/release/dofastted/vm2api?display_name=tag)](https://github.com/dofastted/vm2api/releases)
+[![License](https://img.shields.io/github/license/dofastted/vm2api)](LICENSE)
+[![Telegram](https://img.shields.io/badge/Telegram-@VM2API-blue?logo=telegram)](https://t.me/VM2API)
+
+控制面清洗协议、调度槽位。推理在虚拟机里走 Claude Code 原生 subagent，再 TCP 打到 Console API。回包原样给调用方。
+
+💬 **加入讨论**：[Telegram @VM2API](https://t.me/VM2API)
+
+主路线图解：[技术路线](docs/技术路线.md) · 自建：[部署说明](docs/DEPLOY.md) · 打二进制：[版本构建](docs/BUILD.md)
+
+> 公开产品面只走 **Rust 内核 + Claude Code**。Go HTTP hop 已删除。远程 SOCKS5 用透明网关；也可以在代理池里加 **本地出口**（宿主机 NAT）。
 
 ---
 
-## 核心：Console API，不是 OAuth
+## 核心能力
+
+- 🪪 **Console API，不是 OAuth**：Setup Token 转成 Console 可用 API，取代 OAuth 换来的 AT / RT。上游按 Console 客户端看待你。
+- 🧼 **0 提示词注入**：不再靠改 system / 注入人设去“像官方”。身份在凭证形态上就已经是 Console。
+- 🧩 **Claude Code 原生 subagent**：槽内官方转发面，最大 **20** 路并发，不用第三方假客户端顶替。
+- 🖥️ **Docker 或真虚拟机**：一槽一台机器。拟真物理机指纹仍在攻克，欢迎方案。
+- 📡 **全量遥测**：目标是 Claude 认为你是一台完全独立的电脑，并且无其余特征。
+- 🌐 **出口可选**：每槽一条远程 SOCKS5，或代理池「添加本地出口」。
+- 🎛️ **管理台**：`GET /console`。环境变量 admin 登录，没有用户管理页。
+- 🔌 **协议口**：`POST /v1/messages`（Anthropic），以及 Chat / Completions / Responses 兼容入口。
+
+---
+
+## 快速开始
+
+### 环境要求
+
+| 项 | 建议 |
+|---|---|
+| OS | Ubuntu 24.04（glibc 够新；Debian 12 上新内核常常起不来） |
+| 运行时 | Node 22、Docker、iptables |
+| 本机构建 | Rust stable、Go 1.25、pnpm 10 |
+| 网 | 每槽一条出口：远程 SOCKS5，或本地出口 |
+
+### 三步拉起控制面
+
+1. **克隆并安装**
+
+   ```bash
+   git clone https://github.com/dofastted/vm2api.git /opt/vm2api
+   cd /opt/vm2api
+   npm ci
+   pnpm -C web install --frozen-lockfile
+   npm run build:web
+   ```
+
+   内核 / 网关：从 [GitHub Release](https://github.com/dofastted/vm2api/releases) 取 linux amd64，或本机 `npm run build:kernel && npm run build:egress`。
+
+2. **写环境变量和占位槽**
+
+   ```bash
+   cp docs/deploy/env.example /etc/vm2api.env
+   chmod 600 /etc/vm2api.env
+   # 必填：VM2API_API_KEY / VM2API_ADMIN_PASSWORD / VM2API_DB_SECRET
+   # 自建请把 KIN_*_BIN 指到 /opt/vm2api/bin/
+
+   mkdir -p vms data bin
+   printf '%s\n' '{ "active_vm": "vm-01" }' > vms/active.json
+   ```
+
+   还要有 `vms/vm-01.json`，抄本见 [部署说明](docs/DEPLOY.md#第一次落地)。没有 `vms/active.json` 进程会退出。
+
+3. **启动**
+
+   ```bash
+   set -a && source /etc/vm2api.env && set +a
+   node src/server.mjs
+   ```
+
+   生产用 systemd：[docs/deploy/vm2api.service](docs/deploy/vm2api.service)。
+
+### 访问
+
+启动成功后：
+
+| 入口 | 地址 |
+|---|---|
+| 探活 | `http://127.0.0.1:8787/health` |
+| 管理台 | `http://127.0.0.1:8787/console`（`VM2API_ADMIN_PASSWORD`） |
+| 协议 | `POST /v1/messages`（master key 或 `sk-vm-…`） |
+
+上线后：代理池绑出口 → 建 Claude 槽 → 导入 Setup Token → 官方初装 → 再打 `/v1`。完整步骤：[DEPLOY.md](docs/DEPLOY.md)。
+
+```bash
+curl -sS http://127.0.0.1:8787/v1/messages \
+  -H "Authorization: Bearer $VM2API_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5","max_tokens":128000,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+---
+
+## 技术路线
 
 ![Console API 取代 OAuth AT/RT，零提示词注入](docs/images/vm2api-01-console-api.png)
-
-独家 Console API。Setup Token 转成 Console 可用 API，**取代** OAuth 换来的 AT / RT。
 
 | 旧路 | 本仓 |
 |------|------|
 | OAuth 拿到 AT / RT，上游按 OAuth 客户端看你 | Setup Token → Console API |
 | 为了像官方，要注人设 / 提示词 | Claude 认为你是 Console API |
 | 提示词注入有泄漏面 | **0 提示词注入** |
-
----
-
-## 技术路线
 
 ![用户请求到 Console API 的六站流水线](docs/images/vm2api-02-route.png)
 
@@ -35,50 +121,113 @@ Claude 看到的是 **Console API**，不是 OAuth。因此 **0 提示词注入*
   → 透明转发给用户
 ```
 
-控制面只做清洗与调度。推理在虚拟机里走 Claude Code 原生 subagent，再 TCP 打到 Console API。回包原样给调用方。
-
----
-
-## 虚拟机槽位
-
 ![Docker / 真虚拟机、物理指纹、20 路原生 subagent](docs/images/vm2api-03-vm-subagent.png)
 
 - 槽位可以是 **Docker**，也可以是 **真虚拟机**
-- 槽内用 **Claude Code 原生 subagent** 转发，最大 **20 并发**
-- **拟真物理机指纹** 仍在攻克。欢迎提供方案
-
----
-
-## 遥测与身份
+- 槽内 **Claude Code 原生 subagent**，最大 **20** 并发
+- **拟真物理机指纹** 仍在攻克。欢迎开 Issue / PR
 
 ![全量遥测，独立电脑，无其余特征](docs/images/vm2api-04-telemetry.png)
 
-遥测全量发送。目标：Claude 认为你是一台 **完全独立的电脑**，并且 **无其余特征**。
+遥测全量发送。一槽一台机器。身份、遥测、指纹都按单机收敛。
+
+展开说明：[docs/技术路线.md](docs/技术路线.md)
 
 ---
 
-## 仓库
+## 架构
 
 ```text
-web/                  Vite 管理台
-src/                  Node 控制面
-crates/kin-kernel     Claude Code Rust 内核
-worker/cmd/kin-egress SOCKS5 透明网关（本地出口不走它）
-docs/                 路线图 + 契约
+客户端 / Claude Code / 兼容 SDK
+        │  Bearer / x-api-key
+        ▼
+Node 控制面  :8787
+  协议清洗 · 调度 · 管理台 /console
+        │  cli-hop
+        ▼
+槽（Docker 或真虚拟机）
+  Rust 内核 + Claude Code 原生 subagent（≤20）
+        │  SOCKS5 或本地出口
+        ▼
+Console API endpoint  →  原样回传给调用方
 ```
 
-```bash
-npm ci && npm test
-npm run build:kernel && npm run build:web
-export VM2API_API_KEY=... VM2API_ADMIN_PASSWORD=... VM2API_DB_SECRET=...
-node src/server.mjs    # :8787   管理台 GET /console
-```
-
-自建：[部署说明](docs/DEPLOY.md) · 打二进制 / 打 tag：[版本构建](docs/BUILD.md)
+| 目录 | 做什么 |
+|---|---|
+| `src/` | Node 控制面、`/v1`、面板 API |
+| `web/` | Vite 管理台，构建后 `GET /console` |
+| `crates/kin-kernel` | Claude Code Rust 内核 |
+| `worker/cmd/kin-egress` | 远程 SOCKS5 透明网关 |
+| `worker/cmd/kin-worker` | **只** telemetry，不是推理 hop |
+| `docs/` | 路线、部署、构建、契约 |
 
 二进制走 GitHub Release，不要把 ELF 提交进 git。不要提交凭证。
 
-更多契约：[docs/](docs/README.md)
+---
+
+## 部署与配置
+
+生产推荐：仓库放到 `/opt/vm2api`，环境变量放 `/etc/vm2api.env`，用 systemd 拉起，前面 nginx 反代 `/v1` `/api` `/console` `/health`。
+
+最少三项，缺 `VM2API_API_KEY` 或面板密码进程起不来：
+
+```bash
+VM2API_API_KEY=         # master key，/v1 + 面板 + /admin
+VM2API_ADMIN_PASSWORD=  # 管理台登录
+VM2API_DB_SECRET=       # 库加密
+```
+
+`VM2API_*` 优先，没有再读 `KIN_*`。完整表和 nginx 抄本：[DEPLOY.md](docs/DEPLOY.md) · [env.example](docs/deploy/env.example)
+
+---
+
+## 版本与构建
+
+当前发布：**v1.0.0**
+
+```bash
+git tag -a v1.0.0 -m "vm2api v1.0.0"
+git push origin v1.0.0
+```
+
+`v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，编 linux amd64：`kin-kernel`、`kin-egress`、`kin-worker`（telemetry）。本机构建与升级步骤：[BUILD.md](docs/BUILD.md)
+
+---
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [技术路线](docs/技术路线.md) | 产品主路线（图） |
+| [DEPLOY.md](docs/DEPLOY.md) | 自建、环境变量、占位槽、systemd、反代 |
+| [BUILD.md](docs/BUILD.md) | 本机构建、Release、升级 |
+| [API.md](docs/API.md) | `/v1` 客户端契约 |
+| [PROTOCOL.md](docs/PROTOCOL.md) | 协议行为 |
+| [PANEL_API.md](docs/PANEL_API.md) | 管理台 API |
+| [OAUTH.md](docs/OAUTH.md) | 导入与换票（主凭证是 Setup Token） |
+| [CHANGELOG.md](CHANGELOG.md) | 版本记录 |
+
+---
+
+## FAQ
+
+1. **进程立刻退出，提示 `VM2API_API_KEY not set` 或读不到 JSON？**  
+   先写 `/etc/vm2api.env`，再准备 `vms/active.json` 和对应槽文件。抄本在 [DEPLOY.md](docs/DEPLOY.md#第一次落地)。
+
+2. **`/console` 是空白或 404？**  
+   先 `npm run build:web`，确认存在 `web/dist`。静态页更新不必重启 Node。
+
+3. **槽建好了但不调度？**  
+   每槽必须绑出口（远程 SOCKS5 或本地出口）。`proxy_required` 为真时没绑代理不会接请求。
+
+4. **Debian 12 上内核起不来？**  
+   优先 Ubuntu 24.04。过旧的 glibc 跑不了当前 wrap / Claude kernel。
+
+5. **还要不要跑 Go hop / `kin-worker` 当推理？**  
+   不要。hop 服务端已删除。`kin-worker` 不带参数会退出，只接受 `telemetry`。
+
+6. **密钥写进 git 了怎么办？**  
+   立刻轮换 `VM2API_*`、Setup Token、面板密码。不要把密钥贴到 Issue。
 
 ---
 
@@ -92,3 +241,17 @@ Telegram 群组：[t.me/VM2API](https://t.me/VM2API)（`@VM2API`）
 <img src="docs/images/support-wechat.png" alt="支持收款码" width="220" />
 
 感谢 liunx do 论坛支持。
+
+欢迎 Issue / PR。提交前请勿带上 `.env`、槽 JSON 里的票、或 Release 二进制。
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=dofastted/vm2api&type=Date)](https://star-history.com/#dofastted/vm2api&Date)
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
+
+vm2api 不是 Anthropic 官方项目，与其无关联。Claude、Claude Code、Anthropic 等均为其权利人的商标。
