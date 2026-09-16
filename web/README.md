@@ -14,7 +14,7 @@ pnpm install
 pnpm dev
 ```
 
-浏览器打开 Vite 提示的地址，路由是 hash：`#/overview`、`#/database`、`#/users`、`#/settings/backup`。
+浏览器打开 Vite 提示的地址，路由是 hash：`#/overview`、`#/database`、`#/settings/backup`。
 
 本地默认把 `/api` 反代到 `https://ccmax20.cc`。换后端：
 

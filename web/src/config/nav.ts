@@ -14,7 +14,6 @@ import {
   ScrollText,
   Settings,
   Shield,
-  Users,
 } from 'lucide-react'
 
 export type ViewId =
@@ -33,7 +32,6 @@ export type ViewId =
   | 'logs'
   | 'database'
   | 'settings'
-  | 'users'
   | 'wrap'
 
 export const VIEW_TITLES: Record<ViewId, string> = {
@@ -52,7 +50,6 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   logs: '日志',
   database: '数据库',
   settings: '设置',
-  users: '用户',
   wrap: 'Wrap 母样本',
 }
 
@@ -77,6 +74,4 @@ export const NAV_ITEMS: {
   { id: 'database', url: '/database', icon: Database },
   { id: 'settings', url: '/settings/sticky', icon: Settings },
   { id: 'wrap', url: '/wrap', icon: Puzzle },
-
-  { id: 'users', url: '/users', icon: Users },
 ]

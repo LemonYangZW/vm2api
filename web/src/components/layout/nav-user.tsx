@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { ChevronsUpDown, LogOut, Settings, Users } from 'lucide-react'
+import { ChevronsUpDown, LogOut, Settings } from 'lucide-react'
 import { getDisplayNameInitials } from '@/lib/utils'
 import useDialogState from '@/hooks/use-dialog-state'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -78,12 +78,6 @@ export function NavUser({ user }: NavUserProps) {
                   <Link to='/settings/$tab' params={{ tab: 'sticky' }}>
                     <Settings />
                     设置
-                  </Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to='/users'>
-                    <Users />
-                    用户
                   </Link>
                 </DropdownMenuItem>
               </DropdownMenuGroup>
