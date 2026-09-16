@@ -1,7 +1,7 @@
 # Control plane only. Slot guests still run on the host Docker engine.
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
-RUN corepack enable
+RUN corepack enable && corepack prepare pnpm@10.18.2 --activate
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
