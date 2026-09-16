@@ -1,81 +1,83 @@
 # vm2api
 
-用虚拟机槽位做拟真转发的订阅转 API 网关。公开仓是干净提取，不含编辑器 / 代理工具链、不含单页 HTML 应急面板、不含内部复盘文档。
+**claude2api。** 虚拟机拟真 + Claude Code 原生 subagent，把 Setup Token 做成 Console 可用 API。  
+Claude 看到的是 **Console API**，不是 OAuth。因此 **0 提示词注入**。
 
-控制面仍叫 KIN（`src/`、`sk-kin-…`、`/api/panel`），避免改协议。对外项目名是 **vm2api**。
+主路线：[技术路线](docs/技术路线.md)
 
-## 仓库里有什么
+---
 
-```text
-web/                  Vite + React 管理台
-src/                  Node 控制面（鉴权、协议、调度、面板）
-crates/kin-kernel/    Claude Rust 内核（cli-hop）
-crates/codex-kernel/  GPT / Codex Rust 内核
-worker/               Go 槽位数据面（HTTP 转发 + refresh）
-api-kernel/           Go API 内核
-docs/                 对外契约
-```
+## 核心：Console API，不是 OAuth
 
-```text
-浏览器 ──► web（Vite）──► Node :8787
-                           ├─ rust  Claude：kin-kernel → 自备 Claude Code（不随仓分发）
-                           ├─ rust  GPT：kin-codex-kernel → ChatGPT
-                           └─ go：kin-worker 经槽 SOCKS5 POST Anthropic
-```
+![Console API 取代 OAuth AT/RT，零提示词注入](docs/images/vm2api-01-console-api.png)
 
-Node **不**直连 `api.anthropic.com`。自建默认走 **Go HTTP worker** 即可跑通。
+独家 Console API。Setup Token 转成 Console 可用 API，**取代** OAuth 换来的 AT / RT。
 
-`engine=rust` 的 Claude 路径是 cli-hop，需要运维自备 Claude Code。本仓**不包含** patched CLI / wrap-cli 母样本。
-
-## 构建
-
-需要 Node 22、Go 1.25、Rust stable、pnpm（前端）。
-
-```bash
-npm ci
-npm test                 # unit + Go worker + api-kernel
-npm run build:worker
-npm run build:egress
-npm run build:api-kernel
-npm run build:kernel     # crates/kin-kernel → bin/kin-kernel
-npm run build:codex-kernel
-pnpm -C web install
-pnpm -C web test
-pnpm -C web build        # → web/dist
-```
-
-Linux amd64 二进制由 GitHub Release 提供：`kin-kernel`、`kin-codex-kernel`、`kin-worker`、`kin-api-kernel`。不要把 ELF 提交进 git。
-
-## 运行
-
-```bash
-export KIN_API_KEY=...
-export KIN_ADMIN_USER=admin
-export KIN_ADMIN_PASSWORD=...   # 必填
-export KIN_DB_SECRET=...        # 凭证列 AES-256-GCM
-node src/server.mjs             # :8787
-```
-
-管理台：先 `pnpm -C web build`，然后打开 `GET /console`（Node 提供 `web/dist`）。开发时：
-
-```bash
-KIN_API_PROXY=http://127.0.0.1:8787 pnpm -C web dev
-```
-
-协议口：`POST /v1/messages`、`/v1/chat/completions`、`/v1/responses`。鉴权 `Authorization: Bearer` 或 `x-api-key`。
-
-## 文档
-
-| 文档 | 内容 |
+| 旧路 | 本仓 |
 |------|------|
-| [docs/API.md](docs/API.md) | `/v1` 鉴权与四协议 |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | 官方判定、人设、thinking、beta |
-| [docs/INFERENCE.md](docs/INFERENCE.md) | rust cli-hop vs Go HTTP |
-| [docs/PANEL_API.md](docs/PANEL_API.md) | `/api/panel` |
-| [docs/OAUTH.md](docs/OAUTH.md) | 导入、refresh、初装 |
+| OAuth 拿到 AT / RT，上游按 OAuth 客户端看你 | Setup Token → Console API |
+| 为了像官方，要注人设 / 提示词 | Claude 认为你是 Console API |
+| 提示词注入有泄漏面 | **0 提示词注入** |
 
-## 安全
+---
 
-不要提交 OAuth、sessionKey、SOCKS 账密、`credentials.json`、含密钥的 JSON。`KIN_ADMIN_PASSWORD` 未设置则拒绝启动。
+## 技术路线
 
-感谢liunx do论坛支持
+![用户请求到 Console API 的六站流水线](docs/images/vm2api-02-route.png)
+
+```text
+用户请求
+  → 协议清洗
+  → POST /v1/messages
+  → 接入 Claude Code 原生 subagent
+  → TCP 转发
+  → Console API endpoint
+  → 透明转发给用户
+```
+
+控制面只做清洗与调度。推理在虚拟机里走 Claude Code 原生 subagent，再 TCP 打到 Console API。回包原样给调用方。
+
+---
+
+## 虚拟机槽位
+
+![Docker / 真虚拟机、物理指纹、20 路原生 subagent](docs/images/vm2api-03-vm-subagent.png)
+
+- 槽位可以是 **Docker**，也可以是 **真虚拟机**
+- 槽内用 **Claude Code 原生 subagent** 转发，最大 **20 并发**
+- **拟真物理机指纹** 仍在攻克。欢迎提供方案
+
+---
+
+## 遥测与身份
+
+![全量遥测，独立电脑，无其余特征](docs/images/vm2api-04-telemetry.png)
+
+遥测全量发送。目标：Claude 认为你是一台 **完全独立的电脑**，并且 **无其余特征**。
+
+---
+
+## 仓库
+
+```text
+web/                  Vite 管理台
+src/                  Node 控制面
+crates/kin-kernel/    Claude Rust 内核
+crates/codex-kernel/  GPT Rust 内核
+worker/               Go 槽位服务
+api-kernel/           Go API 内核
+docs/                 路线图 + 契约
+```
+
+```bash
+npm ci && npm test
+npm run build:worker && npm run build:kernel && npm run build:web
+export KIN_API_KEY=... KIN_ADMIN_PASSWORD=... KIN_DB_SECRET=...
+node src/server.mjs    # :8787   管理台 GET /console
+```
+
+二进制走 GitHub Release，不要把 ELF 提交进 git。不要提交凭证。
+
+更多契约：[docs/](docs/README.md)
+
+感谢 liunx do 论坛支持。

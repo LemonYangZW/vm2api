@@ -1,7 +1,7 @@
-# 推理数据面（SSOT）
+# 推理数据面（实现备查）
 
-> `engine=rust` **就是** cli-hop。没有第三条「rust HTTP hop」推理路径。
-> 开源仓不附带 wrap-cli / patched Claude Code。自建默认用 `inference.engine=go`。
+> **产品主路线**见 [技术路线.md](技术路线.md)：Setup Token → Console API、Claude Code 原生 subagent、TCP → Console endpoint、0 提示词注入。
+> 本文只记当前进程怎么挂。`engine=rust` 是 cli-hop。开源仓不附带 wrap-cli。
 
 Node 只做控制面（鉴权、协议、人设、调度、面板）。**不直连** `api.anthropic.com`。无直连回落。
 
