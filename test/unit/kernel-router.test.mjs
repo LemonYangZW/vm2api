@@ -19,6 +19,7 @@ import {
   reconcileCliHopRuntime,
   wrapSlotCount,
   wrapNewerThanKernel,
+  credentialsNewerThanKernel,
   WRAP_SLOT_MAX,
   WRAP_IDLE_RECYCLE_MS,
   scheduleWrapRecycle,
@@ -617,6 +618,30 @@ test('wrapSlotCount always pre-opens max native slots', () => {
   assert.equal(wrapSlotCount({ policy: { maxConcurrency: 5 } }), WRAP_SLOT_MAX)
   assert.equal(wrapSlotCount({ policy: { maxConcurrency: 32 } }), WRAP_SLOT_MAX)
   assert.equal(wrapSlotCount({ policy: { maxConcurrency: 0 } }), WRAP_SLOT_MAX)
+})
+
+test('credentialsNewerThanKernel is true after host rotates the ticket', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cred-stale-'))
+  const home = path.join(root, 'vms', 'vm-13', 'cli-home')
+  const claude = path.join(home, '.claude')
+  const run = path.join(root, 'vms', 'vm-13', 'run')
+  fs.mkdirSync(claude, { recursive: true })
+  fs.mkdirSync(run, { recursive: true })
+  const sock = path.join(run, 'kernel.sock')
+  const cred = path.join(claude, 'credentials.json')
+  fs.writeFileSync(sock, '')
+  fs.writeFileSync(cred, '{}')
+  const past = new Date(Date.now() - 60_000)
+  fs.utimesSync(sock, past, past)
+  const exec = {
+    homeDir: home,
+    vm: { id: 'vm-13', runtime: { kernel_socket: sock } },
+  }
+  assert.equal(credentialsNewerThanKernel(exec), true)
+  fs.utimesSync(cred, past, past)
+  fs.utimesSync(sock, new Date(), new Date())
+  assert.equal(credentialsNewerThanKernel(exec), false)
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('wrapNewerThanKernel is true after wrap files replace a stale sock', () => {

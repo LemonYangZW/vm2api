@@ -118,6 +118,39 @@ export function slotWorkerCredentialPath(homeDir) {
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
+/**
+ * Official CLI reads ~/.claude/.credentials.json. One store: symlink
+ * that name onto host-owned credentials.json so wrap cannot copy RT.
+ */
+export function ensureOfficialCredentialLink(homeDir, { uid, gid } = {}) {
+  const claudeDir = path.join(homeDir || '', '.claude')
+  const workerFile = path.join(claudeDir, 'credentials.json')
+  const officialFile = path.join(claudeDir, '.credentials.json')
+  if (!homeDir || !fs.existsSync(workerFile)) return { wrote: false, error: 'worker credentials.json missing' }
+  fs.mkdirSync(claudeDir, { recursive: true })
+  try {
+    const st = fs.lstatSync(officialFile)
+    if (st.isSymbolicLink()) {
+      const target = fs.readlinkSync(officialFile)
+      if (target === 'credentials.json' || path.resolve(claudeDir, target) === path.resolve(workerFile)) {
+        return { wrote: true, path: officialFile, linked: true }
+      }
+    }
+    fs.rmSync(officialFile, { force: true })
+  } catch {}
+  try {
+    fs.symlinkSync('credentials.json', officialFile)
+  } catch (e) {
+    return { wrote: false, error: String(e.message || e).slice(0, 200) }
+  }
+  if (uid != null && gid != null) {
+    try {
+      fs.lchownSync(officialFile, uid, gid)
+    } catch {}
+  }
+  return { wrote: true, path: officialFile, linked: true }
+}
+
 /** Read the slot worker credentials.json without logging secrets. */
 export function readWorkerCredentialFile(homeDir) {
   const file = slotWorkerCredentialPath(homeDir)
@@ -256,6 +289,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
     )
     chownSlotCredentialFile(homeDir, file)
     sealSlotCredentialFile(file)
+    ensureOfficialCredentialLink(homeDir)
     return file
   }
   const n = normalizeOauth(cred)
@@ -284,6 +318,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   atomicWriteJson(file, { type: mode, authScheme, claudeAiOauth: oauth }, { mode: 0o600 })
   chownSlotCredentialFile(homeDir, file)
   sealSlotCredentialFile(file)
+  ensureOfficialCredentialLink(homeDir)
   return file
 }
 

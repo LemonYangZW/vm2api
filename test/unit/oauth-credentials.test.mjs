@@ -319,6 +319,10 @@ test('writeWorkerCredentialFile stores claudeAiOauth and reads back', () => {
   assert.equal(cred.refresh_token, 'sk-ant-ort01-TEST')
   assert.equal(cred.email, 'slot@example.com')
   assert.equal(expiresAtToMs(cred.expires_at), 1787486457000)
+  const official = path.join(home, '.claude', '.credentials.json')
+  assert.equal(fs.lstatSync(official).isSymbolicLink(), true)
+  assert.equal(fs.readlinkSync(official), 'credentials.json')
+  fs.rmSync(home, { recursive: true, force: true })
 })
 
 test('slotUidGidFromHomeDir maps numeric slot homes', () => {

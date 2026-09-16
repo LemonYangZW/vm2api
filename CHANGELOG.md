@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 控制面可用 Docker Compose 部署（`network_mode: host` + `docker.sock`；槽位仍在宿主机引擎）
+- 同步源仓运行时补丁：换票后回收 wrap、官方凭证软链、未确认 401 不再当吊销
 
 ## 1.0.0 — 2026-09-16
 

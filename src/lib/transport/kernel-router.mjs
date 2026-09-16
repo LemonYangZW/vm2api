@@ -4,6 +4,7 @@
  * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
 import { ensureWorkerCredential } from './go-worker-client.mjs'
+import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
 import {
   streamRustKernel,
   callRustKernel,
@@ -17,6 +18,7 @@ import {
   scheduleWrapRecycle,
   awaitWrapRecycle,
   noteWrapHop,
+  credentialsNewerThanKernel,
 } from './rust-kernel-supervisor.mjs'
 
 const rustHealthCache = new Map()
@@ -124,9 +126,31 @@ function credentialEnsureFailure(result, ensured) {
   }
 }
 
+async function prepareSlotCredentials(exec) {
+  if (!exec?.homeDir) return
+  const ids = slotUidGidFromHomeDir(exec.homeDir)
+  ensureOfficialCredentialLink(exec.homeDir, ids || {})
+}
+
+async function bounceRustForFreshTicket(exec) {
+  await prepareSlotCredentials(exec)
+  await ensureWorkerCredential(exec)
+  const rec = scheduleWrapRecycle(exec, { cooldownMs: 0 })
+  if (rec.pending) await rec.pending
+  clearRustHealthCache(cacheKey(exec))
+  const started = await ensureRustKernel(exec)
+  if (started?.ok) rememberRustHealth(exec, started)
+  else clearRustHealthCache(cacheKey(exec))
+  return started
+}
+
 async function prepareRust(exec, { ensure, routing } = {}) {
   await awaitWrapRecycle(exec)
   if (typeof ensure === 'function') return ensure(exec)
+  await prepareSlotCredentials(exec)
+  if (credentialsNewerThanKernel(exec)) {
+    return bounceRustForFreshTicket(exec)
+  }
   const ttl = rustHealthTtlMs(routing)
   const cached = peekRustHealth(exec, ttl)
   if (cached) {
@@ -138,6 +162,7 @@ async function prepareRust(exec, { ensure, routing } = {}) {
     rememberRustHealth(exec, ready)
     return ready
   }
+  if (exec?.homeDir) await ensureWorkerCredential(exec)
   const started = await ensureRustKernel(exec)
   if (started?.ok) rememberRustHealth(exec, started)
   else clearRustHealthCache(cacheKey(exec))

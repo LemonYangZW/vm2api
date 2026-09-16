@@ -10,6 +10,7 @@ import { rustKernelHealth, rustKernelPaths, rustKernelProcessUp, rustKernelReach
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { setVmSchedulable } from '../vm/vm-registry.mjs'
 import { resolveCliSystemLayout } from '../vm/slot-engine.mjs'
+import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
 
 const starts = new Map()
 const CONTAINER_KERNEL_BIN = '/home/kincli/.kin/kin-kernel'
@@ -253,6 +254,20 @@ export function wrapNewerThanKernel(exec) {
   }
 }
 
+/** Host rotated credentials.json; running wrap still holds the revoked AT. */
+export function credentialsNewerThanKernel(exec) {
+  const home = String(exec?.homeDir || '').trim()
+  const sock = rustKernelPaths(exec).socketPath
+  if (!home || !sock) return false
+  const cred = path.join(home, '.claude', 'credentials.json')
+  try {
+    if (!fs.existsSync(sock) || !fs.existsSync(cred)) return false
+    return fs.statSync(cred).mtimeMs > fs.statSync(sock).mtimeMs + 500
+  } catch {
+    return false
+  }
+}
+
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
   await killWrapDataplane(slotContainerName(exec), runDockerExec)
   const paths = rustKernelPaths(exec)
@@ -347,14 +362,19 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 }
 
 async function startRustKernel(exec, { timeoutMs, control, runDockerExec }) {
+  if (exec?.homeDir) {
+    const ids = slotUidGidFromHomeDir(exec.homeDir)
+    ensureOfficialCredentialLink(exec.homeDir, ids || {})
+  }
   const paths = rustKernelPaths(exec)
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
   const existing = await rustKernelHealth(exec, { timeoutMs: 800 })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const staleWrap = wrapNewerThanKernel(exec)
+  const staleTicket = credentialsNewerThanKernel(exec)
   const slotMismatch =
     !!paths.configPath && Number(readExistingKernelConfig(paths.configPath).slots_per_worker) !== WRAP_SLOT_MAX
-  if (rustKernelReachable(existing) && !staleWrap && !slotMismatch) {
+  if (rustKernelReachable(existing) && !staleWrap && !staleTicket && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
@@ -364,7 +384,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec }) {
   if (!container) return { ok: false, reason: 'container_missing' }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing)
   const pid1Kernel = await containerKernelIsPid1(container, runDockerExec)
-  const waitMs = staleWrap || slotMismatch ? 0 : bootWaitMs(timeoutMs, { pid1Kernel, wedged })
+  const waitMs = staleWrap || staleTicket || slotMismatch ? 0 : bootWaitMs(timeoutMs, { pid1Kernel, wedged })
   if (waitMs > 0) {
     const waited = await waitForHealth(exec, waitMs)
     if (waited?.ok) {

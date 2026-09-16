@@ -132,6 +132,28 @@ function resultErrorCode(result) {
   return String(result?.body?.error?.code || result?.body?.error?.type || '')
 }
 
+/**
+ * First wrap hop after idle often streams a local/stale 401
+ * (`request_id:null` or `upstream_stream_incomplete`) because the CLI
+ * has not loaded the host ticket yet. That is not grant death.
+ */
+export function isUnconfirmedAuthFailure(result = {}) {
+  const message = bodyMessage(result.body)
+  const code = bodyCode(result.body)
+  const workerCode = resultErrorCode(result)
+  const hay = `${code} ${message} ${workerCode}`
+  const authish =
+    Number(result.status) === 401 ||
+    /token has been revoked|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
+      hay,
+    )
+  if (!authish) return false
+  if (result.terminalState === 'incomplete' || /upstream_stream_incomplete/i.test(hay)) return true
+  if (/"request_id"\s*:\s*null/.test(message)) return true
+  if (/needs_refresh|credential needs refresh|slot has no credential|credential_required/i.test(hay)) return true
+  return false
+}
+
 const TIMEOUT_PATTERNS = /timeout|deadline|response header|timed out/i
 
 function isTimeoutFailure(workerCode, message) {
@@ -214,6 +236,14 @@ export function classifyUpstreamResult(
   }
   const hay = `${code} ${message} ${workerCode}`
   if (/token has been revoked|oauth_revoked|invalid_grant|authentication_error/i.test(hay) || status === 401) {
+    if (isUnconfirmedAuthFailure(result)) {
+      return {
+        scope: 'account',
+        action: result.committed ? 'stop' : 'continue',
+        reason: 'oauth_unconfirmed',
+        cooldownUntil: null,
+      }
+    }
     if (hasRefresh === false) {
       return {
         scope: 'account',

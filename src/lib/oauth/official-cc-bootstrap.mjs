@@ -26,7 +26,13 @@ import {
   SLOT_MEMORY,
 } from '../vm/vm-runtime.mjs'
 import { reloadSlotReady } from '../vm/slot-runtime.mjs'
-import { hasAccessPresence, hasRefreshPresence, needsRefresh, readWorkerCredentialFile } from './oauth-credentials.mjs'
+import {
+  hasAccessPresence,
+  hasRefreshPresence,
+  needsRefresh,
+  readWorkerCredentialFile,
+  ensureOfficialCredentialLink,
+} from './oauth-credentials.mjs'
 import { canOfficialCc, credentialModeOfVm } from './credential-mode.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { inferTierFromOfficialStats, parseOfficialCcStats } from './official-cc-stats.mjs'
@@ -773,32 +779,7 @@ export function wipeOfficialFirstUseHome(homeDir, { uid, gid } = {}) {
  * that name onto host-owned credentials.json so wrap cannot copy RT.
  */
 export function materializeOfficialClaudeCredentials(homeDir, { uid, gid } = {}) {
-  const claudeDir = path.join(homeDir, '.claude')
-  const workerFile = path.join(claudeDir, 'credentials.json')
-  const officialFile = path.join(claudeDir, '.credentials.json')
-  if (!fs.existsSync(workerFile)) return { wrote: false, error: 'worker credentials.json missing' }
-  fs.mkdirSync(claudeDir, { recursive: true })
-  try {
-    const st = fs.lstatSync(officialFile)
-    if (st.isSymbolicLink()) {
-      const target = fs.readlinkSync(officialFile)
-      if (target === 'credentials.json' || path.resolve(claudeDir, target) === path.resolve(workerFile)) {
-        return { wrote: true, path: officialFile, linked: true }
-      }
-    }
-    fs.rmSync(officialFile, { force: true })
-  } catch {}
-  try {
-    fs.symlinkSync('credentials.json', officialFile)
-  } catch (e) {
-    return { wrote: false, error: String(e.message || e).slice(0, 200) }
-  }
-  if (uid != null && gid != null) {
-    try {
-      fs.lchownSync(officialFile, uid, gid)
-    } catch {}
-  }
-  return { wrote: true, path: officialFile, linked: true }
+  return ensureOfficialCredentialLink(homeDir, { uid, gid })
 }
 
 export function prepareClaudeJsonForOfficialInit(homeDir, opts = {}) {

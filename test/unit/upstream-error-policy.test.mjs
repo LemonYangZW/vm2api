@@ -348,7 +348,7 @@ test('401 revoked message is oauth_revoked', () => {
   assert.equal(shouldContinue(policy), true)
 })
 
-test('wrap 200 invalid_grant is oauth_revoked even after commit', () => {
+test('wrap incomplete 401 with null request_id is not grant death', () => {
   const policy = classifyUpstreamResult(
     {
       ok: false,
@@ -356,7 +356,29 @@ test('wrap 200 invalid_grant is oauth_revoked even after commit', () => {
       committed: true,
       terminalState: 'incomplete',
       body: {
-        error: { type: 'authentication_error', code: 'invalid_grant', message: 'OAuth credential was rejected' },
+        error: {
+          type: 'authentication_error',
+          code: 'upstream_stream_incomplete',
+          message:
+            'provider error: provider error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."},"request_id":null} · api_error · upstream_stream_incomplete',
+        },
+      },
+    },
+    { hasRefresh: true },
+  )
+  assert.equal(policy.reason, 'oauth_unconfirmed')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.cooldownUntil, null)
+})
+
+test('confirmed 401 revoked still parks the grant', () => {
+  const policy = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 401,
+      terminalState: 'rejected',
+      body: {
+        error: { type: 'authentication_error', message: 'OAuth access token has been revoked.', request_id: 'req_live' },
       },
     },
     { hasRefresh: true },
