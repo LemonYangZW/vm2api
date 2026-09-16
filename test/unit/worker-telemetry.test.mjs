@@ -1,0 +1,80 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { buildWorkerTelemetry, touchTelemetrySession } from '../../src/lib/vm/worker-telemetry.mjs'
+import { syncWorkerTelemetry } from '../../src/lib/vm/vm-runtime.mjs'
+
+const MACHINE = 'aa'.repeat(32)
+const USER = 'bb'.repeat(32)
+
+function writeOfficialHome(root, vmId) {
+  const home = path.join(root, 'vms', vmId, 'cli-home')
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  fs.writeFileSync(
+    path.join(home, '.claude.json'),
+    JSON.stringify({
+      machineID: MACHINE,
+      userID: USER,
+      oauthAccount: {
+        accountUuid: 'acc-official',
+        organizationUuid: 'org-official',
+      },
+    }),
+  )
+  return home
+}
+
+test('sidecar stays off without official identity', () => {
+  const out = buildWorkerTelemetry(
+    {
+      id: 'vm-09',
+      seed_policy: { telemetry_disabled: false },
+      fingerprint: { device_id: 'slot-device', session_id: 'sess-9' },
+    },
+    os.tmpdir(),
+  )
+  assert.equal(out.enabled, false)
+  assert.equal(out.reason, 'waiting_official_identity')
+})
+
+test('sidecar enables with official ~/.claude.json IDs', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  writeOfficialHome(root, 'vm-02')
+  const vm = {
+    id: 'vm-02',
+    seed_policy: { telemetry_disabled: false },
+    fingerprint: { device_id: 'd2', session_id: 's2' },
+  }
+  const out = buildWorkerTelemetry(vm, root)
+  assert.equal(out.enabled, true)
+  assert.equal(out.identity.device_id, MACHINE)
+  assert.equal(out.identity.user_id, USER)
+  assert.equal(out.identity.source, 'official-cc-init')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('syncWorkerTelemetry writes enabled:true when official IDs exist', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  writeOfficialHome(root, 'vm-02')
+  const vm = {
+    id: 'vm-02',
+    seed_policy: { telemetry_disabled: false },
+    fingerprint: { device_id: 'd2', session_id: 's2' },
+  }
+  const runDir = path.join(root, 'vms', 'vm-02', 'run')
+  fs.mkdirSync(runDir, { recursive: true })
+  const cfgPath = path.join(runDir, 'worker.json')
+  fs.writeFileSync(cfgPath, JSON.stringify({ vm_id: 'vm-02', proxy_required: false }))
+  const out = syncWorkerTelemetry(vm, root)
+  assert.equal(out.wrote, true)
+  assert.equal(out.enabled, true)
+  const doc = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+  assert.equal(doc.telemetry.enabled, true)
+  assert.equal(doc.proxy_required, false)
+  const touch = touchTelemetrySession(root, 'vm-02')
+  assert.equal(touch.wrote, true)
+  assert.equal(fs.existsSync(path.join(runDir, 'telemetry.touch')), true)
+  fs.rmSync(root, { recursive: true, force: true })
+})

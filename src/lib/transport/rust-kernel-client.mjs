@@ -1,0 +1,118 @@
+/**
+ * Rust kin-kernel hop client. Same envelope / Unix-socket contract as
+ * go-worker-client; the socket is run/kernel.sock instead of worker.sock.
+ */
+import path from 'node:path'
+import { callGoWorker, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+
+export function rustKernelPaths(exec = {}) {
+  const base = workerPaths(exec)
+  const runDir = base.runDir
+  return {
+    runDir,
+    socketPath: exec.vm?.runtime?.kernel_socket || (runDir ? path.join(runDir, 'kernel.sock') : null),
+    tokenPath: base.tokenPath,
+    configPath: runDir ? path.join(runDir, 'kernel.json') : null,
+  }
+}
+
+export function withRustKernelExec(exec) {
+  const paths = rustKernelPaths(exec)
+  return {
+    ...exec,
+    vm: {
+      ...(exec?.vm || {}),
+      runtime: {
+        ...(exec?.vm?.runtime || {}),
+        worker_socket: paths.socketPath,
+        worker_token_file: paths.tokenPath,
+        worker_run_dir: paths.runDir,
+      },
+    },
+  }
+}
+
+function remapVia(result) {
+  if (!result || typeof result !== 'object') return result
+  return {
+    ...result,
+    via: String(result.via || 'go-worker').replace(/go-worker/g, 'rust-kernel'),
+  }
+}
+
+export async function callRustKernel(opts = {}) {
+  return remapVia(await callGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+}
+
+export async function streamRustKernel(opts = {}) {
+  return remapVia(await streamGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+}
+
+export async function rustKernelHealth(exec, opts = {}) {
+  const health = await workerHealth(withRustKernelExec(exec), opts)
+  if (health?.source) {
+    return { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
+  }
+  return health
+}
+
+export function rustKernelProcessUp(health) {
+  if (!health) return false
+  if (health.ok) return true
+  if (Number(health.status) === 200) return true
+  if (health.engine === 'rust' || health.worker_version) return true
+  return false
+}
+
+export function rustKernelCliReady(health) {
+  if (health?.ready_slots == null) return true
+  const n = Number(health.ready_slots)
+  return Number.isFinite(n) && n > 0
+}
+
+export function rustKernelReachable(health) {
+  return rustKernelProcessUp(health) && rustKernelCliReady(health)
+}
+
+function finiteNumber(value) {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * Panel-safe kernel health. Wrap / cli-hop `/internal/health` carries
+ * `provider`, `ready_slots`, `cli_pid`; Go hop omits them.
+ */
+export function toPublicKernelHealth(health, engine) {
+  const processUp =
+    engine === 'rust'
+      ? rustKernelProcessUp(health)
+      : health?.ok === true ||
+        Number(health?.status) === 200 ||
+        health?.worker_version != null ||
+        health?.version != null
+  const reachable = engine === 'rust' ? rustKernelReachable(health) : processUp
+  return {
+    reachable,
+    process_up: processUp,
+    status: health?.status ?? null,
+    worker_version: health?.worker_version || health?.version || null,
+    engine: health?.engine || engine,
+    provider: health?.provider ?? null,
+    ready_slots: finiteNumber(health?.ready_slots),
+    cli_pid: finiteNumber(health?.cli_pid),
+    error_code: reachable ? null : health?.code || `${engine}_worker_unavailable`,
+  }
+}
+
+export function isNeedsRefreshResult(result) {
+  const status = Number(result?.status) || 0
+  const code = String(result?.body?.error?.code || result?.error?.code || '')
+  const message = String(result?.body?.error?.message || result?.error?.message || '')
+  const hay = `${code} ${message}`
+  if (code === 'needs_refresh' || /needs_refresh/i.test(hay)) return true
+  if (status === 401) return true
+  if (/authentication_error|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)) return true
+  return false
+}

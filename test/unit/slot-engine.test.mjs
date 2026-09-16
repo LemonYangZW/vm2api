@@ -1,0 +1,163 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  assertCliHopAllowed,
+  normalizeInferenceConfig,
+  parseSlotEnginePolicyPatch,
+  parseSlotPolicyTargets,
+  personaModeFromPreset,
+  resolveCliSystemLayout,
+  resolveInferenceEngine,
+  resolveOfficialCcInference,
+  resolveSlotPersonaPreset,
+  slotPersonaModeOverride,
+  validateInferenceRoutingPatch,
+} from '../../src/lib/vm/slot-engine.mjs'
+
+import { persistSlotEnginePolicy, persistSlotEnginePolicyMany, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
+
+function makeRoot() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-engine-'))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  return root
+}
+
+function writeVm(root, id, extra = {}) {
+  const file = path.join(root, 'vms', `${id}.json`)
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      id,
+      name: id,
+      policy: { maxConcurrency: 2 },
+      ...extra,
+    }),
+  )
+  return file
+}
+
+test('vm engine overrides routing, empty inherits rust', () => {
+  assert.equal(resolveInferenceEngine({}, {}), 'rust')
+  assert.equal(resolveInferenceEngine({}, { inference: { engine: 'rust' } }), 'rust')
+  assert.equal(resolveInferenceEngine({ inference_engine: 'go' }, { inference: { engine: 'rust' } }), 'go')
+  assert.equal(resolveInferenceEngine({ inference_engine: 'rust' }, { inference: { engine: 'go' } }), 'rust')
+})
+
+test('resolveCliSystemLayout is zero unless persona_inject is set', () => {
+  assert.equal(resolveCliSystemLayout({}, {}), 'zero')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'zero')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_inject: 'rewrite' } }), 'identity')
+  assert.equal(
+    resolveCliSystemLayout({ persona_preset: 'zero' }, { compatibility: { persona_inject: 'rewrite' } }),
+    'zero',
+  )
+})
+
+test('official_cc inference: rust is always cli-hop, go+cli-hop rejected', () => {
+  assert.equal(resolveOfficialCcInference({}, {}), 'cli-hop')
+  assert.equal(resolveOfficialCcInference({}, { official_cc: {} }), 'cli-hop')
+  assert.equal(resolveOfficialCcInference({}, { official_cc: { inference: 'cli-hop' } }), 'cli-hop')
+  assert.equal(
+    resolveOfficialCcInference(
+      { inference_engine: 'go', official_cc_inference: 'http' },
+      { official_cc: { inference: 'cli-hop' } },
+    ),
+    'http',
+  )
+
+  assert.equal(resolveOfficialCcInference({ inference_engine: 'go' }, {}), 'http')
+  assert.equal(resolveOfficialCcInference({ inference_engine: 'rust' }, {}), 'cli-hop')
+  assert.equal(resolveOfficialCcInference({ inference_engine: 'rust', official_cc_inference: 'http' }, {}), 'cli-hop')
+  assert.equal(assertCliHopAllowed({}, { official_cc: { inference: 'cli-hop' } }).ok, true)
+  assert.equal(assertCliHopAllowed({ inference_engine: 'rust' }, {}).ok, true)
+  assert.equal(assertCliHopAllowed({ inference_engine: 'go' }, { official_cc: { inference: 'cli-hop' } }).ok, false)
+})
+
+test('setup-token rust slots still cli-hop; only token minting skips CLI', () => {
+  const rust = { inference_engine: 'rust', claude: { mode: 'setup-token' } }
+  assert.equal(resolveInferenceEngine(rust, {}), 'rust')
+  assert.equal(resolveOfficialCcInference(rust, {}), 'cli-hop')
+})
+
+test('slot persona inherit vs override', () => {
+  const routing = { compatibility: { persona_preset: 'official_full' } }
+  assert.equal(resolveSlotPersonaPreset({}, routing), 'official_full')
+  assert.equal(resolveSlotPersonaPreset({ persona_preset: 'zero' }, routing), 'zero')
+  assert.equal(resolveSlotPersonaPreset({ persona_preset: 'official' }, routing), 'official')
+  assert.equal(resolveSlotPersonaPreset({ persona_preset: 'official_full' }, routing), 'official_full')
+  assert.equal(slotPersonaModeOverride({}), null)
+  assert.equal(slotPersonaModeOverride({ persona_preset: 'official' }), 'official_prompt')
+  assert.equal(slotPersonaModeOverride({ persona_preset: 'zero' }), 'zero')
+  assert.equal(slotPersonaModeOverride({ persona_preset: 'official_full' }), 'official_full')
+  assert.equal(personaModeFromPreset('official'), 'official_prompt')
+  assert.equal(personaModeFromPreset('official_full'), 'official_full')
+})
+
+test('persistSlotEnginePolicy writes inherit as deleted fields', () => {
+  const root = makeRoot()
+  const file = writeVm(root, 'vm-01')
+  persistSlotEnginePolicy(root, 'vm-01', { inference_engine: 'rust', persona_preset: 'zero' })
+  let saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(saved.inference_engine, 'rust')
+  assert.equal(saved.persona_preset, 'zero')
+  assert.equal(summarizeVm(saved).inference_engine, 'rust')
+  assert.equal(summarizeVm(saved).persona_preset, 'zero')
+  persistSlotEnginePolicy(root, 'vm-01', { inference_engine: '', persona_preset: '' })
+  saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(saved.inference_engine, undefined)
+  assert.equal(saved.persona_preset, undefined)
+  assert.equal(summarizeVm(saved).inference_engine, null)
+  assert.equal(summarizeVm(saved).persona_preset, null)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('persistSlotEnginePolicyMany updates listed ids only', () => {
+  const root = makeRoot()
+  writeVm(root, 'vm-01')
+  writeVm(root, 'vm-02')
+  const report = persistSlotEnginePolicyMany(root, ['vm-01'], { inference_engine: 'rust' })
+  assert.equal(report.updated, 1)
+  assert.equal(report.items[0].inference_engine, 'rust')
+  const two = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-02.json'), 'utf8'))
+  assert.equal(two.inference_engine, undefined)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('patch parsers reject unknown values', () => {
+  assert.equal(parseSlotEnginePolicyPatch({}).ok, false)
+  assert.equal(parseSlotEnginePolicyPatch({ inference_engine: 'kvm' }).ok, false)
+  assert.equal(parseSlotEnginePolicyPatch({ persona_preset: 'custom' }).ok, false)
+  const ok = parseSlotEnginePolicyPatch({ inference_engine: 'inherit', persona_preset: 'official_prompt' })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.patch.inference_engine, '')
+  assert.equal(ok.patch.persona_preset, 'official')
+  const full = parseSlotEnginePolicyPatch({ persona_preset: 'official_full' })
+  assert.equal(full.ok, true)
+  assert.equal(full.patch.persona_preset, 'official_full')
+  const targets = parseSlotPolicyTargets({ ids: ['vm-01', 'vm-01', ''] })
+  assert.deepEqual(targets.ids, ['vm-01'])
+  assert.equal(parseSlotPolicyTargets({ all: true }).all, true)
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { engine: 'rust' } }), [])
+  assert.ok(validateInferenceRoutingPatch({ inference: { engine: '' } }).length)
+  assert.equal(normalizeInferenceConfig({ engine: 'rust', fallback_to_go: false }).fallback_to_go, false)
+  assert.equal(normalizeInferenceConfig({ engine: 'rust', strict: true }).strict, true)
+  const omitted = normalizeInferenceConfig({ engine: 'go' })
+  assert.equal(omitted.fallback_to_go, false)
+  assert.equal(omitted.eager_start, true)
+  assert.equal(omitted.health_ttl_ms, 2000)
+  assert.equal(omitted.tcp_nodelay, true)
+
+  assert.equal(
+    normalizeInferenceConfig({ eager_start: false, health_ttl_ms: 0, tcp_nodelay: false }).eager_start,
+    false,
+  )
+  assert.equal(normalizeInferenceConfig({ health_ttl_ms: 0 }).health_ttl_ms, 0)
+  assert.ok(validateInferenceRoutingPatch({ inference: { strict: 'true' } }).length)
+  assert.ok(validateInferenceRoutingPatch({ inference: { fallback_to_go: 1 } }).length)
+  assert.ok(validateInferenceRoutingPatch({ inference: { eager_start: 1 } }).length)
+  assert.ok(validateInferenceRoutingPatch({ inference: { health_ttl_ms: -1 } }).length)
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { eager_start: false, health_ttl_ms: 0 } }), [])
+})

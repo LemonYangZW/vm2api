@@ -1,0 +1,39 @@
+{
+  "enabled": true,
+  "skip_official": true,
+  "skip_zero": true,
+  "error": {
+    "status": 403,
+    "type": "permission_error",
+    "code": "distill_blocked",
+    "message": "不允许蒸馏"
+  },
+  "structure": {
+    "min_max_tokens": 8192,
+    "require_no_tools": true,
+    "require_single_turn": true
+  },
+  "needles": [
+    "<think>",
+    "</think>",
+    "<answer>",
+    "<|begin_of_thought|>",
+    "<|end_of_thought|>",
+    "<|begin_of_solution|>",
+    "Return your final response within \\boxed{}",
+    "Generate an executable Python function generated from the given prompt",
+    "systematic long thinking process",
+    "as an internal monologue",
+    "Please reason step by step, and put your final answer within \\boxed{}",
+    "Respond in the following format: <think>"
+  ],
+  "fingerprints": [
+    "Let  $a,b,A,B$  be given reals. We consider the function defined by",
+    "The graph of the function $y=\\cos x - \\sin x$ has a line of symmetry given by",
+    "Prove that if $\\alpha, \\beta, \\gamma$ are the angles of a triangle, then",
+    "Jia walks from home to Yi's house. At the same time, Yi rides a bicycle",
+    "Colonoscopy reveals a fungating hemorrhagic mass in the ascending colon",
+    "reactant: Cc1ccc2c(cnn2C2CCCCO2)c1B1OC(C)(C)C(C)(C)O1",
+    "What is the area, in square units, of an isosceles right triangle with a hypotenuse of 20 units?"
+  ]
+}

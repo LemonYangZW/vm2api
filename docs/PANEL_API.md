@@ -1,0 +1,235 @@
+# 面板 API
+
+基址 `/api/panel`。需要**面板登录会话**或 Master `KIN_API_KEY`。`sk-kin-…` 不能调面板。信封 `{ ok, data }` / `{ ok: false, error }`。调用方应从 `data` 取业务体。
+
+登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities }`。
+
+`/admin/*` 仅 master / admin 角色。恢复备份期间协议口 503。
+
+## RBAC
+
+| 角色 | 页面 | 能力 |
+|------|------|------|
+| `user` | 虚拟机 / 代理池 / 密钥 / 计费 / 日志 | 只管自己的 VM、代理、key；自建配额 `vm_create_quota` 0–100；不能调度平台池 |
+| `super` | 总览 / 集群 / 用量 / 日志 + 虚拟机 | 读 VM + 拨调度 / 清冷却 |
+| `admin` | 全部 | `*`。可管理用户 VM，但 admin/master **未 pin** 的 `/v1` 只打未分配平台池 |
+
+环境变量 `KIN_ADMIN_USER` / `KIN_ADMIN_PASSWORD` 只在库里还没有同名用户时灌进第一个 admin；之后以 SQLite `users` 为准。密码 scrypt。不能删/停用最后一个 admin。
+
+`vms/*.json` 的 `owner_user_id` / `origin`（`platform` \| `admin_assigned` \| `user_created`）是属主 SSOT。`PATCH /vms/:id/owner` 仅 admin。自建 VM 不能收回进平台池。
+
+## 用户
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/users` | 列表（含 `vm_create_quota`） |
+| POST | `/users` | `{ username, password, role, enabled, vm_create_quota? }` |
+| PATCH | `/users/:id` | 改角色/密码/启用/配额；改密会撤销该用户其它会话 |
+| DELETE | `/users/:id` | |
+| PATCH | `/vms/:id/owner` | admin：`{ user_id }` 分配，`{ user_id: null }` 收回（仅 `admin_assigned`） |
+| GET | `/billing` | 用户计费汇总。`from`/`until`/`group_by=vm|key`。user 隐式只看自己；admin 可 `user_id=` |
+
+
+用户名 `^[a-zA-Z][a-zA-Z0-9._-]{1,31}$`，密码 8–128。`vm_create_quota` 整数 0–100，默认 0。
+
+## 总览 / 槽位
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/dashboard` | 总览：健康、KPI、`proxy_pool`、`ops`（默认近 1h SLA/TTFT）、`billing` |
+| GET | `/vms` | 列表（`has_token`、`cred_status`、`proxy_configured`、`can_import_credential`、`account_tier`、`schedule_level`、`schedule_level_mode`、`worker_credential`、Fable 轨） |
+| GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/by_model` + `account.runtime_window` |
+| PATCH | `/vms/:id` | 热改并发、模型白名单、槽策略或 `schedule_level`（不重启槽） |
+| POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
+| POST | `/vms/:id/schedulable` | `{ schedulable }` 是否入池；不改容器 |
+| POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标，重新入池 |
+| POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master `x-kin-vm` 钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
+| POST | `/vms/:id/count-tokens` | Setup Token / Console API Key 经槽 Go worker SOCKS 打官方 `POST /v1/messages/count_tokens`。body `{ model, messages, system?, tools? }`。完整 OAuth 400 `count_tokens_unsupported`。成功 `{ input_tokens, model, credential_mode, vm_id }` |
+| POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
+| POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
+| POST | `/vms/:id/oauth/generate-auth-url` | PKCE 授权链接；无 SOCKS5 拒绝。`{ flavor: "claude_code" }` 为官方 Claude Code 授权页。`{ flavor: "setup_token" }` 为 inference-only PKCE，不启槽内 CLI |
+| POST | `/vms/:id/oauth/exchange-code` | 粘贴授权码，经槽代理换票。完整 OAuth 才排队初装。flavor 以 session 为准 |
+| GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
+| GET/PUT | `/vms/:id/seed-settings` | 播种；强制保留 telemetry/bedrock/vertex 等 env |
+| POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`） |
+| POST | `/vms/:id/reload` | 重载该槽 worker |
+| GET | `/wrap-cli` | wrap 母样本 inspect：`ok, dir, kernel_bin, glibc_shim, wrapper, meta` |
+| POST | `/wrap-cli/make` | `{ glibc_vm? }` 重整 share/wrap-cli；可从指定槽拷 glibc shim |
+| POST | `/wrap-cli/sync` | `{ ids?, restart? }` 铺到槽 `.kin`；rust 槽默认 bounce kernel |
+| POST | `/vms/:id/wrap-cli/promote` | 从该槽晋升母样本，不复制凭证/SOCKS |
+| POST | `/vms/:id/wrap-cli/repair` | 单槽重装 wrap。`{ wrap, kernel }`；wrap 成功时 HTTP 200 |
+| POST | `/vms/:id/start` · `/stop` | 容器生命周期。运行中容器除非显式 recreate，禁止 `docker rm -f` |
+| POST | `/vms/:id/activate` | 标 active |
+| POST | `/vms/:id/reset` | 销毁容器与家目录，再按原槽位重建（保留 ID/代理/种子；凭证清空） |
+| POST | `/vms/:id/reset-fingerprint` | |
+| POST | `/vms/:id/allocate-proxy` | 从池分配 SOCKS5 |
+| POST | `/vms/:id/update-claude-code` | 410，`claude_cli_removed` |
+| DELETE | `/vms/:id` | 不能删 active；只解绑本槽代理 |
+| POST | `/vms/create` | 种子 VM + Claude Code home |
+| POST | `/vms/import` | sessionKey 导入（必须已有 VM+代理） |
+| GET | `/vms/fleet-status` | 全槽更新状态 |
+| POST | `/vms/fleet-update` | 全槽 roll / 采集 |
+| POST | `/vms/reconcile-fingerprints` | 用官方 `~/.claude.json` 对齐指纹 |
+| POST | `/probe` | 全量额度探测 |
+| GET/POST | `/health-probe` | 读/跑官方 hello 健康探测缓存 |
+| GET | `/usage` | 用量汇总（含缓存 token、官方价；账号行 `credential_mode` = `oauth` / `setup-token` / `apikey`） |
+| GET | `/models` | 策略目录（不 hop worker） |
+| GET | `/oauth` | 全槽脱敏 credential |
+
+`cred_status`：`无凭证` / `可用` / `5h 警告` / `5h 限制` / `7d 警告` / `7d 限制` / `普通限制` / `不可用` / `被吊销` / `探测失败`。Fable 不可用 / 7d_oi / 家族冷却不抬账号级限制。等级：Fable 窗或真实 7d_oi = Max；`plan_denied` = Pro。
+
+`account.runtime_window`：`rate_limited_at` / `rate_limit_reset_at` / `overload_until` / `session_window_start|end|status`。
+
+`schedule_level` 是当前有效调度等级，范围 1–10；`schedule_level_mode` 为 `manual` 或 `auto`。`PATCH {"schedule_level": 1..10}` 写入手动等级，`null` 或 `"auto"` 清除手动值。自动模式按 Claude 7D 重置剩余时间滚动分档：不足 24h 为 7，之后每 24h 降一级，144h 及以上或无有效重置时间为 1。`weight` 仍是同等级候选的平滑 WRR 比例，与调度等级无关。
+
+`GET /vms/:id` 的 `kernel.rust_health` 来自 wrap `/internal/health`：`reachable`（进程在且 `ready_slots>=1`）、`process_up`、`provider`（cli-hop 为 `local_cli`）、`ready_slots`、`cli_pid`、`worker_version`。Go hop 没有 slot 字段。`reachable=false` 且 `process_up=true` 表示 kernel 在、CLI 槽未就绪。
+
+### 虚拟机代理字段
+
+| 字段 | 说明 |
+|------|------|
+| `proxy_configured` | 是否已绑定 SOCKS5 |
+| `can_import_credential` | 绑定且代理非 fail/dead 才允许换票 |
+| `proxy.status` / `enabled` / `latency_ms` / `last_error` / `last_probe_at` / `has_auth` | 健康快照；**不返回**带账密的 `proxy.url` |
+
+`proxy_pool`：`{ total, free, bound, ok, dead, probing, disconnect_on_error }`。
+
+## 数据库运行态（仅 admin）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/database/metrics` | `{ sampled_at, database, usage_cache }`；SQLite/WAL 只读快照与官方用量缓存实例统计 |
+
+`database` 只执行 `SELECT 1`、只读 PRAGMA、migration 摘要和文件 stat；不返回数据库路径。单项失败为 `null`，文件明确不存在时大小为 `0`，探针失败只令 `database.ok = false`。当前 `node:sqlite` 不提供 SQLite 页缓存 hit/miss，不得从这些字段推算。
+
+`usage_cache.hit_rate = (success_hits + error_hits) / requests`；`reuse_rate` 再加 `singleflight_joins`。零请求时均为 `null`。`error_hits` 是负缓存命中，不代表业务成功；累计计数随进程或缓存实例重建归零。
+
+该端点只做观测；禁止 SQL 控制台、表浏览、配置修改、checkpoint、VACUUM、`PRAGMA optimize`、完整性检查及业务大表全表计数。
+
+## 模型策略
+
+| 方法 | 路径 |
+|------|------|
+| GET | `/model-policy` → `{ policy, models, effective }` |
+| PUT | `/model-policy` |
+| POST | `/model-policy/reset` |
+| POST | `/model-policy/sync-worker` | 只同步本地策略缓存，不 hop 烧票 |
+| POST | `/model-policy/sync-codex` | 经 GPT OAuth 槽 SOCKS 拉 ChatGPT 模型目录并入矩阵。票过期时用 refresh_token 换一次新 access，写入 `codex-credentials.json`。无 Codex 槽 400 `no_codex_slot`。 |
+
+`catalog_mode`：`policy_only`（默认，控制台 #/models 即目录）/ `worker_intersect_policy` / `worker_only`。矩阵行可改 `betas.pass_context_1m`、thinking 策略、`max_tokens_cap`。
+
+## 路由 / 设置
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/PUT | `/routing` | sticky / pool / failover / 并发 / `tiers` / 额度 / logging / `compatibility` / `official_cc` / `health_probe` |
+
+`PUT` 热更新。`tiers` 必须回传：`PUT` 是整体替换而非 patch，缺字段即置空。保存时按 Pro/Max 把未手动 override 的槽并发写回去。
+
+## 蒸馏拦截
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/PUT | `/distill` | 协议入口蒸馏拦截。命中后 HTTP 403，`code=distill_blocked`，默认文案 `不允许蒸馏`，不 hop 凭证 |
+
+`PUT` 热更新 `src/config/distill-rules.json`。字段：`enabled`、`skip_official`（官方 Claude Code 放行）、`skip_zero`（`persona_preset/inject=zero` 放行）、`error.{status,type,code,message}`、`needles[]`、`fingerprints[]`、`structure.{min_max_tokens,require_no_tools,require_single_turn}`。仅 admin。
+
+## 拒答缓存
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/PUT | `/refusal-guards` | 上游 AUP / `stop_reason=refusal` 指纹缓存。命中后 HTTP 403，`code=refusal_guard`，不 hop |
+| DELETE | `/refusal-guards/:fingerprint` | 删除一条 64 位 hex 指纹 |
+| DELETE | `/refusal-guards` | 须 `{ "confirm": true }` 清空 |
+
+`PUT { enabled }` 写入 SQLite `settings.refusal_guard_enabled`。`KIN_REFUSAL_GUARD=0` 仍强制关闭。与蒸馏拦截独立：0 注入跳过蒸馏，本缓存仍生效。仅 admin。
+
+
+## 密钥 / 日志
+
+| 方法 | 路径 |
+|------|------|
+| GET/POST | `/api-keys` |
+| PATCH/DELETE | `/api-keys/:id` |
+| GET | `/request-logs` |
+| GET | `/request-logs/stats` |
+| GET | `/request-logs/:request_id` |
+| GET | `/request-logs/:request_id/attempts` |
+
+创建密钥只在响应里明文出现一次。存储为 HMAC 索引。
+
+attempts：每次选中的 VM/账号、错误域、cooldown、提交边界、终态。`normal` 摘要；`debug` 另存脱敏 body。`X-Request-ID` 回写。`X-Kin-Debug` / `X-Kin-Log` 可单请求覆盖。
+
+### 协议字段（对齐 Sub2API usage_logs）
+
+| 字段 | 说明 |
+|------|------|
+| `cache_read_tokens` / `cache_creation_tokens` | 提示缓存读 / 写 |
+| `cache_creation_5m_tokens` / `cache_creation_1h_tokens` | TTL 细分（无细分归 5m） |
+| `requested_model` / `upstream_model` / `model_mismatch` | 三态；null = 上游未声明 |
+| `first_token_ms` | 首个业务事件（worker 回传） |
+| `stop_reason` | 流式来自 `message_delta` |
+| 费用列 | 官方价 input/output/cache 5m·1h·read；上海日切 |
+
+`GET /request-logs/stats` 另返回 `window`：SLA、错误率、429/503、QPS/TPS、耗时与 TTFT 分位、按模型 `avg_first_token_ms`、`error_collection`。`GET /dashboard.ops` 默认近 1 小时同一形状。
+
+筛选：`status=error`、`error_class=` = auth / request / signature / rate_limit / quota / overloaded / timeout / credential / proxy / upstream / other。每行带 `error_class` / `error_label` / `error_owner`。5h/7d/限流计入 SLA 成功。
+
+流式 usage 由 worker SSE 校验器合并后经 trailer 回传，终态 attempt 只记一次。
+
+## 压测 / 探针
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/test-models` | 可测模型。`vm_id` 按槽位平台过滤：GPT/Codex 只返回 `gpt-*`/`codex-*`，Claude 槽不含 GPT。`platform=openai|anthropic` 无 `vm_id` 时同样过滤。GPT 槽 `refresh=1` 经该槽 SOCKS 拉 ChatGPT `/backend-api/models` 并入矩阵，401 不换票。回包带 `platform`、`protocol`（`openai.responses` / `anthropic.messages`）、`inbound_path`。 |
+| POST/GET | `/concurrent-test` | 研报压测；默认并发 10、2 轮、Opus5/Sonnet5/Fable5、预算 32000。UA `kin-console-loadtest/1.0`，走 `/v1` |
+| GET | `/concurrent-tests` · `/concurrent-test-reports` | 历史与落盘报告（`data/loadtests/reports/`） |
+| GET | `/probe-test/catalog` | 能力 / 答题用例 |
+| POST/GET | `/probe-test` · `/probe-tests` | 与研报互斥 |
+
+Claude 槽测试与能力探针走官方 CC 入站（`/v1/messages`）。GPT/Codex 槽测试走 `/v1/responses`。研报保持第三方 UA。
+
+## 备份 / 代理
+
+| 方法 | 路径 |
+|------|------|
+| GET/POST | `/backups` |
+| GET/PUT | `/backups/config` |
+| GET | `/backups/:id/download` |
+| POST | `/backups/:id/restore` 须 `{ "confirm": true }` |
+| GET | `/proxies` |
+| POST | `/proxies/import` · `/proxies/probe` |
+| GET/PUT | `/proxies/config` |
+| PUT | `/proxies/:id` 改 host/port/账密 |
+| POST | `/proxies/:id/enable` · `/disable` · `/bind` · `/unbind` · `/reveal` |
+| DELETE | `/proxies/:id` |
+
+恢复期间协议口 503。每个槽位必须绑定 SOCKS5。`PUT /proxies/config` 的 `disconnect_on_error`（默认 false）：运行时 SOCKS 错误立刻停该槽调度、回写失败并重建 worker；其它健康槽仍可 failover。
+
+### `PUT /proxies/:id`
+
+可改 `host` / `port` / `username` / `password`，**按键是否存在**判定语义：不传该键 = 保持原值；传空串 = 清除（`username: ""` 会连带清掉密码）。合并后走 import 同一套 `socks5Record()` 校验。同时把该行的 `raw` 重写为 `host:port`，清掉导入时可能残留的明文密码。
+
+代理凭据在系统里存三份（池 → `vms/<id>.json` → `worker.json`），所以本端点会对每个已绑槽位回写槽位文件并重载 worker（停调度 → reload → 恢复），reason 记为 `proxy_edit_worker_reload`。单个槽位重载失败不会让请求失败——池已经改了，回滚更乱；失败信息逐槽位放在响应里由运维决定是否重试。
+
+响应 `{ proxy, workers: [{ vm_id, ok, error }] }`。错误：`404 proxy_not_found`、`400 invalid_proxy`、`400 no_editable_fields`、`400 password_without_username`（SOCKS5 没有只有密码的认证方式，`socks5Record()` 见用户名为空就丢弃密码，所以这个组合直接拒掉而不是静默存成「仍无账密」）。
+
+**路由顺序**：该路由必须排在 `PUT /proxies/config` 之后（`[^/]+` 也会匹配 `config`，且两者方法相同）。实现里另加了 `(?!config$)` 负向前瞻，把这个顺序依赖写成显式约束。
+
+### `POST /proxies/:id/reveal`
+
+**唯一允许返回代理凭据的端点。** 响应 `{ ok, id, uri }`，`uri` 形如 `socks5://user:pass@host:port`（无账密时不带 `user:pass@`）。
+
+只给拼好的 URI、不给分立的 username/password 字段——调用方唯一的正当用途是复制，拆开只会增加它被渲染到界面上的机会。调用方侧的对应约束：只允许写入剪贴板，不得渲染、不得存入前端状态、不得记日志。
+
+形态对齐既有的 `POST /api-keys/:id/reveal`：POST 而非 GET（不进浏览器历史与缓存）、无请求体、无二次确认、不记审计（网关目前没有审计机制，为单个端点首创属于越界）。
+
+与 `getProxyForVm()` 不同，本端点**不过滤** `enabled`/`status`——被禁用或已失效的代理恰恰是运维最需要读回来排查的。
+
+> 除此之外，任何 `/api/panel/*` 响应都不得包含代理账密；`GET /proxies` 永不返回（`publicProxy()` 只吐 `has_auth` 布尔）。
+
+sessionKey / 授权码导入必须走该槽 SOCKS5。
+
+## 管理口（master）
+
+常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 与 `GET /v1/models` 一样只读本地策略目录，不 hop 槽位。`GET/POST /admin/vm/claude-code/*` 返回 410。

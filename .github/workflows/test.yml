@@ -1,0 +1,100 @@
+# Required PR/main gate: unit + worker + api-kernel + rust kernels + web.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - name: format-check
+        run: npx biome format
+      - name: syntax-check hot path
+        run: |
+          node --check src/server.mjs
+          find src -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - run: npm run test:unit
+
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: gofmt
+        run: test -z "$(gofmt -l worker api-kernel)"
+      - name: go test race
+        working-directory: worker
+        run: go test -race ./...
+      - name: go vet
+        working-directory: worker
+        run: go vet ./...
+      - name: build kin-worker
+        run: mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-worker ./cmd/kin-worker
+
+  api-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: go test
+        working-directory: api-kernel
+        run: go test ./...
+      - name: build kin-api-kernel
+        run: mkdir -p bin && cd api-kernel && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-api-kernel ./cmd/kin-api-kernel
+
+  kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test kin-kernel
+        run: cargo test --manifest-path crates/kin-kernel/Cargo.toml
+      - name: cargo test codex-kernel
+        run: cargo test --manifest-path crates/codex-kernel/Cargo.toml
+      - name: release build
+        run: |
+          cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
+          cargo build --release --manifest-path crates/codex-kernel/Cargo.toml
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: install and verify
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm build

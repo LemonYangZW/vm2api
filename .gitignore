@@ -1,0 +1,37 @@
+# runtime
+src/config/test.key
+src/config/gateway-v2.json
+src/config/gateway-v2.public.json
+src/captures/
+src/data/
+data/
+vms/
+hypervisor/*.env
+**/*.key
+**/node_modules/
+**/.credentials.json
+**/credentials.json
+**/.env
+**/.env.*
+*.bak*
+bin/
+.workflow/
+__pycache__/
+web/dist/
+**/target/
+.local/
+
+# keep example
+!src/config/gateway-v2.example.json
+
+# local / editor / agent trees — never publish
+.claude/
+.cursor/
+.pi/
+.trellis/
+.vscode/
+.agents/
+.codex/
+.impeccable/
+.idea/
+*.swp

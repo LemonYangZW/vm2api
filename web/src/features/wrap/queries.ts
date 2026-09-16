@@ -1,0 +1,81 @@
+import { queryOptions } from '@tanstack/react-query'
+import { api } from '@/lib/api'
+
+export type WrapSampleMeta = {
+  source?: string
+  source_vm?: string
+  captured_at?: string
+  kernel?: string
+  glibc_shim?: boolean
+  files?: string[]
+}
+
+export type WrapSample = {
+  ok: boolean
+  dir?: string
+  kernel_bin?: boolean
+  glibc_shim?: boolean
+  wrapper?: boolean
+  code?: string
+  error?: string
+  meta?: WrapSampleMeta | null
+}
+
+export type WrapSyncReport = {
+  ok?: boolean
+  src?: string
+  meta?: WrapSampleMeta | null
+  total?: number
+  ok_count?: number
+  failed_count?: number
+  items?: {
+    id?: string
+    ok?: boolean
+    error?: string
+    code?: string
+    kernel?: { ok?: boolean; skipped?: boolean; error?: string }
+  }[]
+}
+
+export type WrapRepairReport = {
+  wrap?: { ok?: boolean; dest?: string; error?: string }
+  kernel?: { ok?: boolean; skipped?: boolean; reason?: string; error?: string }
+}
+
+export function wrapSampleQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'wrap-cli'] as const,
+    queryFn: () => api<WrapSample>('/api/panel/wrap-cli'),
+  })
+}
+
+export function syncWrapSample(
+  body: { ids?: string[]; restart?: boolean } = {}
+) {
+  return api<WrapSyncReport>('/api/panel/wrap-cli/sync', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function makeWrapSample(body: { glibc_vm?: string } = {}) {
+  const glibc_vm = String(body.glibc_vm || '').trim()
+  return api<WrapSample>('/api/panel/wrap-cli/make', {
+    method: 'POST',
+    body: JSON.stringify(glibc_vm ? { glibc_vm } : {}),
+  })
+}
+
+export function promoteWrapSample(id: string) {
+  return api<WrapSample>(
+    `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/promote`,
+    { method: 'POST', body: JSON.stringify({}) }
+  )
+}
+
+export function repairWrapSample(id: string) {
+  return api<WrapRepairReport>(
+    `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/repair`,
+    { method: 'POST', body: JSON.stringify({}) }
+  )
+}

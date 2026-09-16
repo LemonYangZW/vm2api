@@ -1,0 +1,45 @@
+# Publish linux amd64 binaries. Source stays in git; ELF stays on the Release.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -o dist/kin-worker ./worker/cmd/kin-worker
+          CGO_ENABLED=0 go build -trimpath -o dist/kin-egress ./worker/cmd/kin-egress
+          CGO_ENABLED=0 go build -trimpath -o dist/kin-api-kernel ./api-kernel/cmd/kin-api-kernel
+          cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
+          cargo build --release --manifest-path crates/codex-kernel/Cargo.toml
+          cp crates/kin-kernel/target/release/kin-kernel dist/kin-kernel
+          cp crates/codex-kernel/target/release/kin-codex-kernel dist/kin-codex-kernel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist/*
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          generate_release_notes: true
+          files: |
+            dist/kin-kernel
+            dist/kin-codex-kernel
+            dist/kin-worker
+            dist/kin-egress
+            dist/kin-api-kernel

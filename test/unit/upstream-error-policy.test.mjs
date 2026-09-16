@@ -1,0 +1,474 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  classifyUpstreamResult,
+  repairAnthropicRequest,
+  shouldContinue,
+} from '../../src/lib/pool/upstream-error-policy.mjs'
+
+test('unified account 429 cools account until authoritative reset', () => {
+  const now = 1_700_000_000_000
+  const reset = now + 120_000
+  const policy = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { type: 'error', error: { type: 'rate_limit_error', message: 'limited' } },
+      headers: {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-reset': String(reset),
+      },
+    },
+    { model: 'claude-opus-test', now },
+  )
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.cooldownUntil, reset)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('model 429 only cools requested model', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { type: 'rate_limit_error', message: 'model capacity' } },
+      headers: {},
+    },
+    { model: 'claude-sonnet-test', now: 1000 },
+  )
+  assert.equal(policy.scope, 'model')
+  assert.equal(policy.model, 'claude-sonnet-test')
+  assert.equal(policy.cooldownUntil, 61_000)
+})
+
+test('entitlement 429 stops without poisoning pool', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { message: 'Usage credits are required for fast mode' } },
+    },
+    { model: 'claude-opus-test' },
+  )
+  assert.equal(policy.scope, 'request')
+  assert.equal(policy.action, 'stop')
+})
+
+test('committed incomplete stream never switches account', () => {
+  const policy = classifyUpstreamResult({
+    status: 200,
+    ok: false,
+    committed: true,
+    terminalState: 'incomplete',
+  })
+  assert.equal(policy.scope, 'stream')
+  assert.equal(policy.action, 'stop')
+})
+
+test('transport proxy error rotates with proxy cooldown', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 0,
+      transportError: true,
+      body: { error: { code: 'worker_transport_error', message: 'SOCKS proxy dial failed' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.scope, 'proxy')
+  assert.equal(policy.action, 'continue-and-cooldown')
+})
+
+test('response-header timeout does not cool the account', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 502,
+      body: {
+        error: {
+          type: 'api_error',
+          code: 'upstream_transport_error',
+          message: 'net/http: timeout awaiting response headers',
+        },
+      },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.scope, 'provider')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'provider_timeout')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, true)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('generic 502/5xx can failover without account cooldown', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 502,
+      body: { error: { type: 'api_error', message: 'Upstream service temporarily unavailable' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, true)
+})
+
+test('transport timeout is not treated as a dead proxy', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 0,
+      transportError: true,
+      body: { error: { code: 'upstream_transport_error', message: 'SOCKS connection timed out' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'worker_timeout')
+  assert.equal(policy.cooldownUntil, null)
+})
+
+test('529 still uses a short provider cooldown', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 529,
+      body: { error: { type: 'overloaded_error', message: 'Overloaded' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.scope, 'provider')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.reason, 'provider_overloaded')
+  assert.equal(policy.cooldownUntil, 16_000)
+})
+
+test('signature error has one scoped repair', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 400,
+      body: { error: { message: 'thinking.signature: Field required' } },
+    },
+    { repaired: false, signatureRepair: true },
+  )
+  assert.equal(policy.action, 'repair-and-retry')
+  const body = repairAnthropicRequest(
+    {
+      thinking: { type: 'enabled', budget_tokens: 1000 },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'x' },
+            { type: 'text', text: 'keep' },
+          ],
+        },
+      ],
+    },
+    policy,
+  )
+  assert.equal(body.thinking, undefined)
+  assert.deepEqual(body.messages[0].content, [
+    { type: 'text', text: 'x' },
+    { type: 'text', text: 'keep' },
+  ])
+  const second = classifyUpstreamResult(
+    {
+      status: 400,
+      body: { error: { message: 'thinking.signature: Field required' } },
+    },
+    { repaired: true },
+  )
+  assert.equal(second.action, 'stop')
+})
+
+test('invalid thinking signature converts signed blocks to text', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 400,
+      body: { error: { message: 'messages.1.content.0: Invalid `signature` in `thinking` block' } },
+    },
+    { signatureRepair: true },
+  )
+  assert.equal(policy.action, 'repair-and-retry')
+  const body = repairAnthropicRequest(
+    {
+      thinking: { type: 'adaptive' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'draft', signature: 'bad_sig' },
+            { type: 'redacted_thinking', data: 'xx', signature: 'also_bad' },
+            { type: 'text', text: 'visible' },
+          ],
+        },
+      ],
+    },
+    policy,
+  )
+  assert.equal(body.thinking, undefined)
+  assert.deepEqual(body.messages[0].content, [
+    { type: 'text', text: 'draft' },
+    { type: 'text', text: 'visible' },
+  ])
+})
+
+test('fable 504 cools only the fable family', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 504,
+      body: { error: { message: 'timeout awaiting response headers' } },
+    },
+    { model: 'claude-fable-5', now: 1000 },
+  )
+  assert.equal(policy.scope, 'model')
+  assert.equal(policy.model, 'fable')
+  assert.equal(policy.reason, 'fable_timeout')
+})
+
+test('7d_oi 429 cools fable family not the account', () => {
+  const now = 1_700_000_000_000
+  const policy = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { type: 'rate_limit_error', message: 'limited' } },
+      headers: {
+        'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+        'anthropic-ratelimit-unified-7d_oi-reset': String(now + 90_000),
+      },
+    },
+    { model: 'claude-fable-5[1m]', now },
+  )
+  assert.equal(policy.scope, 'model')
+  assert.equal(policy.model, 'fable')
+  assert.equal(policy.cooldownUntil, now + 90_000)
+})
+
+test('200 refusal with empty visible output is content_filter, not success', () => {
+  const policy = classifyUpstreamResult({
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    stopReason: 'refusal',
+    body: {
+      stop_reason: 'refusal',
+      content: [{ type: 'thinking', thinking: 'hidden' }],
+      usage: { input_tokens: 7582, output_tokens: 12 },
+    },
+  })
+  assert.equal(policy.scope, 'request')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.reason, 'content_filter_refusal')
+})
+
+test('assistant prefill 400 is repairable', () => {
+  const policy = classifyUpstreamResult({
+    status: 400,
+    body: { error: { message: 'Conversation must end with a user message' } },
+  })
+  assert.equal(policy.action, 'repair-and-retry')
+  assert.equal(policy.reason, 'prefill_repairable')
+  const body = repairAnthropicRequest(
+    {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+      ],
+    },
+    policy,
+  )
+  assert.equal(body.messages.at(-1).role, 'user')
+})
+
+test('invalid encrypted_content flattens the replayed search history once', () => {
+  const result = {
+    status: 400,
+    body: { error: { message: 'messages.1.content.0: Invalid `encrypted_content` in `search_result` block' } },
+  }
+  const policy = classifyUpstreamResult(result)
+  assert.equal(policy.action, 'repair-and-retry')
+  assert.equal(policy.reason, 'search_repairable')
+  const body = repairAnthropicRequest(
+    {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '搜索最新公告' }] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'news' } },
+            {
+              type: 'web_search_tool_result',
+              tool_use_id: 'srvtoolu_1',
+              content: [{ type: 'web_search_result', title: 'T', url: 'https://a.co', encrypted_content: 'AAAA' }],
+            },
+          ],
+        },
+        { role: 'user', content: [{ type: 'text', text: '继续' }] },
+      ],
+    },
+    policy,
+  )
+  assert.equal(JSON.stringify(body).includes('encrypted_content'), false)
+  assert.equal(
+    body.messages[1].content.every((block) => block.type === 'text'),
+    true,
+  )
+
+  assert.equal(classifyUpstreamResult(result, { repaired: true }).action, 'stop')
+})
+
+test('401 with refresh is oauth_revoked on the first hop', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 401,
+      body: { error: { message: 'invalid or expired credentials' } },
+    },
+    { hasRefresh: true, oauth401CooldownMs: 20_000 },
+  )
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.reason, 'oauth_revoked')
+  assert.equal(policy.cooldownUntil, Number.MAX_SAFE_INTEGER)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('401 revoked message is oauth_revoked', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 401,
+      body: { error: { message: 'OAuth access token has been revoked' } },
+    },
+    {
+      hasRefresh: true,
+      credentialGeneration: 7,
+      priorAuth401Generation: 7,
+    },
+  )
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.reason, 'oauth_revoked')
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('wrap 200 invalid_grant is oauth_revoked even after commit', () => {
+  const policy = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 200,
+      committed: true,
+      terminalState: 'incomplete',
+      body: {
+        error: { type: 'authentication_error', code: 'invalid_grant', message: 'OAuth credential was rejected' },
+      },
+    },
+    { hasRefresh: true },
+  )
+  assert.equal(policy.reason, 'oauth_revoked')
+  assert.equal(policy.action, 'continue-and-cooldown')
+})
+
+test('401 without refresh disables the grant and keeps failover', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 401,
+      body: { error: { message: 'invalid or expired credentials' } },
+    },
+    { hasRefresh: false },
+  )
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.reason, 'oauth_no_refresh')
+  assert.equal(policy.cooldownUntil, Number.MAX_SAFE_INTEGER)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('fable 403 is plan denied and does not park the credential', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 403,
+      body: { error: { type: 'permission_error', message: 'permission denied' } },
+    },
+    { model: 'claude-fable-5' },
+  )
+  assert.equal(policy.reason, 'fable_plan_denied')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.mark_tier, 'pro')
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('non-fable 403 still cools the credential', () => {
+  const now = 1_700_000_000_000
+  const policy = classifyUpstreamResult(
+    {
+      status: 403,
+      body: { error: { type: 'permission_error', message: 'permission denied' } },
+    },
+    { model: 'claude-sonnet-5', now, oauth401CooldownMs: 20_000 },
+  )
+  assert.equal(policy.reason, 'permission_denied')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.scope, 'credential')
+})
+
+test('empty thinking history after repair gets a placeholder', () => {
+  const body = repairAnthropicRequest(
+    {
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'thinking', thinking: '', signature: 'x' }],
+        },
+      ],
+    },
+    { action: 'repair-and-retry' },
+  )
+  assert.deepEqual(body.messages[0].content, [{ type: 'text', text: '(assistant content removed)' }])
+})
+
+const SIGNATURE_400 = {
+  status: 400,
+  body: {
+    error: {
+      type: 'invalid_request_error',
+      message: 'messages.1.content.0.thinking: The `signature` field is invalid',
+    },
+  },
+}
+
+test('signature 400 is passed through by default', () => {
+  const policy = classifyUpstreamResult(SIGNATURE_400, { model: 'claude-sonnet-5' })
+  assert.equal(policy.reason, 'invalid_request')
+  assert.equal(policy.action, 'stop')
+  assert.equal(shouldContinue(policy), false)
+})
+
+test('signatureRepair=true repairs and retries the signature 400', () => {
+  const policy = classifyUpstreamResult(SIGNATURE_400, {
+    model: 'claude-sonnet-5',
+    signatureRepair: true,
+  })
+  assert.equal(policy.reason, 'signature_repairable')
+  assert.equal(policy.action, 'repair-and-retry')
+})
+
+test('signatureRepair=false passes the upstream signature 400 back to the caller', () => {
+  const policy = classifyUpstreamResult(SIGNATURE_400, {
+    model: 'claude-sonnet-5',
+    signatureRepair: false,
+  })
+  assert.equal(policy.reason, 'invalid_request')
+  assert.equal(policy.action, 'stop')
+  assert.equal(shouldContinue(policy), false)
+})
+
+test('signatureRepair=false leaves the other 400 repairs alone', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 400,
+      body: { error: { message: 'Invalid `encrypted_content` in `search_result` block' } },
+    },
+    { model: 'claude-sonnet-5', signatureRepair: false },
+  )
+  assert.equal(policy.reason, 'search_repairable')
+  assert.equal(policy.action, 'repair-and-retry')
+})

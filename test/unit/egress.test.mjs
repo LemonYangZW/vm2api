@@ -1,0 +1,64 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  bridgeName,
+  chainName,
+  egressEnabled,
+  inspectEgressProcess,
+  iptablesPlan,
+  networkName,
+  portsForProxy,
+  slotNetworkForVm,
+} from '../../src/lib/vm/egress.mjs'
+
+test('names stay short and stable per proxy id', () => {
+  assert.equal(networkName('px-a1b2c3d4'), 'kin-eg-px-a1b2c3d4')
+  assert.ok(bridgeName('px-a1b2c3d4').length <= 15)
+  assert.equal(bridgeName('px-a1b2c3d4'), bridgeName('px-a1b2c3d4'))
+  assert.ok(chainName('px-a1b2c3d4').startsWith('KEG'))
+})
+
+test('ports are even/odd pair in 20000-35999', () => {
+  const a = portsForProxy('px-a1b2c3d4')
+  const b = portsForProxy('px-ffffffff')
+  assert.equal(a.dns, a.tcp + 1)
+  assert.ok(a.tcp >= 20000 && a.tcp < 36000)
+  assert.notEqual(a.tcp, b.tcp)
+})
+
+test('iptables plan redirects tcp and dns, returns subnet, drops the rest', () => {
+  const plan = iptablesPlan({
+    chain: 'KEGa1b2c3d4',
+    bridge: 'kega1b2c3d4',
+    subnet: '172.31.0.0/24',
+    tcpPort: 20010,
+    dnsPort: 20011,
+  })
+  const joined = plan.add.map((row) => row.join(' '))
+  assert.ok(joined.some((s) => s.includes('REDIRECT --to-ports 20010')))
+  assert.ok(joined.some((s) => s.includes('--dport 53') && s.includes('20011')))
+  assert.ok(joined.some((s) => s.includes('-p tcp --dport 53') && s.includes('20011')))
+  assert.ok(joined.some((s) => s.includes('-F KEGa1b2c3d4')))
+  assert.ok(joined.some((s) => s.includes('-d 172.31.0.0/24 -j RETURN')))
+  assert.ok(joined.some((s) => s.includes('FORWARD') && s.includes('DROP')))
+  assert.ok(plan.del.some((row) => row.includes('-X')))
+})
+
+test('slot network is bound proxy net and never host', () => {
+  const vm = { proxy: { id: 'px-a1b2c3d4' } }
+  assert.equal(slotNetworkForVm(vm, { KIN_VM_NETWORK: 'host' }), 'kin-eg-px-a1b2c3d4')
+  assert.equal(slotNetworkForVm({}, { KIN_VM_NETWORK: 'host' }), '')
+  assert.equal(egressEnabled({}), true)
+  assert.equal(egressEnabled({ KIN_EGRESS: '0' }), true)
+})
+
+test('inspectEgressProcess reports missing pid as not_running', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-eg-inspect-'))
+  const st = inspectEgressProcess(root, 'px-deadbeef')
+  assert.equal(st.ok, false)
+  assert.equal(st.reason, 'not_running')
+  fs.rmSync(root, { recursive: true, force: true })
+})
