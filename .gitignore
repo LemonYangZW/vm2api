@@ -4,7 +4,7 @@ src/config/gateway-v2.json
 src/config/gateway-v2.public.json
 src/captures/
 src/data/
-data/
+/data/
 vms/
 hypervisor/*.env
 **/*.key
