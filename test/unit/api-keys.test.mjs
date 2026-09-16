@@ -10,14 +10,14 @@ function tmpStore() {
   return new ApiKeyStore({ dataDir: dir })
 }
 
-test('generateApiKey uses sk-kin- prefix and is long enough', () => {
+test('generateApiKey uses sk-vm- prefix and is long enough', () => {
   const k = generateApiKey()
-  assert.match(k, /^sk-kin-[a-f0-9]{64}$/)
+  assert.match(k, /^sk-vm-[a-f0-9]{64}$/)
   assert.notEqual(k, generateApiKey())
 })
 
 test('maskApiKey hides middle', () => {
-  const k = 'sk-kin-' + 'a'.repeat(64)
+  const k = 'sk-vm-' + 'a'.repeat(64)
   const m = maskApiKey(k)
   assert.ok(m.includes('…'))
   assert.ok(!m.includes('a'.repeat(20)))

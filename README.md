@@ -62,8 +62,7 @@ Claude 看到的是 **Console API**，不是 OAuth。因此 **0 提示词注入*
 ```text
 web/                  Vite 管理台
 src/                  Node 控制面
-crates/kin-kernel/    Claude Rust 内核
-crates/codex-kernel/  GPT Rust 内核
+crates/               Claude / GPT Rust 内核
 worker/               Go 槽位服务
 api-kernel/           Go API 内核
 docs/                 路线图 + 契约
@@ -72,7 +71,7 @@ docs/                 路线图 + 契约
 ```bash
 npm ci && npm test
 npm run build:worker && npm run build:kernel && npm run build:web
-export KIN_API_KEY=... KIN_ADMIN_PASSWORD=... KIN_DB_SECRET=...
+export VM2API_API_KEY=... VM2API_ADMIN_PASSWORD=... VM2API_DB_SECRET=...
 node src/server.mjs    # :8787   管理台 GET /console
 ```
 

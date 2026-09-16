@@ -12,8 +12,11 @@ const PROJECT = path.resolve(process.env.KIN_PROJECT_ROOT || path.resolve(ROOT, 
 
 export function loadConfig() {
   const keyFile = path.join(ROOT, 'config', 'test.key')
-  const apiKey = process.env.KIN_API_KEY || (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : null)
-  if (!apiKey) throw new Error('KIN_API_KEY not set')
+  const apiKey =
+    process.env.VM2API_API_KEY ||
+    process.env.KIN_API_KEY ||
+    (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : null)
+  if (!apiKey) throw new Error('VM2API_API_KEY not set')
 
   const active = JSON.parse(fs.readFileSync(path.join(PROJECT, 'vms', 'active.json'), 'utf8'))
   const vm = JSON.parse(fs.readFileSync(path.join(PROJECT, 'vms', `${active.active_vm}.json`), 'utf8'))

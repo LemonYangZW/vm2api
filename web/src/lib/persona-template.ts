@@ -71,7 +71,7 @@ export const PERSONA_TEMPLATE_VARS: [string, string][] = [
     "官方身份句 You are a Claude agent, built on Anthropic's Claude Agent SDK.",
   ],
   ['identity_compact', '0注入短身份句 You are Anthropic Claude Agent SDK.'],
-  ['agent_expansion', 'KIN 短 agent 扩写段'],
+  ['agent_expansion', '短 agent 扩写段'],
   ['agent_official', '官方 agent 提示词全文'],
   ['caller_agent', '调用方自带的 agent prompt，无则为空'],
   ['caller_system', '调用方剩余 system（--append-system-prompt），无则为空'],

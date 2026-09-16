@@ -17,7 +17,7 @@ export function redactSecrets(obj) {
   const s = JSON.stringify(obj)
   return s
     .replace(/sk-ant-[a-z0-9-]{8,}/gi, (m) => m.slice(0, 14) + '***REDACTED***')
-    .replace(/sk-kin-[a-f0-9]{8,}/gi, (m) => m.slice(0, 10) + '***REDACTED***')
+    .replace(/sk-(?:kin|vm)-[a-f0-9]{8,}/gi, (m) => m.slice(0, 10) + '***REDACTED***')
     .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer ***REDACTED***')
 }
 
@@ -68,8 +68,8 @@ export const HOP_BY_HOP = new Set([
 /** Panel admin credentials (env override) */
 export function getPanelAdmin() {
   return {
-    username: process.env.KIN_ADMIN_USER || 'admin',
-    password: process.env.KIN_ADMIN_PASSWORD || '',
+    username: process.env.VM2API_ADMIN_USER || process.env.KIN_ADMIN_USER || 'admin',
+    password: process.env.VM2API_ADMIN_PASSWORD || process.env.KIN_ADMIN_PASSWORD || '',
   }
 }
 

@@ -22,7 +22,7 @@ import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
 
-const KEY_PREFIX = 'sk-kin-'
+const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
 
 function clampInt(n, min, max, fallback) {
@@ -115,8 +115,11 @@ export class ApiKeyStore {
     this.repo = new ApiKeysRepo(this.db)
     this.hashSecret = String(
       hashSecret ||
+        process.env.VM2API_API_KEY_HASH_SECRET ||
         process.env.KIN_API_KEY_HASH_SECRET ||
+        process.env.VM2API_DB_SECRET ||
         process.env.KIN_DB_SECRET ||
+        process.env.VM2API_API_KEY ||
         process.env.KIN_API_KEY ||
         'kin-development-api-key-hash-secret',
     )

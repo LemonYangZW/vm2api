@@ -966,7 +966,7 @@ export function createPanelHandler(ctx) {
         const { items, total } = requestLog.exportRows(filters)
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
         const body = format === 'csv' ? logsToCsv(items) : logsToJsonl(items)
-        const filename = `kin-logs-${stamp}.${format}`
+        const filename = `vm2api-logs-${stamp}.${format}`
         res.writeHead(200, {
           'content-type': format === 'csv' ? 'text/csv; charset=utf-8' : 'application/x-ndjson; charset=utf-8',
           'content-disposition': `attachment; filename="${filename}"`,

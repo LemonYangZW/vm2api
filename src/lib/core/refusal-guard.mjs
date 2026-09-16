@@ -12,7 +12,8 @@ export const REFUSAL_GUARD_MESSAGE =
 export const REFUSAL_GUARD_SETTING = 'refusal_guard_enabled'
 
 export function isRefusalGuardEnabled(readSetting) {
-  if (process.env.KIN_REFUSAL_GUARD === '0' || process.env.KIN_REFUSAL_GUARD === 'false') return false
+  const flag = process.env.VM2API_REFUSAL_GUARD || process.env.REFUSAL_GUARD || process.env.KIN_REFUSAL_GUARD
+  if (flag === '0' || flag === 'false') return false
   if (typeof readSetting === 'function') {
     try {
       const v = readSetting(REFUSAL_GUARD_SETTING, true)

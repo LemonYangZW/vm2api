@@ -186,8 +186,8 @@ export function WrapSamplePage() {
         }
       >
         <p className='mb-4 max-w-3xl text-sm leading-relaxed text-muted-foreground'>
-          母样本是唯一一份已验证的 wrap 运行时（patched Claude Code + kin-kernel
-          + CONNECT 桥）。同步只覆盖槽内 <code>.kin</code>，不改票、不改
+          母样本是唯一一份已验证的 wrap 运行时（patched Claude Code + kernel
+          + CONNECT 桥）。同步只覆盖槽内运行时目录，不改票、不改
           SOCKS、不 docker rm。Debian 12 靠样本里的 glibc 2.39 shim。
         </p>
         <div className='grid gap-4 lg:grid-cols-2'>
@@ -216,7 +216,7 @@ export function WrapSamplePage() {
                       {data?.meta?.captured_at || '—'}
                     </span>
                   </div>
-                  <Flag ok={data?.kernel_bin} label='kin-kernel.bin' />
+                  <Flag ok={data?.kernel_bin} label='kernel.bin' />
                   <Flag ok={data?.wrapper} label='kernel wrapper' />
                   <Flag ok={data?.glibc_shim} label='glibc 2.39 shim' />
                 </>

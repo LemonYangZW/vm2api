@@ -2,7 +2,7 @@
  * Optional at-rest encryption for credential fields in the DB
  * (sub2api AESEncryptor counterpart, zero-dependency node:crypto).
  *
- * Enabled when KIN_DB_SECRET is set: AES-256-GCM, key = SHA-256(secret).
+ * Enabled when VM2API_DB_SECRET (or KIN_DB_SECRET) is set: AES-256-GCM, key = SHA-256(secret).
  * Format: enc:v1:<iv_b64>:<tag_b64>:<ciphertext_b64>
  * Without the secret, values are stored as-is (matching the previous
  * plaintext-file-with-0600 behavior).
@@ -12,15 +12,19 @@ import crypto from 'node:crypto'
 
 const PREFIX = 'enc:v1:'
 
-export function encryptionEnabled() {
-  return !!process.env.KIN_DB_SECRET
+function dbSecret() {
+  return process.env.VM2API_DB_SECRET || process.env.KIN_DB_SECRET
 }
 
-function deriveKey(secret = process.env.KIN_DB_SECRET) {
+export function encryptionEnabled() {
+  return !!dbSecret()
+}
+
+function deriveKey(secret = dbSecret()) {
   return crypto.createHash('sha256').update(String(secret)).digest()
 }
 
-export function encryptString(plain, secret = process.env.KIN_DB_SECRET) {
+export function encryptString(plain, secret = dbSecret()) {
   if (plain == null) return null
   const key = deriveKey(secret)
   const iv = crypto.randomBytes(12)
@@ -30,7 +34,7 @@ export function encryptString(plain, secret = process.env.KIN_DB_SECRET) {
   return PREFIX + [iv.toString('base64'), tag.toString('base64'), ct.toString('base64')].join(':')
 }
 
-export function decryptString(value, secret = process.env.KIN_DB_SECRET) {
+export function decryptString(value, secret = dbSecret()) {
   if (value == null) return null
   const s = String(value)
   if (!s.startsWith(PREFIX)) return s

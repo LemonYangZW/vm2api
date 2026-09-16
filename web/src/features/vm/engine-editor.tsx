@@ -75,7 +75,7 @@ export function VmEngineEditor({
         >
           设置 → 协议
         </Link>
-        。不要把槽切到会启动 kin-worker hop 的 Go。
+        。不要把槽切到会启动 Go worker hop 的路径。
       </p>
       {inherits ? null : (
         <Button

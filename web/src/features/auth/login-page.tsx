@@ -51,7 +51,7 @@ export function LoginPage() {
     <div className='flex min-h-svh items-center justify-center bg-background p-6'>
       <Card className='w-full max-w-sm'>
         <CardHeader>
-          <CardTitle className='text-xl'>种核 KIN</CardTitle>
+          <CardTitle className='text-xl'>vm2api</CardTitle>
           <p className='text-sm text-muted-foreground'>号池管理台</p>
         </CardHeader>
         <CardContent>

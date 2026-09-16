@@ -132,7 +132,7 @@ function workerLabel(value: unknown) {
 function topologyLabel(
   topology: VmKernelSnapshot['process_topology'] | undefined
 ) {
-  if (topology?.rust_pid1) return 'kin-kernel PID1'
+  if (topology?.rust_pid1) return 'kernel PID1'
   if (topology?.go_worker_pid1) return 'Go worker PID1（旧拓扑）'
   return '未知'
 }

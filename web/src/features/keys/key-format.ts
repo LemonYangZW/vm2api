@@ -12,7 +12,7 @@ export function maskApiKeyItem(k: ApiKeyItem): string {
   }
   if (raw.length > 16) return `${raw.slice(0, 8)}…${raw.slice(-4)}`
   if (prefix && suffix) return `${prefix}…${suffix}`
-  return prefix || raw || 'sk-kin-…'
+  return prefix || raw || 'sk-vm-…'
 }
 
 export function keyIsExpired(k: ApiKeyItem): boolean {

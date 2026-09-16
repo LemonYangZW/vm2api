@@ -191,7 +191,7 @@ export function KeysPage() {
       >
         {keys.length === 0 ? (
           <EmptyState
-            reason='尚无密钥。sk-kin 只能调 /v1。'
+            reason='尚无密钥。协议密钥只能调 /v1。'
             actionLabel='生成'
             onAction={() => setCreateOpen(true)}
           />

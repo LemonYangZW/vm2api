@@ -26,7 +26,7 @@ test('data survives a full gateway restart on the same data dir', async () => {
     })
     assert.equal(r.status, 201, r.text)
     created = r.json.item
-    assert.match(created.key, /^sk-kin-/)
+    assert.match(created.key, /^sk-vm-/)
 
     // 2. run one inference with the managed key → usage + request log
     const m = await api(gw, 'POST', '/v1/messages', {

@@ -50,7 +50,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
           <CardTitle className='text-sm'>绑定的 SOCKS5</CardTitle>
         </CardHeader>
         <p className='px-6 pb-2 text-xs text-muted-foreground'>
-          出站经这条代理的 kin-egress 网关。槽内不 Dial SOCKS。
+          出站经这条代理的 egress 网关。槽内不 Dial SOCKS。
         </p>
         <CardContent className='divide-y pt-0'>
           <Field label='绑定 ID'>

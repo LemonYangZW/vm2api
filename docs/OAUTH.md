@@ -27,7 +27,7 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 
 ## 导入门控
 
-三条入口都要求槽位已存在且绑定可用 SOCKS5。生产忽略 `require_proxy: false`（仅 `KIN_CRS_MOCK=1` 可绕过）。
+三条入口都要求槽位已存在且绑定可用 SOCKS5。生产忽略 `require_proxy: false`（仅测试 mock 可绕过）。
 
 | 入口 | 路径 | 说明 |
 |------|------|------|

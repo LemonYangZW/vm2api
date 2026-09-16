@@ -44,7 +44,7 @@ export function CacheBreakpointsPane({
             上游只缓存到断点为止的前缀，所以一个不带 <code>cache_control</code>{' '}
             的请求无论 TTL 写什么都是全价。「缓存
             TTL」只给已有断点重新定时，断点本身由这里造。默认打 5m；入站自己要
-            1h（头 <code>x-kin-cache-ttl</code> 或 <code>cache_control</code>
+            1h（缓存 TTL 请求头或 <code>cache_control</code>
             ）时跟着升到 1h。上游一次最多 4 个断点，超了按 tools → messages →
             system 的顺序舍弃。官方 Claude Code 原生请求整包跳过。
           </p>

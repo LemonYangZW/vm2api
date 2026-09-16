@@ -275,7 +275,7 @@ export async function buildDashboard({
   return ok({
     health: {
       status: 'ok',
-      service: 'kin-gateway',
+      service: 'vm2api',
       rewrite: cfg.rewrite?.enabled ? 'on' : 'off',
       base_url: cfg.base_url,
     },

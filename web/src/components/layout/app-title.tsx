@@ -26,7 +26,7 @@ export function AppTitle() {
               onClick={() => setOpenMobile(false)}
               className='grid flex-1 text-start text-sm leading-tight'
             >
-              <span className='truncate font-bold'>种核 KIN</span>
+              <span className='truncate font-bold'>vm2api</span>
               <BrandPlatforms className='mt-1' />
             </Link>
             <ToggleSidebar />

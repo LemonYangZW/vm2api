@@ -1,5 +1,5 @@
 /**
- * KIN Gateway v2.1 — Node control plane.
+ * vm2api — Node control plane.
  * Inference data plane: one long-lived Go slot worker per VM
  * (slot SOCKS5 + OAuth owner + SSE terminal validation).
  * The gateway converts protocols, schedules the account pool with bounded
@@ -108,7 +108,7 @@ const LIMITATIONS = {
 
 const cfg = loadConfig()
 if (!getPanelAdmin().password) {
-  throw new Error('KIN_ADMIN_PASSWORD must be set; insecure default panel credentials are disabled')
+  throw new Error('VM2API_ADMIN_PASSWORD must be set; insecure default panel credentials are disabled')
 }
 fs.mkdirSync(cfg.paths.captures, { recursive: true })
 
@@ -842,7 +842,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/' || p === '/health')) {
       return json(res, 200, {
         status: 'ok',
-        service: 'kin-gateway-v2.1',
+        service: 'vm2api',
         base_url: cfg.base_url,
         rewrite: cfg.rewrite.enabled ? 'on' : 'off',
         intercept_rules: cfg.intercept.rules.length,
@@ -1075,7 +1075,7 @@ server.listen(cfg.port, cfg.host, () => {
   }
   console.log(
     JSON.stringify({
-      event: 'kin-gateway-v2.1-started',
+      event: 'vm2api-started',
       port: boundPort,
       base_url: cfg.base_url,
       active_vm: getActiveVmId(cfg.paths.project),

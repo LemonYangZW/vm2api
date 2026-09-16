@@ -257,7 +257,7 @@ export function LogsPage() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `kin-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.${opts.format}`
+      a.download = `vm2api-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.${opts.format}`
       a.click()
       URL.revokeObjectURL(url)
       if (truncated && Number.isFinite(count) && Number.isFinite(exportTotal)) {

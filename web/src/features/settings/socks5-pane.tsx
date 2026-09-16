@@ -13,7 +13,7 @@ export function Socks5Pane() {
         </CardHeader>
         <CardContent className='space-y-2 text-sm text-muted-foreground'>
           <p>
-            kin-egress 是虚拟机的默认路由。槽内只推理，不 Dial SOCKS、不设
+            egress 是虚拟机的默认路由。槽内只推理，不 Dial SOCKS、不设
             HTTPS_PROXY。
           </p>
           <p>

@@ -307,7 +307,7 @@ export function ModelsPage() {
         }
       >
         <p className='mb-3 text-sm text-muted-foreground'>
-          本页只服务 oauth 分类。绑 API 的 sk-kin 走「API」页 catalog。
+          本页只服务 oauth 分类。绑 API 的协议密钥走「API」页 catalog。
         </p>
         {dirty ? (
           <p className='mb-3 text-sm text-[color:var(--status-caution)]'>

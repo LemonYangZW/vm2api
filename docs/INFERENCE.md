@@ -9,20 +9,20 @@ Node 只做控制面（鉴权、协议、人设、调度、面板）。**不直�
 
 | 开关 | 数据面 | 上游怎么走 | 内核/worker 干什么 |
 |---|---|---|---|
-| `inference.engine=rust` | wrap / cli-hop | patched Claude Code 自己打 Anthropic Messages | `kin-kernel` 只调度 native_messages：写 stdin、demux stdout。**不** HTTP hop Anthropic |
-| `inference.engine=go` | Go HTTP 转发 | `kin-worker` 挂 Authorization，经槽 SOCKS5 `POST /v1/messages` | worker 是 hop。JSON 透传 |
+| `inference.engine=rust` | wrap / cli-hop | patched Claude Code 自己打 Anthropic Messages | Claude kernel 只调度 native_messages：写 stdin、demux stdout。**不** HTTP hop Anthropic |
+| `inference.engine=go` | Go HTTP 转发 | Go worker 挂 Authorization，经槽 SOCKS5 `POST /v1/messages` | worker 是 hop。JSON 透传 |
 
 ```
 client ──nginx──► Node :8787
                      │ fingerprint / persona / pool
                      │
                      ├─ rust（必须 cli-hop）
-                     │     envelope → kin-kernel --gateway-worker
+                     │     envelope → Claude kernel --gateway-worker
                      │     provider=local_cli → patched CLI native_messages（预开 20 slot）
                      │     CLI TLS → 本机 HTTP CONNECT → 槽 SOCKS5 → api.anthropic.com
                      │
                      └─ go（HTTP 转发）
-                           envelope → kin-worker
+                           envelope → Go worker
                            worker 挂票 → 槽 SOCKS5 → api.anthropic.com
 ```
 
@@ -44,7 +44,7 @@ client ──nginx──► Node :8787
 
 - 两条路都强制槽 SOCKS5（`proxy_required=true`）。
 - wrap 预开 20 native slot；面板「并行」只改 Node inflight，不重启 kernel。
-- wrap 需要 Ubuntu 24 / 足够新的 glibc。Debian 12（glibc 2.36）上新 `kin-kernel` 起不来，应保持 `engine=go` 或快速 fallback，不要空等 health。
+- wrap 需要 Ubuntu 24 / 足够新的 glibc。Debian 12（glibc 2.36）上新 Claude kernel 起不来，应保持 `engine=go` 或快速 fallback，不要空等 health。
 - Extra 5h 以 Messages **headers** 为准。wrap 必须把 `anthropic-ratelimit-unified-5h-*` 从 CLI → kernel trailer → Node `ingestHeaders`。Go hop 本来就有这些头。
 
 ## 过期文档

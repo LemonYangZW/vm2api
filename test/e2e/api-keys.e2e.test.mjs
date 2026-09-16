@@ -11,7 +11,7 @@ test('panel creates managed key; key can call /v1/messages', async () => {
       body: { name: 'e2e', max_concurrency: 2, quota_requests: 5, rpm: 60 },
     })
     assert.equal(created.status, 201, created.text)
-    assert.ok(created.json.item?.key?.startsWith('sk-kin-'))
+    assert.ok(created.json.item?.key?.startsWith('sk-vm-'))
     const key = created.json.item.key
 
     const r = await api(gw, 'POST', '/v1/messages', {
@@ -51,7 +51,7 @@ test('panel re-reveals a used key; rotate swaps the plaintext', async () => {
     const rotated = await api(gw, 'POST', `/api/panel/api-keys/${id}/rotate`)
     assert.equal(rotated.status, 200, rotated.text)
     const next = rotated.json.item.key
-    assert.ok(next.startsWith('sk-kin-'))
+    assert.ok(next.startsWith('sk-vm-'))
     assert.notEqual(next, key)
 
     const old = await api(gw, 'POST', '/v1/messages', {

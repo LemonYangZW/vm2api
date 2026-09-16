@@ -16,18 +16,18 @@ flowchart LR
 
 | 密钥 | 来源 | 能调 |
 |------|------|------|
-| Master `KIN_API_KEY` | 环境变量 | `/v1/*` + `/api/panel/*` + `/admin/*` |
-| `sk-kin-…` | 控制台签发 | **只** `/v1/*` |
-| `kin-panel-…` | 面板登录 | **只** `/api/panel/*` |
+| Master `VM2API_API_KEY` | 环境变量 | `/v1/*` + `/api/panel/*` + `/admin/*` |
+| `sk-vm-…` | 控制台签发 | **只** `/v1/*` |
+| 面板会话 | 面板登录 | **只** `/api/panel/*` |
 
 请求头任选其一：
 
 ```http
-Authorization: Bearer sk-kin-…
-x-api-key: sk-kin-…
+Authorization: Bearer sk-vm-…
+x-api-key: sk-vm-…
 ```
 
-没有密钥 → `401 missing_api_key`。`sk-kin-…` 调面板 → `403 forbidden`。
+没有密钥 → `401 missing_api_key`。协议密钥调面板 → `403 forbidden`。
 
 ## 端点
 
@@ -52,13 +52,13 @@ x-api-key: sk-kin-…
 |----|------|
 | `content-type: application/json` | 必填 |
 | `x-session-id` / `x-conversation-id` / `x-claude-code-session-id` | sticky 键（见 `routing.sticky`） |
-| `x-kin-delivery: verified` | 缓冲到 `message_stop` 再回放 |
-| `x-kin-cache-ttl: 1h` | 出站 cache 升 1h（默认 5m） |
-| `x-kin-debug: 1` / `x-kin-log: debug\|normal\|off` | 单请求日志模式 |
-| `x-kin-vm` | **仅 master**：钉到指定槽（虚拟机测试 loopback） |
+| 交付模式 `verified` | 缓冲到 `message_stop` 再回放 |
+| 缓存 TTL `1h` | 出站 cache 升 1h（默认 5m） |
+| 调试开关 | 单请求日志模式 |
+| 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
 
-体大小上限默认 2MB（`KIN_MAX_BODY`）。超限 `400 body_too_large`。
+体大小上限默认 2MB。超限 `400 body_too_large`。
 
 ## Messages
 

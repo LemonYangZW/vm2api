@@ -1,6 +1,6 @@
 # 面板 API
 
-基址 `/api/panel`。需要**面板登录会话**或 Master `KIN_API_KEY`。`sk-kin-…` 不能调面板。信封 `{ ok, data }` / `{ ok: false, error }`。调用方应从 `data` 取业务体。
+基址 `/api/panel`。需要**面板登录会话**或 Master `VM2API_API_KEY`。协议密钥不能调面板。信封 `{ ok, data }` / `{ ok: false, error }`。调用方应从 `data` 取业务体。
 
 登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities }`。
 
@@ -14,7 +14,7 @@
 | `super` | 总览 / 集群 / 用量 / 日志 + 虚拟机 | 读 VM + 拨调度 / 清冷却 |
 | `admin` | 全部（不含用户管理页） | `*`。admin/master **未 pin** 的 `/v1` 只打未分配平台池 |
 
-开源仓 **没有用户管理**。登录只用环境变量 `KIN_ADMIN_USER` / `KIN_ADMIN_PASSWORD` 灌进去的第一个 admin。`GET/POST/PATCH/DELETE /users` 返回 `404 not_found`。
+开源仓 **没有用户管理**。登录只用环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 灌进去的第一个 admin。`GET/POST/PATCH/DELETE /users` 返回 `404 not_found`。
 
 `vms/*.json` 的 `owner_user_id` / `origin`（`platform` \| `admin_assigned` \| `user_created`）是属主 SSOT。`PATCH /vms/:id/owner` 仅 admin。自建 VM 不能收回进平台池。
 
@@ -35,7 +35,7 @@
 | POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
 | POST | `/vms/:id/schedulable` | `{ schedulable }` 是否入池；不改容器 |
 | POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标，重新入池 |
-| POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master `x-kin-vm` 钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
+| POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master 可钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
 | POST | `/vms/:id/count-tokens` | Setup Token / Console API Key 经槽 Go worker SOCKS 打官方 `POST /v1/messages/count_tokens`。body `{ model, messages, system?, tools? }`。完整 OAuth 400 `count_tokens_unsupported`。成功 `{ input_tokens, model, credential_mode, vm_id }` |
 | POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
@@ -134,7 +134,7 @@
 | DELETE | `/refusal-guards/:fingerprint` | 删除一条 64 位 hex 指纹 |
 | DELETE | `/refusal-guards` | 须 `{ "confirm": true }` 清空 |
 
-`PUT { enabled }` 写入 SQLite `settings.refusal_guard_enabled`。`KIN_REFUSAL_GUARD=0` 仍强制关闭。与蒸馏拦截独立：0 注入跳过蒸馏，本缓存仍生效。仅 admin。
+`PUT { enabled }` 写入 SQLite `settings.refusal_guard_enabled`。环境变量 `REFUSAL_GUARD=0` 仍强制关闭。与蒸馏拦截独立：0 注入跳过蒸馏，本缓存仍生效。仅 admin。
 
 
 ## 密钥 / 日志
@@ -174,7 +174,7 @@ attempts：每次选中的 VM/账号、错误域、cooldown、提交边界、终
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/test-models` | 可测模型。`vm_id` 按槽位平台过滤：GPT/Codex 只返回 `gpt-*`/`codex-*`，Claude 槽不含 GPT。`platform=openai|anthropic` 无 `vm_id` 时同样过滤。GPT 槽 `refresh=1` 经该槽 SOCKS 拉 ChatGPT `/backend-api/models` 并入矩阵，401 不换票。回包带 `platform`、`protocol`（`openai.responses` / `anthropic.messages`）、`inbound_path`。 |
-| POST/GET | `/concurrent-test` | 研报压测；默认并发 10、2 轮、Opus5/Sonnet5/Fable5、预算 32000。UA `kin-console-loadtest/1.0`，走 `/v1` |
+| POST/GET | `/concurrent-test` | 研报压测；默认并发 10、2 轮、Opus5/Sonnet5/Fable5、预算 32000。走 `/v1` |
 | GET | `/concurrent-tests` · `/concurrent-test-reports` | 历史与落盘报告（`data/loadtests/reports/`） |
 | GET | `/probe-test/catalog` | 能力 / 答题用例 |
 | POST/GET | `/probe-test` · `/probe-tests` | 与研报互斥 |
