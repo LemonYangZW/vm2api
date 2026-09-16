@@ -31,6 +31,8 @@ export type VmProxySnap = {
   bound_count?: number
   bind_limit?: number
   created_at?: string
+  kind?: 'local' | 'socks5' | string
+  scheme?: string
 }
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'

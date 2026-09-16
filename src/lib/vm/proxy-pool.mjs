@@ -14,6 +14,7 @@ import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId } from '../admin/resource-owner.mjs'
+import { LOCAL_EGRESS_ID, isLocalEgressProxy } from './egress.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
 export const BIND_LIMIT_MIN = 1
@@ -111,6 +112,23 @@ function looksLikeHost(value) {
   const host = String(value || '').trim()
   if (!host || /^\d+$/.test(host)) return false
   return true
+}
+
+function localEgressRecord() {
+  return {
+    id: LOCAL_EGRESS_ID,
+    scheme: 'local',
+    kind: 'local',
+    host: 'local',
+    port: 0,
+    username: null,
+    password: null,
+    raw: 'local',
+    enabled: true,
+    status: 'ok',
+    bound_vm_ids: [],
+    created_at: new Date().toISOString(),
+  }
 }
 
 function socks5Record({ host, port, username = null, password = null, raw = '' }) {
@@ -309,7 +327,18 @@ export class ProxyPool {
       last_probe_at: p.last_probe_at || null,
       last_error: p.last_error || null,
       created_at: p.created_at,
+      kind: isLocalEgressProxy(p) ? 'local' : 'socks5',
+      scheme: isLocalEgressProxy(p) ? 'local' : p.scheme || 'socks5',
     }
+  }
+
+  ensureLocal() {
+    const existing = this.state.proxies.find((p) => isLocalEgressProxy(p))
+    if (existing) return { ok: true, created: false, proxy: this.publicProxy(existing) }
+    const proxy = localEgressRecord()
+    this.state.proxies.unshift(proxy)
+    this.save()
+    return { ok: true, created: true, proxy: this.publicProxy(proxy) }
   }
 
   importLines(text, extra = {}) {
@@ -629,6 +658,22 @@ export class ProxyPool {
    * Full SOCKS5 auth handshake is best-effort.
    */
   async probeOne(proxy) {
+    if (isLocalEgressProxy(proxy)) {
+      if (typeof this.egressCheck !== 'function') {
+        return { ok: true, scope: 'local', latency_ms: 0 }
+      }
+      let eg = this.egressCheck(proxy)
+      if (!eg?.ok && typeof this.repairEgress === 'function') {
+        try {
+          this.repairEgress(proxy)
+        } catch {
+          /* keep */
+        }
+        eg = this.egressCheck(proxy)
+      }
+      if (eg?.ok) return { ok: true, scope: 'local', latency_ms: 0 }
+      return { ok: false, scope: 'egress', socks_ok: true, latency_ms: 0, error: eg?.reason || 'local_network_missing' }
+    }
     const socks = await this._probeSocks(proxy)
     if (!socks.ok) return { ...socks, scope: 'socks' }
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
@@ -811,6 +856,18 @@ export class ProxyPool {
   }
 
   _withAuth(p) {
+    if (isLocalEgressProxy(p)) {
+      return {
+        id: p.id || LOCAL_EGRESS_ID,
+        url: '',
+        host: 'local',
+        port: 0,
+        scheme: 'local',
+        kind: 'local',
+        username: null,
+        password: null,
+      }
+    }
     const auth = p.username != null ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || '')}@` : ''
     return {
       id: p.id,

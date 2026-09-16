@@ -24,7 +24,6 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath -o dist/kin-worker ./worker/cmd/kin-worker
           CGO_ENABLED=0 go build -trimpath -o dist/kin-egress ./worker/cmd/kin-egress
-          CGO_ENABLED=0 go build -trimpath -o dist/kin-api-kernel ./api-kernel/cmd/kin-api-kernel
           cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
           cargo build --release --manifest-path crates/codex-kernel/Cargo.toml
           cp crates/kin-kernel/target/release/kin-kernel dist/kin-kernel
@@ -42,4 +41,3 @@ jobs:
             dist/kin-codex-kernel
             dist/kin-worker
             dist/kin-egress
-            dist/kin-api-kernel

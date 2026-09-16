@@ -179,7 +179,6 @@ test('rust switch recreates a slot missing the kernel mount before health commit
           reloaded = true
           return { ok: true }
         },
-        workerHealth: async () => ({ ok: false, status: 200, version: 'go-test' }),
         ensureRustKernel: async () => ({
           ok: true,
           health: { ok: true, status: 200, engine: 'rust', worker_version: 'rust-test' },
@@ -191,7 +190,6 @@ test('rust switch recreates a slot missing the kernel mount before health commit
     assert.equal(reloaded, false)
     assert.equal(result.ok, true)
     assert.equal(result.active_engine, 'rust')
-    assert.equal(result.runtime.go.reachable, true)
     assert.equal(result.runtime.rust.reachable, true)
   } finally {
     fs.rmSync(bin, { force: true })

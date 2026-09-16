@@ -179,3 +179,20 @@ test('probeAll resurrects a probe-killed proxy', async () => {
     socks.server.close()
   }
 })
+
+test('ensureLocal adds a single local egress row', () => {
+  const pool = makePool()
+  const first = pool.ensureLocal()
+  const second = pool.ensureLocal()
+  assert.equal(first.ok, true)
+  assert.equal(first.created, true)
+  assert.equal(first.proxy.kind, 'local')
+  assert.equal(first.proxy.id, 'px-local')
+  assert.equal(second.created, false)
+  assert.equal(pool.snapshot().proxies.filter((p) => p.kind === 'local').length, 1)
+  const bound = pool.bind('px-local', 'vm-01')
+  assert.equal(bound.ok, true)
+  const auth = pool.getProxyForVm('vm-01')
+  assert.equal(auth.scheme, 'local')
+  assert.equal(auth.url, '')
+})

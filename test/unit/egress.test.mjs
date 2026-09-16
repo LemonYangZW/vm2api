@@ -4,11 +4,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  LOCAL_EGRESS_ID,
+  boundProxyUrl,
   bridgeName,
   chainName,
   egressEnabled,
   inspectEgressProcess,
   iptablesPlan,
+  isLocalEgressProxy,
   networkName,
   portsForProxy,
   slotNetworkForVm,
@@ -53,6 +56,14 @@ test('slot network is bound proxy net and never host', () => {
   assert.equal(slotNetworkForVm({}, { KIN_VM_NETWORK: 'host' }), '')
   assert.equal(egressEnabled({}), true)
   assert.equal(egressEnabled({ KIN_EGRESS: '0' }), true)
+})
+
+test('local egress is identified and has no SOCKS url', () => {
+  assert.equal(isLocalEgressProxy({ id: LOCAL_EGRESS_ID }), true)
+  assert.equal(isLocalEgressProxy({ scheme: 'local', host: 'local' }), true)
+  assert.equal(isLocalEgressProxy({ host: '1.2.3.4', port: 1080 }), false)
+  assert.equal(boundProxyUrl({ id: LOCAL_EGRESS_ID, host: 'local', port: 0 }), '')
+  assert.equal(slotNetworkForVm({ proxy: { id: LOCAL_EGRESS_ID } }), 'kin-eg-px-local')
 })
 
 test('inspectEgressProcess reports missing pid as not_running', () => {

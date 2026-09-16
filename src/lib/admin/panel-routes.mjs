@@ -1936,7 +1936,7 @@ export function createPanelHandler(ctx) {
         if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
         writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
 
-        let kernel = { ok: true, skipped: true, reason: 'engine_go' }
+        let kernel = { ok: false, skipped: true, reason: 'engine_not_rust' }
         if (resolveInferenceEngine(vm, ctx.routingConfig) === 'rust') {
           kernel = await restartRustKernel(slotExec(cfg.paths.project, vm))
         }
@@ -3075,6 +3075,11 @@ export function createPanelHandler(ctx) {
         const ident = panelIdentity(req)
         const snap = ident.role === 'user' ? proxyPool.snapshot({ ownerUserId: req.panelUserId }) : proxyPool.snapshot()
         return json(res, 200, panel.ok(snap))
+      }
+      if (req.method === 'POST' && p === '/api/panel/proxies/local') {
+        const result = proxyPool.ensureLocal()
+        if (result.created) ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(result.proxy.id))
+        return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/import') {
         const body = await readBody(req, 2 * 1024 * 1024)

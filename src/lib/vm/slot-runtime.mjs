@@ -1,7 +1,7 @@
 /**
  * Host-side slot lifecycle. Docker is implemented; KVM is a same-shaped
  * adapter that refuses until a hypervisor is wired. Guest identity / SOCKS
- * / TLS stay inside kin-worker and must not branch here.
+ * / TLS stay inside the rust kernel and must not branch here.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,7 +12,6 @@ import {
   writeKernelConfig,
 } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
-import { workerHealth } from '../transport/go-worker-client.mjs'
 import { runtimeKind, RUNTIME_KVM } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm } from './vm-registry.mjs'
 import { resolveInferenceEngine } from './slot-engine.mjs'
@@ -127,7 +126,7 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   }
   if (!eager) return { ok: true, skipped: true, reason: 'eager_start_off' }
   const engine = resolveInferenceEngine(vm, routing)
-  if (engine !== 'rust') return { ok: true, skipped: true, reason: 'engine_go', engine: 'go' }
+  if (engine !== 'rust') return { ok: true, skipped: true, reason: 'engine_not_rust', engine }
   if (!slotHasCredential(vm, projectRoot)) {
     return { ok: true, skipped: true, reason: 'no_credential', engine: 'rust' }
   }
@@ -200,23 +199,6 @@ export function slotExec(projectRoot, vm) {
   }
 }
 
-function workerReachable(health) {
-  return (
-    health?.ok === true || Number(health?.status) === 200 || health?.worker_version != null || health?.version != null
-  )
-}
-
-async function waitForGoWorker(exec, check, timeoutMs) {
-  const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
-  let health = null
-  while (Date.now() < deadline) {
-    health = await check(exec, { timeoutMs: 400 })
-    if (workerReachable(health)) return { ok: true, health }
-    await new Promise((resolve) => setTimeout(resolve, 80))
-  }
-  return { ok: false, health }
-}
-
 function kernelBinaryError(bin) {
   if (!bin || !fs.existsSync(bin)) {
     return { ok: false, code: 'kernel_binary_missing', error: 'Rust kernel binary is not configured' }
@@ -250,7 +232,6 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const hasKernelMount = ops.containerHasKernelMount || containerHasKernelMount
   const start = ops.startVmRuntime || startVmRuntime
   const reload = ops.reloadSlotWorker || reloadSlotWorker
-  const checkGo = ops.workerHealth || workerHealth
   const ensureRust = ops.ensureRustKernel || ensureRustKernel
   const kernelBin = (ops.kernelBinPath || kernelBinPath)()
   let wrap = null
@@ -287,15 +268,6 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   }
 
   const exec = slotExec(projectRoot, vm)
-  const go = await waitForGoWorker(exec, checkGo, timeoutMs)
-  if (!go.ok) {
-    return {
-      ok: false,
-      code: 'go_worker_health_timeout',
-      error: go.health?.error || 'Go credential worker health timeout',
-      runtime: { go: { reachable: false, health: go.health || null } },
-    }
-  }
   const startRust = wrapUsesSlotKernel(wrap) ? ops.restartRustKernel || restartRustKernel : ensureRust
   const rust = await startRust(exec, { timeoutMs })
   if (!rust?.ok) {
@@ -307,7 +279,6 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
       error: rust?.error || rust?.reason || 'Rust kernel failed to start',
       rollback,
       runtime: {
-        go: { reachable: true, health: go.health },
         rust: { reachable: false, health: rust?.health || null },
       },
     }
@@ -317,7 +288,6 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
     active_engine: 'rust',
     action: boot.action,
     runtime: {
-      go: { reachable: true, health: go.health },
       rust: { reachable: true, health: rust.health || null },
     },
   }

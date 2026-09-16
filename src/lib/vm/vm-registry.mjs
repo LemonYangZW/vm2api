@@ -253,7 +253,7 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
         id: proxyInfo.id,
         host: proxyInfo.host,
         port: proxyInfo.port,
-        scheme: 'socks5',
+        scheme: proxyInfo.scheme || proxyInfo.kind || 'socks5',
         url: proxyInfo.url || null,
         username: proxyInfo.username || null,
         password: proxyInfo.password == null ? null : proxyInfo.password,

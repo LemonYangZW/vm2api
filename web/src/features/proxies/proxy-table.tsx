@@ -211,7 +211,9 @@ function ProxyRow({
       )}
     >
       <div className='field-host min-w-[140px] flex-[1.2] truncate pl-3 text-xs'>
-        {item.host}:{item.port}
+        {item.kind === 'local' || item.scheme === 'local'
+          ? '本地出口'
+          : `${item.host}:${item.port}`}
         {item.has_auth ? (
           <Lock
             className='ml-1 inline size-3 align-[-1px] text-muted-foreground'

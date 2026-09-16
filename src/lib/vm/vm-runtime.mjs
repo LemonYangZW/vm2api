@@ -15,7 +15,7 @@ import { assertCliHopAllowed, resolveOfficialCcInference } from './slot-engine.m
 import { ensureSlotClaudeOwnership } from '../oauth/oauth-credentials.mjs'
 import { materializeWrapCli } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
-import { ensureProxyEgress, slotNetworkForVm } from './egress.mjs'
+import { ensureProxyEgress, isLocalEgressProxy, slotNetworkForVm } from './egress.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -171,12 +171,12 @@ function runtimePatch(vm, info, extra = {}) {
     os: meta.pretty,
     memory: MEM,
     user: runtimeUser(vm),
-    worker: extra.worker || vm.runtime?.worker || 'go',
+    worker: extra.worker || vm.runtime?.worker || 'rust',
     worker_socket: extra.worker_socket || vm.runtime?.worker_socket || null,
     worker_run_dir: extra.worker_run_dir || vm.runtime?.worker_run_dir || null,
     worker_token_file: extra.worker_token_file || vm.runtime?.worker_token_file || null,
     kernel_socket: extra.kernel_socket || vm.runtime?.kernel_socket || null,
-    egress: 'explicit-socks5',
+    egress: extra.egress || (isLocalEgressProxy(vm.proxy) ? 'local' : 'explicit-socks5'),
     ...extra,
   }
   return vm
@@ -333,15 +333,16 @@ function writeWorkerFiles(vm, projectRoot, { transparent } = {}) {
   const onEgress =
     transparent === true ||
     (transparent !== false && String(inspectContainer(containerName(vm.id))?.networkMode || '').startsWith('kin-eg-'))
-  const proxyUrl = onEgress ? '' : workerProxyUrl(vm) || ''
-  if (!onEgress && vm.proxy_required !== false && !proxyUrl) throw new Error('slot SOCKS5 proxy is required')
+  const local = isLocalEgressProxy(vm.proxy)
+  const proxyUrl = onEgress || local ? '' : workerProxyUrl(vm) || ''
+  if (!onEgress && !local && vm.proxy_required !== false && !proxyUrl) throw new Error('slot SOCKS5 proxy is required')
   const testEndpoints = process.env.KIN_WORKER_TEST_ENDPOINTS === '1'
   const workerConfig = {
     vm_id: vm.id,
     socket_path: '/run/kin/worker.sock',
     credential_path: '/home/kincli/.claude/credentials.json',
     proxy_url: proxyUrl,
-    proxy_required: onEgress ? false : vm.proxy_required !== false,
+    proxy_required: onEgress || local ? false : vm.proxy_required !== false,
     internal_token: token,
     delivery_mode: 'realtime',
     refresh_skew_seconds: 300,
@@ -355,7 +356,7 @@ function writeWorkerFiles(vm, projectRoot, { transparent } = {}) {
     runtime_kind: runtimeKind(vm),
     telemetry: buildWorkerTelemetry(vm, projectRoot),
   }
-  if (onEgress) workerConfig.egress_mode = 'transparent'
+  if (onEgress || local) workerConfig.egress_mode = 'transparent'
   if (testEndpoints) {
     const anthropicBaseUrl = String(process.env.KIN_ANTHROPIC_BASE_URL || '').trim()
     const oauthTokenUrl = String(process.env.KIN_OAUTH_TOKEN_URL || '').trim()

@@ -75,7 +75,11 @@ export function isCredentialRuntimeBlocked(state, now = Date.now(), vm = null) {
 }
 
 export function slotHasBoundProxy(vm) {
-  return !!(vm?.proxy_cli_enabled && (vm?.proxy?.url || (vm?.proxy?.host && vm?.proxy?.port)))
+  if (!vm?.proxy_cli_enabled || !vm?.proxy) return false
+  const scheme = String(vm.proxy.scheme || vm.proxy.kind || '').toLowerCase()
+  const host = String(vm.proxy.host || '').toLowerCase()
+  if (vm.proxy.id === 'px-local' || scheme === 'local' || host === 'local') return true
+  return !!(vm.proxy.url || (vm.proxy.host && vm.proxy.port))
 }
 
 export function evaluateSlotGate(vm) {

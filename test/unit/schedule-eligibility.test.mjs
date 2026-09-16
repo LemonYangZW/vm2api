@@ -282,6 +282,13 @@ test('paused slot without SOCKS is proxy_required even if pin would skip unsched
   assert.equal(gate.ok, false)
   assert.equal(gate.reason, 'vm_unschedulable')
   assert.equal(slotHasBoundProxy(paused), false)
+  assert.equal(
+    slotHasBoundProxy({
+      proxy_cli_enabled: true,
+      proxy: { id: 'px-local', scheme: 'local', host: 'local' },
+    }),
+    true,
+  )
 })
 
 test('shouldMarkMissingRefresh ignores stripped presence flags', () => {

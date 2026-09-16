@@ -67,6 +67,18 @@ export function ProxiesPage() {
       qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
     ])
 
+  const addLocal = useMutation({
+    mutationFn: () =>
+      api<Record<string, unknown>>('/api/panel/proxies/local', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    onSuccess: async (data) => {
+      toast.success(data.created ? '已添加本地出口' : '本地出口已存在')
+      await refresh()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
   const importPx = useMutation({
     mutationFn: () =>
       api<Record<string, unknown>>('/api/panel/proxies/import', {
@@ -267,6 +279,11 @@ export function ProxiesPage() {
           }
           onRawChange={setRaw}
           onImport={() => importPx.mutate()}
+          onAddLocal={() => addLocal.mutate()}
+          addingLocal={addLocal.isPending}
+          hasLocal={list.some(
+            (item) => item.kind === 'local' || item.scheme === 'local' || item.id === 'px-local'
+          )}
         />
         <ProxyTable
           rows={rows}

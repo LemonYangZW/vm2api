@@ -63,6 +63,7 @@ Claude 看到的是 **Console API**，不是 OAuth。因此 **0 提示词注入*
 web/                  Vite 管理台
 src/                  Node 控制面
 crates/kin-kernel     Claude Code Rust 内核
+worker/cmd/kin-egress SOCKS5 透明网关（本地出口不走它）
 docs/                 路线图 + 契约
 ```
 

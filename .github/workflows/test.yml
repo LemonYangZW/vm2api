@@ -1,4 +1,4 @@
-# Required PR/main gate: unit + worker + api-kernel + rust kernels + web.
+# Required PR/main gate: unit + egress/telemetry Go + rust kernels + web.
 name: ci
 
 on:
@@ -40,29 +40,15 @@ jobs:
         with:
           go-version: '1.25.x'
       - name: gofmt
-        run: test -z "$(gofmt -l worker api-kernel)"
+        run: test -z "$(gofmt -l worker)"
       - name: go test race
         working-directory: worker
         run: go test -race ./...
       - name: go vet
         working-directory: worker
         run: go vet ./...
-      - name: build kin-worker
-        run: mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-worker ./cmd/kin-worker
-
-  api-kernel:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.x'
-      - name: go test
-        working-directory: api-kernel
-        run: go test ./...
-      - name: build kin-api-kernel
-        run: mkdir -p bin && cd api-kernel && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-api-kernel ./cmd/kin-api-kernel
+      - name: build kin-egress
+        run: mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-egress ./cmd/kin-egress
 
   kernel:
     runs-on: ubuntu-latest

@@ -24,6 +24,7 @@ client ──nginx──► Node :8787
 - `resolveOfficialCcInference`：engine=rust 时 **强制** `cli-hop`。
 - `writeKernelConfig`：`provider: local_cli`。
 - 历史 `go` / `fallback_to_go` 写入一律收成 rust / false。
+- Go hop 服务端已删除。`kin-worker` 只剩 `telemetry` 子命令。
 
 ## 不要和这两件事搞混
 

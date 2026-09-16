@@ -100,7 +100,7 @@ const LIMITATIONS = {
   claude_session: 'sticky commits only after a terminally verified response',
   kernel: 'one Docker container and one long-lived Go worker per slot; not a KVM guest',
   workspace: 'client only; VM/Claude-CLI inference has been removed',
-  forward: 'Go worker uses the slot-bound SOCKS5 with no direct or CLI fallback',
+  forward: 'Rust kernel uses slot egress (SOCKS5 or local) with no Go hop',
   oauth: 'the Go slot worker Refresher.Ensure is the sole refresh manager and uses the same slot SOCKS5',
   realtime_stream:
     'account failover stops after the first downstream business event; verified mode buffers to message_stop',

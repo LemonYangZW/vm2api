@@ -1,12 +1,22 @@
 /**
  * One transparent forwarder per SOCKS5. VMs bound to that proxy join its
  * docker net; kin-egress on the host REDIRECTs the bridge into SOCKS5.
+ * `px-local` / scheme=local 是本机出口：Docker MASQUERADE，不启 kin-egress。
  */
 import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
+export const LOCAL_EGRESS_ID = 'px-local'
+
+export function isLocalEgressProxy(proxy) {
+  if (!proxy || typeof proxy !== 'object') return false
+  const id = String(proxy.id || '').trim()
+  const scheme = String(proxy.scheme || proxy.kind || '').trim().toLowerCase()
+  const host = String(proxy.host || '').trim().toLowerCase()
+  return id === LOCAL_EGRESS_ID || scheme === 'local' || host === 'local'
+}
 
 export function egressEnabled(_env = process.env) {
   return true
@@ -270,6 +280,11 @@ export function inspectEgressProcess(projectRoot, proxyId) {
 }
 
 export function egressListening(projectRoot, proxyId, timeoutMs = 400) {
+  if (String(proxyId || '').trim() === LOCAL_EGRESS_ID) {
+    const net = inspectEgressNetwork(proxyId)
+    if (net?.subnet) return { ok: true, mode: 'local', ...net }
+    return { ok: false, reason: 'local_network_missing' }
+  }
   const st = inspectEgressProcess(projectRoot, proxyId)
   if (!st.ok) return st
   const spec = String(st.listen_tcp || '')
@@ -282,6 +297,7 @@ export function egressListening(projectRoot, proxyId, timeoutMs = 400) {
 }
 
 export function boundProxyUrl(proxy) {
+  if (isLocalEgressProxy(proxy)) return ''
   if (proxy?.url) return String(proxy.url).replace(/^socks5:\/\//i, 'socks5h://')
   if (!proxy?.host || !proxy?.port) return ''
   const auth = proxy.username
@@ -308,7 +324,35 @@ function waitListen(host, port, timeoutMs = 8000) {
   return false
 }
 
+export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
+  const proxyId = proxy?.id || LOCAL_EGRESS_ID
+  const name = networkName(proxyId)
+  const br = bridgeName(proxyId)
+  if (!name) return { ok: false, error: 'proxy_id_required' }
+  const existing = inspectEgressNetwork(proxyId, runDocker)
+  if (existing?.subnet) return { ok: true, mode: 'local', ...existing, reused: true, proxy_id: proxyId }
+  const created = runDocker([
+    'network',
+    'create',
+    '--ipv6=false',
+    '--opt',
+    `com.docker.network.bridge.name=${br}`,
+    '--opt',
+    'com.docker.network.bridge.enable_ip_masquerade=true',
+    '--opt',
+    'com.docker.network.bridge.enable_icc=false',
+    name,
+  ])
+  if (!created.ok && !/already exists/i.test(created.stderr || '')) {
+    return { ok: false, error: created.stderr || 'docker network create failed' }
+  }
+  const info = inspectEgressNetwork(proxyId, runDocker)
+  if (!info?.subnet) return { ok: false, error: 'local egress network missing subnet' }
+  return { ok: true, mode: 'local', ...info, reused: false, proxy_id: proxyId }
+}
+
 export function ensureProxyEgress(projectRoot, proxy, { runDocker = docker, runIptables = iptables } = {}) {
+  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker })
   const proxyId = proxy?.id
   const proxyUrl = boundProxyUrl(proxy)
   if (!proxyId || !proxyUrl) return { ok: false, error: 'bound SOCKS5 id and url required; refusing fallback' }
