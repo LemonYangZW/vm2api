@@ -33,7 +33,6 @@ export function isKernelWatchdogTarget(vm) {
   if (vm.runtime_kind === 'kvm') return false
   if (HARD_DOWN.has(String(vm.status || '').toLowerCase())) return false
   const configured = normalizeInferenceEngine(vm.inference_engine, { inherit: true })
-  if (configured === 'go') return false
   if (configured === 'rust') return true
   return String(vm.runtime?.engine || '').toLowerCase() === 'rust'
 }

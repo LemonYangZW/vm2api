@@ -7,36 +7,36 @@ export const INFERENCE_ENGINE_OPTIONS: {
   label: string
 }[] = [
   { value: 'auto', label: '自动（继承 rust）' },
-  { value: 'go', label: 'Go HTTP（已废弃，不启动 hop）' },
-  { value: 'rust', label: 'Rust · wrap cli-hop' },
+  { value: 'rust', label: 'Rust · Claude Code cli-hop' },
 ]
 
 export function normalizeInferenceEngine(
   value: unknown,
   fallback: InferenceEngine
 ): InferenceEngine {
-  return value === 'go' || value === 'rust' || value === 'auto'
-    ? value
-    : fallback
+  if (value === 'auto' || value === 'rust') return value
+  if (value === 'go') return 'rust'
+  return fallback
 }
 
 export function inferenceEnginePatchValue(value: InferenceEngine) {
-  return value === 'auto' ? '' : value
+  return value === 'auto' ? '' : 'rust'
 }
 
-/** Gateway `normalizeInferenceEngine('')` → rust. Only an explicit `'go'` stays go. */
-export function normalizeGlobalClaudeEngine(value: unknown): 'go' | 'rust' {
-  return value === 'go' ? 'go' : 'rust'
+/** 公开仓全局引擎固定 rust。历史 go 取值一并收掉。 */
+export function normalizeGlobalClaudeEngine(_value: unknown): 'rust' {
+  return 'rust'
 }
 
-/** Gateway `fallback_to_go` omit = false. */
-export function isFallbackToGo(value: unknown): boolean {
-  return value === true
+/** 公开仓不再回落 Go。 */
+export function isFallbackToGo(_value: unknown): boolean {
+  return false
 }
 
 export function inferenceEngineLabel(
   value: InferenceEngine | null | undefined
 ) {
+  if (value === 'go') return 'Rust · Claude Code cli-hop'
   return (
     INFERENCE_ENGINE_OPTIONS.find((option) => option.value === value)?.label ||
     '未知'

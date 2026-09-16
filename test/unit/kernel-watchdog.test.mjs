@@ -2,11 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createKernelWatchdog, isKernelWatchdogTarget } from '../../src/lib/transport/kernel-watchdog.mjs'
 
-test('watchdog skips stopped and go slots', () => {
+test('watchdog skips stopped slots; stored go is treated as rust', () => {
   assert.equal(isKernelWatchdogTarget({ id: 'vm-01' }), false)
   assert.equal(isKernelWatchdogTarget({ id: 'vm-01', inference_engine: 'rust' }), true)
   assert.equal(isKernelWatchdogTarget({ id: 'vm-01', runtime: { engine: 'rust' } }), true)
-  assert.equal(isKernelWatchdogTarget({ id: 'vm-01', inference_engine: 'go' }), false)
+  assert.equal(isKernelWatchdogTarget({ id: 'vm-01', inference_engine: 'go' }), true)
   assert.equal(isKernelWatchdogTarget({ id: 'vm-01', status: 'stopped' }), false)
 })
 
@@ -26,5 +26,5 @@ test('watchdog ensure is called only when rust is unreachable', async () => {
     },
   })
   await wd.tick()
-  assert.deepEqual(ensured, ['vm-down'])
+  assert.deepEqual(ensured, ['vm-down', 'vm-go'])
 })

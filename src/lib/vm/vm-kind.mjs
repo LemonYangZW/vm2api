@@ -1,6 +1,6 @@
 /**
  * One VM holds one credential kind.
- * platform/family is the source of truth; inference_engine stays go|rust.
+ * platform/family is the source of truth; Claude inference is rust-only.
  */
 
 export const VM_KIND_CLAUDE = 'claude'

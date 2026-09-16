@@ -30,7 +30,6 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 import { BackupPane } from '@/features/settings/backup-pane'
 import { CacheBreakpointsPane } from '@/features/settings/cache-breakpoints-pane'
 import { CredentialWeightPane } from '@/features/settings/credential-weight-pane'
-import { GptPane } from '@/features/settings/gpt-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { KernelRoutingPane } from '@/features/settings/kernel-routing-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
@@ -350,12 +349,6 @@ export function SettingsPage() {
                     }
                   />
                 </>
-              ) : null}
-              {tab === 'gpt' ? (
-                <GptPane
-                  value={(draft.codex as Record<string, unknown>) || {}}
-                  onChange={(next) => setDraft({ ...draft, codex: next })}
-                />
               ) : null}
               {tab === 'whitelist' ? (
                 <PersonaRulesPane

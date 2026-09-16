@@ -442,15 +442,10 @@ export function KindFilterChips({
   onChange: (kind: VmKindFilter) => void
 }) {
   let claude = 0
-  let gpt = 0
   for (const vm of vms) {
-    if (isCodexVm(vm)) gpt += 1
-    else claude += 1
+    if (!isCodexVm(vm)) claude += 1
   }
-  const chips = [
-    ['claude', 'claude', claude],
-    ['gpt', 'codex', gpt],
-  ] as const
+  const chips = [['claude', 'claude', claude]] as const
   return (
     <>
       {chips.map(([key, chipKind, n]) => (

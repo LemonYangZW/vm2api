@@ -81,7 +81,7 @@ test('ensureSlotInferenceRuntime wrap glibc shim skips host kernel mount and sta
   assert.equal(result.engine, 'rust')
 })
 
-test('ensureSlotInferenceRuntime skips go slots, eager_start=false, and empty unused slots', async () => {
+test('ensureSlotInferenceRuntime skips uncredentialed, eager_start=false, and empty unused slots', async () => {
   let starts = 0
   const ops = {
     ensureRustKernel: async () => {
@@ -107,6 +107,7 @@ test('ensureSlotInferenceRuntime skips go slots, eager_start=false, and empty un
   })
   assert.equal(starts, 0)
   assert.equal(go.skipped, true)
+  assert.equal(go.reason, 'no_credential')
   assert.equal(off.skipped, true)
   assert.equal(off.reason, 'eager_start_off')
   assert.equal(empty.skipped, true)
@@ -197,32 +198,20 @@ test('rust switch recreates a slot missing the kernel mount before health commit
   }
 })
 
-test('go switch restarts the Go worker and does not launch Rust', async () => {
-  const vm = { id: 'vm-02' }
-  let reloads = 0
-  let rustStarts = 0
-  const result = await switchSlotInferenceEngine(vm, '/tmp/kin-project', 'go', {
+test('go switch is rejected because Go HTTP forwarding is disabled', async () => {
+  const result = await switchSlotInferenceEngine({ id: 'vm-02' }, '/tmp/kin-project', 'go', {
     timeoutMs: 300,
     ops: {
       inspectContainer: () => ({ running: true }),
       containerHasKernelMount: () => true,
-      reloadSlotWorker: () => {
-        reloads += 1
-        return { ok: true, action: 'reloaded' }
-      },
+      reloadSlotWorker: () => ({ ok: true, action: 'reloaded' }),
       workerHealth: async () => ({ status: 200, version: 'go-test' }),
-      ensureRustKernel: async () => {
-        rustStarts += 1
-        return { ok: true }
-      },
+      ensureRustKernel: async () => ({ ok: true }),
     },
   })
 
-  assert.equal(reloads, 1)
-  assert.equal(rustStarts, 0)
-  assert.equal(result.ok, true)
-  assert.equal(result.active_engine, 'go')
-  assert.equal(result.runtime.rust.reachable, false)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'go_engine_disabled')
 })
 
 test('rust switch fails before touching the VM when the binary is missing', async () => {

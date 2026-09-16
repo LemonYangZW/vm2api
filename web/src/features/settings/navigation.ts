@@ -2,7 +2,6 @@ import {
   Activity,
   Archive,
   BellRing,
-  Bot,
   Fingerprint,
   Gauge,
   Layers,
@@ -21,7 +20,6 @@ export const SETTINGS_TABS = [
   ['quota', '配额'],
   ['logs', '日志'],
   ['protocol', '协议'],
-  ['gpt', 'GPT'],
   ['whitelist', '白名单'],
   ['init', '初装'],
   ['health', '探测'],
@@ -53,7 +51,6 @@ export const SETTINGS_NAV_GROUPS: {
     label: '协议',
     items: [
       { id: 'protocol', icon: Fingerprint },
-      { id: 'gpt', icon: Bot },
       { id: 'whitelist', icon: ListChecks },
     ],
   },

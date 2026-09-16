@@ -80,14 +80,16 @@ test('resolveHopEngine keeps rust cli-hop for setup-token slots', () => {
   assert.equal(hit.wanted, 'rust')
 })
 
-test('resolveHopEngine falls back when rust binary is missing', () => {
+test('resolveHopEngine blocks when rust binary is missing', () => {
   const hit = resolveHopEngine(
     { inference_engine: 'rust' },
     { inference: { engine: 'rust', fallback_to_go: true } },
     { binPath: '' },
   )
-  assert.equal(hit.engine, 'go')
+  assert.equal(hit.engine, 'rust')
   assert.equal(hit.wanted, 'rust')
+  assert.equal(hit.blocked, true)
+  assert.equal(hit.fallback, false)
   assert.equal(hit.reason, 'bin_missing')
 })
 
@@ -289,7 +291,7 @@ unixTest('failed Go credential ensure is not followed by a blind Rust retry', as
     else process.env.KIN_KERNEL_BIN = previous
   }
 })
-unixTest('unhealthy or disconnected rust falls back to go before commit', async () => {
+unixTest('unhealthy rust does not fall back to go', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-fb-'))
   const slot = path.join(root, 'vm-01')
   const runDir = path.join(slot, 'run')
@@ -332,8 +334,11 @@ unixTest('unhealthy or disconnected rust falls back to go before commit', async 
       ensureRust: async () => ({ ok: false, reason: 'bin_missing' }),
       timeoutMs: 3000,
     })
-    assert.equal(result.engine, 'go')
+    assert.equal(result.engine, 'rust')
     assert.equal(result.wanted_engine, 'rust')
+    assert.equal(result.ok, false)
+    assert.equal(result.body?.error?.code, 'bin_missing')
+    assert.match(String(result.via), /rust-kernel/)
     const disconnected = await dispatchStreamInference({
       exec,
       body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] },
@@ -341,11 +346,10 @@ unixTest('unhealthy or disconnected rust falls back to go before commit', async 
       ensureRust: async () => ({ ok: true, reason: 'already_up' }),
       timeoutMs: 3000,
     })
-    assert.equal(disconnected.engine, 'go')
+    assert.equal(disconnected.engine, 'rust')
     assert.equal(disconnected.wanted_engine, 'rust')
-    assert.equal(disconnected.engine_reason, 'rust_transport_error')
-    assert.match(String(disconnected.via), /go-worker/)
-    assert.match(String(result.via), /go-worker/)
+    assert.equal(disconnected.transportError, true)
+    assert.match(String(disconnected.via), /rust-kernel/)
     const strict = await dispatchStreamInference({
       exec,
       body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] },

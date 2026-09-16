@@ -67,7 +67,7 @@ export function VmEngineEditor({
         <EngineValue label='当前运行' value={status.active} />
       </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
-        未显式配置时解析为 rust（wrap cli-hop），跟随{' '}
+        公开仓固定 Rust · Claude Code cli-hop，跟随{' '}
         <Link
           to='/settings/$tab'
           params={{ tab: 'protocol' }}
@@ -75,7 +75,7 @@ export function VmEngineEditor({
         >
           设置 → 协议
         </Link>
-        。不要把槽切到会启动 Go worker hop 的路径。
+        。Go HTTP 转发不再启用。
       </p>
       {inherits ? null : (
         <Button

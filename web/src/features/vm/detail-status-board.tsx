@@ -124,8 +124,7 @@ function slotVerdict(
 
 function workerLabel(value: unknown) {
   const raw = String(value || '').trim()
-  if (raw === 'go') return 'Go HTTP（已废弃）'
-  if (raw === 'rust') return 'wrap cli-hop'
+  if (raw === 'go' || raw === 'rust') return 'Rust · Claude Code cli-hop'
   return raw || '—'
 }
 
@@ -133,7 +132,7 @@ function topologyLabel(
   topology: VmKernelSnapshot['process_topology'] | undefined
 ) {
   if (topology?.rust_pid1) return 'kernel PID1'
-  if (topology?.go_worker_pid1) return 'Go worker PID1（旧拓扑）'
+  if (topology?.go_worker_pid1) return '旧拓扑'
   return '未知'
 }
 

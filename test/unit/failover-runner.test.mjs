@@ -303,7 +303,7 @@ test('signature error is repaired once on the same account when enabled', async 
 })
 
 test('signature 400 is not repaired when signature_repair is off', async () => {
-  const scheduler = new Scheduler([{ ...candidate(1), vm: { inference_engine: 'go' } }])
+  const scheduler = new Scheduler([{ ...candidate(1), vm: { family: 'codex', platform: 'openai' } }])
   const runner = new FailoverRunner({ scheduler })
   let calls = 0
   const result = await runner.run({

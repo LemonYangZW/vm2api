@@ -17,18 +17,17 @@ vi.mock('@/lib/session', () => ({
 }))
 
 describe('VM inference engine contract', () => {
-  it('exposes only auto, go, and rust choices', () => {
+  it('exposes only auto and rust choices', () => {
     expect(INFERENCE_ENGINE_OPTIONS.map((option) => option.value)).toEqual([
       'auto',
-      'go',
       'rust',
     ])
   })
 
   it.each([
     ['auto', ''],
-    ['go', 'go'],
     ['rust', 'rust'],
+    ['go', 'rust'],
   ] as const)('maps %s to the Gateway PATCH value %s', (engine, expected) => {
     expect(inferenceEnginePatchValue(engine)).toBe(expected)
   })
@@ -36,19 +35,20 @@ describe('VM inference engine contract', () => {
   it('falls back safely for unknown response values', () => {
     expect(normalizeInferenceEngine('unexpected', 'auto')).toBe('auto')
     expect(normalizeInferenceEngine(null, 'rust')).toBe('rust')
+    expect(normalizeInferenceEngine('go', 'auto')).toBe('rust')
   })
 
   it('treats omitted or empty global engine as rust', () => {
     expect(normalizeGlobalClaudeEngine(undefined)).toBe('rust')
     expect(normalizeGlobalClaudeEngine('')).toBe('rust')
     expect(normalizeGlobalClaudeEngine('rust')).toBe('rust')
-    expect(normalizeGlobalClaudeEngine('go')).toBe('go')
+    expect(normalizeGlobalClaudeEngine('go')).toBe('rust')
   })
 
-  it('treats omitted fallback_to_go as off', () => {
+  it('never enables fallback_to_go', () => {
     expect(isFallbackToGo(undefined)).toBe(false)
     expect(isFallbackToGo(false)).toBe(false)
-    expect(isFallbackToGo(true)).toBe(true)
+    expect(isFallbackToGo(true)).toBe(false)
   })
 
   it('uses rust when resolved engine is omitted', () => {

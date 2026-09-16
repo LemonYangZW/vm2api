@@ -42,7 +42,7 @@ function writeVm(root, id, extra = {}) {
 test('vm engine overrides routing, empty inherits rust', () => {
   assert.equal(resolveInferenceEngine({}, {}), 'rust')
   assert.equal(resolveInferenceEngine({}, { inference: { engine: 'rust' } }), 'rust')
-  assert.equal(resolveInferenceEngine({ inference_engine: 'go' }, { inference: { engine: 'rust' } }), 'go')
+  assert.equal(resolveInferenceEngine({ inference_engine: 'go' }, { inference: { engine: 'rust' } }), 'rust')
   assert.equal(resolveInferenceEngine({ inference_engine: 'rust' }, { inference: { engine: 'go' } }), 'rust')
 })
 
@@ -56,7 +56,7 @@ test('resolveCliSystemLayout is zero unless persona_inject is set', () => {
   )
 })
 
-test('official_cc inference: rust is always cli-hop, go+cli-hop rejected', () => {
+test('official_cc inference: rust is always cli-hop; stored go is rust', () => {
   assert.equal(resolveOfficialCcInference({}, {}), 'cli-hop')
   assert.equal(resolveOfficialCcInference({}, { official_cc: {} }), 'cli-hop')
   assert.equal(resolveOfficialCcInference({}, { official_cc: { inference: 'cli-hop' } }), 'cli-hop')
@@ -65,15 +65,15 @@ test('official_cc inference: rust is always cli-hop, go+cli-hop rejected', () =>
       { inference_engine: 'go', official_cc_inference: 'http' },
       { official_cc: { inference: 'cli-hop' } },
     ),
-    'http',
+    'cli-hop',
   )
 
-  assert.equal(resolveOfficialCcInference({ inference_engine: 'go' }, {}), 'http')
+  assert.equal(resolveOfficialCcInference({ inference_engine: 'go' }, {}), 'cli-hop')
   assert.equal(resolveOfficialCcInference({ inference_engine: 'rust' }, {}), 'cli-hop')
   assert.equal(resolveOfficialCcInference({ inference_engine: 'rust', official_cc_inference: 'http' }, {}), 'cli-hop')
   assert.equal(assertCliHopAllowed({}, { official_cc: { inference: 'cli-hop' } }).ok, true)
   assert.equal(assertCliHopAllowed({ inference_engine: 'rust' }, {}).ok, true)
-  assert.equal(assertCliHopAllowed({ inference_engine: 'go' }, { official_cc: { inference: 'cli-hop' } }).ok, false)
+  assert.equal(assertCliHopAllowed({ inference_engine: 'go' }, { official_cc: { inference: 'cli-hop' } }).ok, true)
 })
 
 test('setup-token rust slots still cli-hop; only token minting skips CLI', () => {
@@ -145,6 +145,7 @@ test('patch parsers reject unknown values', () => {
   assert.equal(normalizeInferenceConfig({ engine: 'rust', fallback_to_go: false }).fallback_to_go, false)
   assert.equal(normalizeInferenceConfig({ engine: 'rust', strict: true }).strict, true)
   const omitted = normalizeInferenceConfig({ engine: 'go' })
+  assert.equal(omitted.engine, 'rust')
   assert.equal(omitted.fallback_to_go, false)
   assert.equal(omitted.eager_start, true)
   assert.equal(omitted.health_ttl_ms, 2000)

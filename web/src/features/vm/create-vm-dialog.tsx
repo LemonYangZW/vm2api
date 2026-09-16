@@ -5,7 +5,6 @@ import { api } from '@/lib/api'
 import { importErrorMessage } from '@/lib/import-errors'
 import { nextVmSeq, vmIdOf, vmNameOf } from '@/lib/vm-name'
 import { Button } from '@/components/ui/button'
-import { PlatformChip } from '@/components/platform-chip'
 import {
   Collapsible,
   CollapsibleContent,
@@ -105,7 +104,6 @@ export function CreateVmFields({
   const [locale, setLocale] = useState<string>(DEFAULT_TEMPLATE.locale)
   const [conc, setConc] = useState<number>(DEFAULT_TEMPLATE.conc)
   const [weight, setWeight] = useState<number>(DEFAULT_TEMPLATE.weight)
-  const [platform, setPlatform] = useState<'anthropic' | 'openai'>('anthropic')
   const [advOpen, setAdvOpen] = useState(false)
 
   // 名称留空时按已占用序号推下一个可用值，仅作为 placeholder 提示与提交兜底。
@@ -144,8 +142,8 @@ export function CreateVmFields({
           max_concurrency: conc,
           weight,
           ...deriveAfter(after),
-          platform,
-          family: platform === 'openai' ? 'codex' : 'claude',
+          platform: 'anthropic',
+          family: 'claude',
         }),
       })
       return data.id || data.vm_id || data.vm?.id || id || ''
@@ -176,34 +174,6 @@ export function CreateVmFields({
             ))}
           </SelectContent>
         </Select>
-      </div>
-
-      <div className='space-y-1'>
-        <Label>平台</Label>
-        <Select
-          value={platform}
-          onValueChange={(next) => setPlatform(next as 'anthropic' | 'openai')}
-        >
-          <SelectTrigger>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value='anthropic'>
-              <span className='inline-flex items-center gap-1.5'>
-                <PlatformChip kind='claude' />
-                默认
-              </span>
-            </SelectItem>
-            <SelectItem value='openai'>
-              <PlatformChip kind='codex' />
-            </SelectItem>
-          </SelectContent>
-        </Select>
-        {platform === 'openai' ? (
-          <p className='text-xs text-muted-foreground'>
-            可先创建空槽，账号用 OAuth 或 auth.json 稍后导入。
-          </p>
-        ) : null}
       </div>
 
       <div className='space-y-1'>

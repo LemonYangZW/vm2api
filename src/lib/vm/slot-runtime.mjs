@@ -237,10 +237,13 @@ function kernelBinaryError(bin) {
 export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeoutMs = 8000, ops = {} } = {}) {
   if (!vm?.id || !projectRoot) return { ok: false, code: 'vm_required', error: 'vm required' }
   if (isCodexVm(vm)) {
-    return { ok: false, code: 'gpt_engine_forbidden', error: 'GPT slots do not use go or rust inference engines' }
+    return { ok: false, code: 'gpt_engine_forbidden', error: 'GPT slots do not use rust inference engines' }
   }
-  if (engine !== 'go' && engine !== 'rust') {
-    return { ok: false, code: 'invalid_inference_engine', error: 'inference engine must be go or rust' }
+  if (engine === 'go') {
+    return { ok: false, code: 'go_engine_disabled', error: 'Go HTTP forwarding is disabled' }
+  }
+  if (engine !== 'rust') {
+    return { ok: false, code: 'invalid_inference_engine', error: 'inference engine must be rust' }
   }
 
   const inspect = ops.inspectContainer || inspectContainer
@@ -293,18 +296,6 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
       runtime: { go: { reachable: false, health: go.health || null } },
     }
   }
-  if (engine === 'go') {
-    try {
-      fs.rmSync(path.join(projectRoot, 'vms', vm.id, 'run', 'kernel.sock'), { force: true })
-    } catch {}
-    return {
-      ok: true,
-      active_engine: 'go',
-      action: boot.action,
-      runtime: { go: { reachable: true, health: go.health }, rust: { reachable: false } },
-    }
-  }
-
   const startRust = wrapUsesSlotKernel(wrap) ? ops.restartRustKernel || restartRustKernel : ensureRust
   const rust = await startRust(exec, { timeoutMs })
   if (!rust?.ok) {

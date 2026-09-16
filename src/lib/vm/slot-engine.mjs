@@ -1,9 +1,9 @@
 /**
  * Slot data-plane engine + unofficial persona override.
  *
- * inference_engine: `rust` = cli-hop（kin-kernel → patched CLI）；`go` = HTTP
- * 转发（kin-worker）。Empty field inherits routing.inference.engine.
- * rust 下 official_cc inference 强制 cli-hop，没有 rust HTTP hop。
+ * inference_engine: 公开仓只认 `rust` = cli-hop（kernel → Claude Code）。
+ * 历史 `go` / worker 取值一律收成 rust，不再启用 Go HTTP 转发。
+ * rust 下 official_cc inference 强制 cli-hop。
  * Setup Token 换票走 sessionKey/PKCE 脚本，不启 claude setup-token PTY；
  * 推理仍跟槽位 engine：配 rust 就 cli-hop。
  * persona_preset official|official_full|zero on a VM overrides the global protocol;
@@ -12,7 +12,7 @@
 import { normalizePersonaPreset, personaPresetFromLegacyMode } from '../identity/persona-template.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
-export const INFERENCE_ENGINES = Object.freeze(['go', 'rust'])
+export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero'])
 export const OFFICIAL_CC_INFERENCES = Object.freeze(['http', 'cli-hop'])
 
@@ -21,8 +21,16 @@ export function normalizeInferenceEngine(value, { inherit = false } = {}) {
     .trim()
     .toLowerCase()
   if (!raw) return inherit ? '' : 'rust'
-  if (raw === 'rust' || raw === 'kernel' || raw === 'kin-kernel') return 'rust'
-  if (raw === 'go' || raw === 'worker' || raw === 'go-worker') return 'go'
+  if (
+    raw === 'rust' ||
+    raw === 'kernel' ||
+    raw === 'kin-kernel' ||
+    raw === 'go' ||
+    raw === 'worker' ||
+    raw === 'go-worker'
+  ) {
+    return 'rust'
+  }
   return inherit ? '' : 'rust'
 }
 
@@ -61,7 +69,7 @@ function optionalTtlMs(value, fallback = 2000) {
 export function normalizeInferenceConfig(raw = {}) {
   return {
     engine: normalizeInferenceEngine(raw.engine),
-    fallback_to_go: raw.fallback_to_go === true,
+    fallback_to_go: false,
     strict: raw.strict === true,
     eager_start: optionalBool(raw.eager_start, true),
     health_ttl_ms: optionalTtlMs(raw.health_ttl_ms, 2000),
@@ -154,8 +162,17 @@ export function parseInferenceEnginePatch(value) {
   if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default') {
     return { ok: true, value: '' }
   }
-  if (raw === 'go' || raw === 'rust') return { ok: true, value: raw }
-  return { ok: false, error: 'inference_engine must be go, rust, or empty' }
+  if (
+    raw === 'rust' ||
+    raw === 'go' ||
+    raw === 'worker' ||
+    raw === 'go-worker' ||
+    raw === 'kernel' ||
+    raw === 'kin-kernel'
+  ) {
+    return { ok: true, value: 'rust' }
+  }
+  return { ok: false, error: 'inference_engine must be rust or empty' }
 }
 
 export function parseSlotPersonaPresetPatch(value) {
@@ -220,7 +237,7 @@ export function validateInferenceRoutingPatch(body = {}) {
   if (Object.prototype.hasOwnProperty.call(body.inference, 'engine')) {
     const parsed = parseInferenceEnginePatch(body.inference.engine)
     if (!parsed.ok) errors.push(parsed.error)
-    else if (!parsed.value) errors.push('inference.engine 必须是 go 或 rust')
+    else if (!parsed.value) errors.push('inference.engine 必须是 rust')
   }
   if (
     Object.prototype.hasOwnProperty.call(body.inference, 'fallback_to_go') &&

@@ -1,12 +1,9 @@
 /**
  * Request-level inference hop router.
- * engine = rust|go from VM override > routing.inference.engine > go.
- * rust = cli-hop（kin-kernel → patched CLI），不是 kernel HTTP hop。
- * Missing binary / unhealthy rust + fallback_to_go → go HTTP worker.
- * Credential import/ensure stay on Go in M1.
+ * 公开仓只走 rust cli-hop（kernel → Claude Code）。Go HTTP 转发不再启用。
+ * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
-import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
-import { streamGoWorker, callGoWorker, ensureWorkerCredential } from './go-worker-client.mjs'
+import { ensureWorkerCredential } from './go-worker-client.mjs'
 import {
   streamRustKernel,
   callRustKernel,
@@ -57,30 +54,22 @@ export function peekRustHealth(exec, ttlMs, now = Date.now()) {
   return hit
 }
 
-export function resolveHopEngine(vm, routing = {}, { rustReady = null, binPath = null, noGoFallback = false } = {}) {
-  const wanted = resolveInferenceEngine(vm, routing)
-  const fallback =
-    routing?.inference?.fallback_to_go === true && routing?.inference?.strict !== true && noGoFallback !== true
-  if (wanted !== 'rust') {
-    return { engine: 'go', wanted, reason: 'configured_go', fallback }
-  }
+export function resolveHopEngine(_vm, _routing = {}, { rustReady = null, binPath = null } = {}) {
+  const wanted = 'rust'
   const bin = binPath != null ? String(binPath).trim() : kernelBinPath()
   if (rustReady === true) {
-    return { engine: 'rust', wanted, reason: 'configured_rust', fallback }
+    return { engine: 'rust', wanted, reason: 'configured_rust', fallback: false }
   }
   if (rustReady === false || !bin) {
-    if (fallback) {
-      return { engine: 'go', wanted, reason: rustReady === false ? 'rust_unhealthy' : 'bin_missing', fallback }
-    }
     return {
       engine: 'rust',
       wanted,
       reason: rustReady === false ? 'rust_unhealthy' : 'bin_missing',
-      fallback,
+      fallback: false,
       blocked: true,
     }
   }
-  return { engine: 'rust', wanted, reason: 'configured_rust', fallback }
+  return { engine: 'rust', wanted, reason: 'configured_rust', fallback: false }
 }
 
 function rustUnavailableResult(ready) {
@@ -157,17 +146,13 @@ async function prepareRust(exec, { ensure, routing } = {}) {
 
 async function runHop({ mode, opts }) {
   const routing = opts.routing || {}
-  const decision = resolveHopEngine(opts.exec?.vm, routing, { noGoFallback: opts.noGoFallback === true })
-  let engine = decision.engine
+  const decision = resolveHopEngine(opts.exec?.vm, routing)
+  let engine = 'rust'
   let reason = decision.reason
-  if (decision.wanted === 'rust' && !decision.blocked) {
+  if (!decision.blocked) {
     const ready = await prepareRust(opts.exec, { ensure: opts.ensureRust, routing })
     if (ready?.ok) {
-      engine = 'rust'
       reason = ready.reason || 'configured_rust'
-    } else if (decision.fallback) {
-      engine = 'go'
-      reason = ready?.reason || 'rust_unavailable'
     } else {
       return {
         ...rustUnavailableResult(ready),
@@ -175,30 +160,22 @@ async function runHop({ mode, opts }) {
         engine_reason: ready?.reason || 'rust_unavailable',
       }
     }
-  }
-  if (decision.blocked) {
+  } else {
     return {
       ...rustUnavailableResult({ reason: decision.reason }),
       wanted_engine: 'rust',
       engine_reason: decision.reason,
     }
   }
-  const send =
-    engine === 'rust'
-      ? mode === 'stream'
-        ? streamRustKernel
-        : callRustKernel
-      : mode === 'stream'
-        ? streamGoWorker
-        : callGoWorker
+  const send = mode === 'stream' ? streamRustKernel : callRustKernel
   let result = await send(opts)
-  if (engine === 'rust') noteWrapHop(opts.exec)
-  if (engine === 'rust' && result.transportError === true && result.committed !== true) {
+  noteWrapHop(opts.exec)
+  if (result.transportError === true && result.committed !== true) {
     result = await send(opts)
     result = { ...result, rust_transport_retried: true }
     noteWrapHop(opts.exec)
   }
-  if (engine === 'rust' && isNeedsRefreshResult(result)) {
+  if (isNeedsRefreshResult(result)) {
     const ensure = opts.ensureCredential || ensureWorkerCredential
     const ensured = await ensure(opts.exec, { force: true })
     if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
@@ -211,14 +188,7 @@ async function runHop({ mode, opts }) {
       noteWrapHop(opts.exec)
     }
   }
-  if (engine === 'rust' && result.transportError === true && result.committed !== true && decision.fallback) {
-    const fallbackSend = mode === 'stream' ? streamGoWorker : callGoWorker
-    result = await fallbackSend(opts)
-    engine = 'go'
-    reason = 'rust_transport_error'
-    clearRustHealthCache(cacheKey(opts.exec))
-  }
-  if (engine === 'rust' && (result.terminalState === 'incomplete' || (result.committed && result.transportError))) {
+  if (result.terminalState === 'incomplete' || (result.committed && result.transportError)) {
     clearRustHealthCache(cacheKey(opts.exec))
   }
   return {

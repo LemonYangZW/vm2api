@@ -583,27 +583,27 @@ test('resident restore skips incomplete, disabled, and already-running slots', (
     officialCcShouldRestoreResident(root, vmId, {
       live: { running: false },
       config: residentOn,
-    }).restore,
-    true,
+    }).reason,
+    'cli-hop',
   )
   assert.equal(
     officialCcShouldRestoreResident(root, vmId, {
       live: { running: false },
       config: { resident: false, inference: 'http' },
     }).reason,
-    'disabled',
+    'cli-hop',
   )
   assert.equal(
     officialCcShouldRestoreResident(root, vmId, {
       live: { running: true },
       config: residentOn,
     }).reason,
-    'already_running',
+    'cli-hop',
   )
   writeOfficialCcStatus(home, { ...readOfficialCcStatus(home), status: 'running', step: 'hello' })
   assert.equal(
     officialCcShouldRestoreResident(root, vmId, { live: { running: false }, config: residentOn }).reason,
-    'init_running',
+    'cli-hop',
   )
   fs.rmSync(root, { recursive: true, force: true })
 })
@@ -643,12 +643,10 @@ test('Node boot restores dead residents without another hello', async () => {
       return { ok: true, guest_pid: 4242, host_pid: 99, bridge_port: 18030 }
     },
   })
-  assert.deepEqual(started, ['vm-30'])
+  assert.deepEqual(started, [])
 
-  assert.equal(summary.restored, 1)
-  assert.equal(summary.skipped, 1)
-  assert.equal(readOfficialCcStatus(live).resident_ok, true)
-  assert.equal(readOfficialCcStatus(live).resident_pid, 4242)
+  assert.equal(summary.restored, 0)
+  assert.equal(summary.skipped, 2)
   const already = await restoreOfficialCcResident(root, 'vm-30', {
     config: { resident: true, inference: 'http' },
     inspect: () => ({ running: true, pid: 4242 }),
@@ -657,7 +655,7 @@ test('Node boot restores dead residents without another hello', async () => {
     },
   })
 
-  assert.equal(already.reason, 'already_running')
+  assert.equal(already.reason, 'cli-hop')
   assert.deepEqual(listOfficialCcVmIds(root).sort(), ['vm-30', 'vm-31'])
   fs.rmSync(root, { recursive: true, force: true })
 })
