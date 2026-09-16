@@ -411,7 +411,7 @@ export function startVmRuntime(vm, projectRoot, { recreate = false } = {}) {
   if (!proxy.ok) return proxy
   const eg = ensureProxyEgress(projectRoot, vm.proxy)
   if (!eg.ok) return eg
-  if (!eg.network) return { ok: false, error: 'egress network missing; refusing host fallback' }
+  if (!eg.network && !eg.name) return { ok: false, error: 'egress network missing; refusing host fallback' }
 
   let existing = inspectContainer(name)
   const paths = workerPaths(projectRoot, vm.id)

@@ -13,8 +13,12 @@ export const LOCAL_EGRESS_ID = 'px-local'
 export function isLocalEgressProxy(proxy) {
   if (!proxy || typeof proxy !== 'object') return false
   const id = String(proxy.id || '').trim()
-  const scheme = String(proxy.scheme || proxy.kind || '').trim().toLowerCase()
-  const host = String(proxy.host || '').trim().toLowerCase()
+  const scheme = String(proxy.scheme || proxy.kind || '')
+    .trim()
+    .toLowerCase()
+  const host = String(proxy.host || '')
+    .trim()
+    .toLowerCase()
   return id === LOCAL_EGRESS_ID || scheme === 'local' || host === 'local'
 }
 
@@ -144,6 +148,7 @@ export function inspectEgressNetwork(proxyId, run = docker) {
   const [subnet, gateway] = String(r.stdout || '').split('|')
   return {
     name,
+    network: name,
     subnet: String(subnet || '').trim(),
     gateway: String(gateway || '').trim() || gatewayFromSubnet(String(subnet || '').trim()),
     bridge: bridgeName(proxyId),
