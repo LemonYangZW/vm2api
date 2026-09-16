@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码在 git。ELF 只放 GitHub Release，不进仓库。当前发布线：**1.0.0**（tag `v1.0.0`）。
+源码在 git。ELF 只放 GitHub Release，不进仓库。当前发布线：**1.1.0**（tag `v1.1.0`）。
 
 ## 版本怎么记
 
@@ -18,9 +18,8 @@
 仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
 
 ```bash
-# 工作区干净、已在要发布的 commit 上
-git tag -a v1.0.0 -m "vm2api v1.0.0"
-git push origin v1.0.0
+git tag -a v1.1.0 -m "vm2api v1.1.0"
+git push origin v1.1.0
 ```
 
 `v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：
@@ -40,9 +39,9 @@ git push origin v1.0.0
 install -m 755 kin-kernel kin-egress kin-worker /opt/vm2api/bin/
 ```
 
-然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。
+然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。槽进程不是 root：权限必须是 `755`，不要 `700`。
 
-控制面镜像：`docker compose build`（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 不在此工作流里编。
+控制面镜像：`docker compose build`（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 用 `node docker/kin-os/build.mjs`。
 
 ## 本机构建
 
@@ -88,13 +87,28 @@ CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、Rust
 
 ## 升级一台已部署的机
 
+**Compose（推荐）**
+
+```bash
+cd /opt/vm2api
+git pull
+chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker
+docker compose up -d --build
+curl -sS --noproxy '*' http://127.0.0.1:8787/health
+```
+
+槽位容器不会被这次升级 `docker rm`。
+
+**本机 Node + systemd**
+
 1. `git pull` 或检出目标 tag。
 2. `npm ci`；有 web 改动则 `pnpm -C web install --frozen-lockfile && npm run build:web`。
-3. 换 Release 二进制或本地重编 `bin/`。
+3. 换 Release 二进制或本地重编 `bin/`（`install -m 755`）。
 4. `node --check src/server.mjs`。
 5. `systemctl restart vm2api` **一次**。确认 `/health`。
 
 静态 HTML / `web/dist` 单独更新不必重启。同一轮不要 restart 两次，不要 `stop` 后不拉起。
+
 
 ---
 

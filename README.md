@@ -43,25 +43,37 @@
 
 ### Docker Compose（推荐）
 
-槽位本来就跑在宿主机 Docker 里。控制面也可以进容器：`network_mode: host` + 挂 `docker.sock`，这样它能建槽、改 iptables。仓库请放在 **`/opt/vm2api`**，路径必须和容器内一致。
+生产就用这条。槽位跑在**宿主机** Docker 里；控制面进容器：`network_mode: host` + 挂 `docker.sock`，才能建槽、改 iptables。仓库必须在 **`/opt/vm2api`**，和容器内路径一致。
 
 ```bash
 git clone https://github.com/dofastted/vm2api.git /opt/vm2api
 cd /opt/vm2api
 cp .env.example .env
+chmod 600 .env
 # 填写 VM2API_API_KEY / VM2API_ADMIN_PASSWORD / VM2API_DB_SECRET
 
 mkdir -p bin
-# 从 https://github.com/dofastted/vm2api/releases 把 linux amd64
-# kin-kernel / kin-egress / kin-worker 放进 bin/ 并 chmod +x
+# 从 https://github.com/dofastted/vm2api/releases 取 linux amd64
+# kin-kernel / kin-egress / kin-worker 放进 bin/
+chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker
+
+# 宿主机槽位镜像（Compose 只编控制面）
+node docker/kin-os/build.mjs ubuntu
 
 docker compose up -d --build
-curl -sS http://127.0.0.1:8787/health
+curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-槽位客户镜像（`kin-os/ubuntu:24.04` 等）要事先存在于**宿主机** Docker。Compose 只编控制面，不编槽位 OS。
+`bin/` 必须 **755**。槽进程 UID 是 `10000+序号`，`chmod +x` 若得到 `700` 会 `permission denied`。
 
-完整约束：[DEPLOY.md · Docker](docs/DEPLOY.md#docker-compose)。不要 systemd 的话也可以继续用下面的本机 Node。
+Docker Desktop（含 WSL2）的 host 网络在 Desktop Linux VM 里，WSL/macOS 的 `127.0.0.1:8787` 可能连不上。改用：
+
+```bash
+docker exec vm2api python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8787/health").read().decode())'
+```
+
+生产请用 **Ubuntu 24.04 + Docker Engine**。完整约束：[DEPLOY.md · Docker](docs/DEPLOY.md#docker-compose)。
+
 
 ### 本机 Node
 
@@ -189,7 +201,7 @@ Console API endpoint  →  原样回传给调用方
 
 ## 部署与配置
 
-生产推荐：仓库放到 `/opt/vm2api`，环境变量放 `/etc/vm2api.env`，用 systemd 拉起，前面 nginx 反代 `/v1` `/api` `/console` `/health`。
+生产推荐：仓库放到 `/opt/vm2api`，写 `.env`，`docker compose up -d --build`。前面可以 nginx 反代 `/v1` `/api` `/console` `/health`。本机 Node + systemd 是备选，见 [DEPLOY.md](docs/DEPLOY.md#第一次落地本机-node)。
 
 最少三项，缺 `VM2API_API_KEY` 或面板密码进程起不来：
 
@@ -205,14 +217,15 @@ VM2API_DB_SECRET=       # 库加密
 
 ## 版本与构建
 
-当前发布：**v1.0.0**
+当前发布：**v1.1.0**
 
 ```bash
-git tag -a v1.0.0 -m "vm2api v1.0.0"
-git push origin v1.0.0
+git tag -a v1.1.0 -m "vm2api v1.1.0"
+git push origin v1.1.0
 ```
 
 `v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，编 linux amd64：`kin-kernel`、`kin-egress`、`kin-worker`（telemetry）。本机构建与升级步骤：[BUILD.md](docs/BUILD.md)
+
 
 ---
 
@@ -221,7 +234,7 @@ git push origin v1.0.0
 | 文档 | 内容 |
 |---|---|
 | [技术路线](docs/技术路线.md) | 产品主路线（图） |
-| [DEPLOY.md](docs/DEPLOY.md) | 自建、环境变量、占位槽、systemd、反代 |
+| [DEPLOY.md](docs/DEPLOY.md) | Docker Compose（推荐）、环境变量、占位槽、systemd、反代 |
 | [BUILD.md](docs/BUILD.md) | 本机构建、Release、升级 |
 | [API.md](docs/API.md) | `/v1` 客户端契约 |
 | [PROTOCOL.md](docs/PROTOCOL.md) | 协议行为 |
@@ -234,13 +247,13 @@ git push origin v1.0.0
 ## FAQ
 
 1. **进程立刻退出，提示 `VM2API_API_KEY not set` 或读不到 JSON？**  
-   先写 `/etc/vm2api.env`，再准备 `vms/active.json` 和对应槽文件。抄本在 [DEPLOY.md](docs/DEPLOY.md#第一次落地)。
+   Compose 写仓库 `.env`；本机 Node 写 `/etc/vm2api.env`，再准备 `vms/active.json`。抄本在 [DEPLOY.md](docs/DEPLOY.md#第一次落地本机-node)。
 
 2. **`/console` 是空白或 404？**  
-   先 `npm run build:web`，确认存在 `web/dist`。静态页更新不必重启 Node。
+   Compose 镜像里已带 `web/dist`。本机 Node 先 `npm run build:web`。静态页更新不必重启 Node。
 
 3. **槽建好了但不调度？**  
-   每槽必须绑出口（远程 SOCKS5 或本地出口）。`proxy_required` 为真时没绑代理不会接请求。
+   先绑出口（远程 SOCKS5 或管理台 **添加本地出口**），再导入 Setup Token。没凭证是 `no_credential`，不会入池。
 
 4. **Debian 12 上内核起不来？**  
    优先 Ubuntu 24.04。过旧的 glibc 跑不了当前 wrap / Claude kernel。
@@ -251,8 +264,14 @@ git push origin v1.0.0
 6. **密钥写进 git 了怎么办？**  
    立刻轮换 `VM2API_*`、Setup Token、面板密码。不要把密钥贴到 Issue。
 
-7. **Compose 起来了但建不了槽？**  
-   确认仓库在 `/opt/vm2api`、`bin/kin-kernel` 可执行、宿主机有 `kin-os/*` 镜像，并且挂了 `docker.sock`。
+7. **Compose 起来了但建不了槽 / `egress network missing`？**  
+   仓库在 `/opt/vm2api`、`bin/kin-*` 为 **755**、宿主机有 `kin-os/*`、挂了 `docker.sock`。先添加本地出口再启动槽。1.1.0 已对齐 egress 的 `name`/`network` 字段。
+
+8. **`exec: "/usr/local/bin/kin-kernel": permission denied`？**  
+   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker`。不要用 `700`。
+
+9. **本机 `curl 127.0.0.1:8787` 失败，容器却是 healthy？**  
+   Docker Desktop 的 `network_mode: host` 不在 WSL/macOS localhost。用 `docker exec vm2api …` 探活，或改 Ubuntu + Docker Engine。
 
 ---
 

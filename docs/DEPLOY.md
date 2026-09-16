@@ -2,7 +2,7 @@
 
 本机或 Linux 主机自建一份 vm2api。推理走 **Rust 内核 + Claude Code**，不走 Go hop。
 
-推荐路径：仓库放到 `/opt/vm2api`，`docker compose up -d --build`。也可以本机 Node + systemd。
+**推荐 Docker Compose**：仓库放到 `/opt/vm2api`，`docker compose up -d --build`。本机 Node + systemd 是备选。
 
 先看路线：[技术路线.md](技术路线.md)。打二进制：[BUILD.md](BUILD.md)。仓库总览：[README](../README.md)。
 
@@ -24,14 +24,16 @@ Debian 12（glibc 2.36）上新 Claude kernel 常常起不来，优先 Ubuntu 24
 ```text
 /opt/vm2api/
   src/server.mjs      控制面
-  web/dist/           管理台（先 build:web）
-  bin/kin-kernel      Rust 内核
+  web/dist/           管理台（Compose 镜像内已构建）
+  bin/kin-kernel      Rust 内核（必须 755）
   bin/kin-egress      远程 SOCKS5 透明网关
   bin/kin-worker      只跑 telemetry，不是推理 hop
+  docker/kin-os/      槽位客户镜像配方（宿主机编）
   vms/                槽位 JSON + 槽家目录
   data/               SQLite 等
   src/config/routing.json
 ```
+
 
 环境变量 `KIN_PROJECT_ROOT` 默认就是仓库根。`KIN_DATA_DIR` 不设时落在 `src/data`；自建请显式设成仓库 `data/`。
 
@@ -64,12 +66,12 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 
 ## Docker Compose
 
-能。控制面用 Compose 起；槽位仍由**宿主机** Docker 引擎创建。这不是把整套推理塞进一个无特权应用容器。
+**推荐。** 控制面用 Compose 起；槽位仍由**宿主机** Docker 引擎创建。这不是把整套推理塞进一个无特权应用容器。
 
 | 在容器里 | 必须在宿主机 |
 |---|---|
 | Node 控制面、`/console`、`/v1` | Docker 引擎、槽位容器、`kin-os/*` 客户镜像 |
-| `docker` CLI（经 `docker.sock`） | Release 二进制目录 `bin/`（挂进去） |
+| `docker` CLI（经 `docker.sock`） | Release 二进制目录 `bin/`（挂进去，**755**） |
 | `kin-egress` 进程 + iptables（`network_mode: host` + `NET_ADMIN`） | 桥接网卡、透明出口 |
 
 约束：
@@ -77,8 +79,8 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 1. 仓库放在 **`/opt/vm2api`**。槽位 `-v /opt/vm2api/vms/…` 由宿主机 Docker 解释，内外路径必须相同。
 2. `network_mode: host`。远程 SOCKS 出口要在主机网络命名空间里 REDIRECT。
 3. 挂 `/var/run/docker.sock`。这等于给容器宿主机级 Docker 权限。
-4. 先把 `kin-kernel` / `kin-egress` / `kin-worker` 放进 `./bin`（[Release](https://github.com/dofastted/vm2api/releases)）。
-5. 槽位镜像 `kin-os/ubuntu:24.04` 等要已经在宿主机 `docker images` 里。本仓不编这些 OS 镜像。
+4. 把 `kin-kernel` / `kin-egress` / `kin-worker` 放进 `./bin`（[Release](https://github.com/dofastted/vm2api/releases)），`chmod 755`。槽 UID 是 `10000+序号`，`700` 会 `permission denied`。
+5. 槽位镜像 `kin-os/ubuntu:24.04` 等要已经在宿主机 `docker images` 里。Compose **不**编这些 OS；用 `node docker/kin-os/build.mjs ubuntu`（不加参数编四套）。
 
 ```bash
 git clone https://github.com/dofastted/vm2api.git /opt/vm2api
@@ -88,17 +90,26 @@ chmod 600 .env
 # 填写三项密钥
 
 mkdir -p bin
-# 下载 v1.0.0 linux amd64 到 bin/ 后：
-chmod +x bin/kin-kernel bin/kin-egress bin/kin-worker
+# 下载 v1.1.0 linux amd64 到 bin/ 后：
+chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker
 
+node docker/kin-os/build.mjs ubuntu
 docker compose up -d --build
-docker compose logs -f
-curl -sS http://127.0.0.1:8787/health
+curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
+
+Docker Desktop（Windows / macOS / WSL2）能编镜像。`network_mode: host` 绑的是 Desktop Linux VM，**不是** WSL 的 localhost。`curl 127.0.0.1:8787` 失败时：
+
+```bash
+docker exec vm2api python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8787/health").read().decode())'
+```
+
+槽位、iptables、透明出口按 Linux 写。**生产用 Ubuntu 24.04 + Docker Engine。**
 
 升级控制面：`git pull && docker compose up -d --build`。槽位容器不会因此被 `docker rm`。静态管理台在镜像里，要带上新的 `web/dist` 就重新 `--build`。
 
-Windows / macOS Desktop 能编镜像、能打开 `/console`，但槽位、iptables、透明出口按 Linux 写，生产请用 Ubuntu 24.04。
+建槽前先在 `/console` 点 **添加本地出口**（或导入 SOCKS5）。没绑出口的槽会停在 `stopped`。1.1.0 起本地出口网络同时带 `name` 和 `network`，不再误报 `egress network missing`。
+
 
 ## 第一次落地（本机 Node）
 
@@ -179,13 +190,14 @@ location / {
 
 ## 上线后点什么
 
-1. 打开 `/console`，用 `VM2API_ADMIN_PASSWORD` 登录。
-2. 代理池：导入远程 SOCKS5，或点 **添加本地出口**（宿主机 NAT，不启 kin-egress）。
-3. 建 Claude 槽，绑出口，导入 Setup Token。
-4. 换票后走官方初装（wipe → hello → `/stats`）。推理不跑官方常驻 CLI。
+1. 打开 `/console`，用 `VM2API_ADMIN_PASSWORD` 登录。Docker Desktop 下若浏览器打不开 `127.0.0.1:8787`，见上文 `docker exec` 探活。
+2. 代理池：点 **添加本地出口**（宿主机 NAT，不启 kin-egress），或导入远程 SOCKS5。
+3. 建 Claude 槽（默认 Ubuntu 24.04），绑出口，再 **启动**。没出口会停在 `stopped`。
+4. 导入 Setup Token。换票后走官方初装（wipe → hello → `/stats`）。推理不跑官方常驻 CLI。
 5. 用 `sk-vm-…` 或 master key 打 `POST /v1/messages`。
 
-槽必须有出口。`proxy_required` 为真时没绑代理不会调度。
+槽必须有出口。没凭证时 `schedulable=false` / `no_credential`，不会调度。
+
 
 ## 不要做的事
 

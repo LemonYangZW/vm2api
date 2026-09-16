@@ -2,7 +2,16 @@
 
 ## Unreleased
 
-- 控制面可用 Docker Compose 部署（`network_mode: host` + `docker.sock`；槽位仍在宿主机引擎）
+## 1.1.0 — 2026-09-17
+
+推荐 Docker Compose 部署，并修槽位启动。
+
+- 文档把 Compose 定为生产推荐路径（`/opt/vm2api` + `docker.sock` + host 网络）
+- 槽位客户镜像配方进仓：`docker/kin-os/`（`node docker/kin-os/build.mjs`）
+- 修复本地出口启动误判 `egress network missing`（inspect 同时返回 `name` 与 `network`）
+- 文档要求 `bin/kin-*` 为 **755**：槽 UID 是 `10000+序号`，`700` 会 permission denied
+- 标明 Docker Desktop / WSL 下 `127.0.0.1:8787` 可能打不到 host 网络
+- 控制面可用 Docker Compose 部署（槽位仍在宿主机引擎）
 - 同步源仓运行时补丁：换票后回收 wrap、官方凭证软链、未确认 401 不再当吊销
 - 同步源仓 GPT 额度：重置券缓存失败不覆盖、探测带回 `cred_status`
 

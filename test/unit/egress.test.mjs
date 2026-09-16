@@ -9,6 +9,7 @@ import {
   bridgeName,
   chainName,
   egressEnabled,
+  inspectEgressNetwork,
   inspectEgressProcess,
   iptablesPlan,
   isLocalEgressProxy,
@@ -64,6 +65,17 @@ test('local egress is identified and has no SOCKS url', () => {
   assert.equal(isLocalEgressProxy({ host: '1.2.3.4', port: 1080 }), false)
   assert.equal(boundProxyUrl({ id: LOCAL_EGRESS_ID, host: 'local', port: 0 }), '')
   assert.equal(slotNetworkForVm({ proxy: { id: LOCAL_EGRESS_ID } }), 'kin-eg-px-local')
+})
+
+test('inspectEgressNetwork exposes name and network for slot start', () => {
+  const info = inspectEgressNetwork('px-local', () => ({
+    ok: true,
+    stdout: '192.168.144.0/20|192.168.144.1',
+  }))
+  assert.equal(info.name, 'kin-eg-px-local')
+  assert.equal(info.network, 'kin-eg-px-local')
+  assert.equal(info.subnet, '192.168.144.0/20')
+  assert.equal(info.gateway, '192.168.144.1')
 })
 
 test('inspectEgressProcess reports missing pid as not_running', () => {
