@@ -1,3 +1,4 @@
+mod cli_hop;
 mod config;
 mod credential;
 mod error;

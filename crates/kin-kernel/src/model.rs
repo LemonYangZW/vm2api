@@ -101,6 +101,27 @@ impl MessageRequest {
             }
         }
     }
+
+    /// Anthropic server tools reject `input_schema` / `description`.
+    pub fn strip_server_tool_extras(&mut self) {
+        for tool in &mut self.tools {
+            if is_anthropic_server_tool(tool) {
+                tool.input_schema = Value::Null;
+                tool.description.clear();
+                for key in [
+                    "input_schema",
+                    "description",
+                    "parameters",
+                    "function",
+                    "strict",
+                ] {
+                    tool.extra.remove(key);
+                }
+            } else if tool.input_schema.is_null() {
+                tool.input_schema = default_schema();
+            }
+        }
+    }
 }
 
 fn json_or_string(raw: &str) -> Value {
@@ -264,6 +285,20 @@ fn is_server_tool_type(tool_type: Option<&str>) -> bool {
                 || value.starts_with("code_execution_")
                 || value.starts_with("tool_search_")
     )
+}
+
+fn is_anthropic_server_tool(tool: &ToolDefinition) -> bool {
+    let ty = tool.tool_type.as_deref().unwrap_or("");
+    if ty.starts_with("web_search") || ty == "google_search" {
+        return true;
+    }
+    if ty.is_empty() || ty == "function" || ty == "custom" {
+        return matches!(
+            tool.name.as_str(),
+            "web_search" | "web_search_20250305" | "WebSearch" | "google_search"
+        );
+    }
+    true
 }
 
 fn default_schema() -> Value {

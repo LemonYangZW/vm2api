@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ pub struct SseEvent {
     pub model: String,
     pub stop_reason: String,
     pub terminal: bool,
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +37,7 @@ pub struct PumpResult {
     pub model: String,
     pub stop_reason: String,
     pub body: Vec<u8>,
+    pub extra_headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +80,7 @@ struct Tracker {
     model: String,
     stop_reason: String,
     body: Vec<u8>,
+    extra_headers: HashMap<String, String>,
 }
 
 impl Tracker {
@@ -89,10 +93,22 @@ impl Tracker {
             model: String::new(),
             stop_reason: String::new(),
             body: Vec::new(),
+            extra_headers: HashMap::new(),
         }
     }
 
     fn observe(&mut self, event: &SseEvent) -> Result<(), PumpError> {
+        if event.event_type == "kin_response_headers" {
+            for (key, value) in &event.extra_headers {
+                if !value.is_empty() {
+                    self.extra_headers.insert(key.clone(), value.clone());
+                }
+            }
+            // Keep the event in the body so Node can ingest Extra 5h/7d
+            // even when HTTP trailers are dropped on the unix socket.
+            self.body.extend_from_slice(&event.raw);
+            return Ok(());
+        }
         self.count += 1;
         self.body.extend_from_slice(&event.raw);
         if self.terminal {
@@ -144,6 +160,7 @@ impl Tracker {
             model: self.model.clone(),
             stop_reason: self.stop_reason.clone(),
             body: self.body.clone(),
+            extra_headers: self.extra_headers.clone(),
         }
     }
 }
@@ -248,8 +265,12 @@ where
     F: FnMut(SseEvent) -> Fut,
     Fut: Future<Output = Result<(), PumpError>>,
 {
+    let skip_emit = event.event_type == "kin_response_headers";
     if let Err(err) = tracker.observe(&event) {
         return Some(fail(tracker.result(), err));
+    }
+    if skip_emit {
+        return None;
     }
     if let Err(err) = emit(event).await {
         return Some(fail(tracker.result(), err));
@@ -332,6 +353,7 @@ fn parse_event(raw: &[u8]) -> Result<SseEvent, PumpError> {
         model: String::new(),
         stop_reason: String::new(),
         terminal: false,
+        extra_headers: HashMap::new(),
     };
     let text = String::from_utf8_lossy(raw);
     let mut data_lines = Vec::new();
@@ -361,7 +383,36 @@ fn parse_event(raw: &[u8]) -> Result<SseEvent, PumpError> {
     event.usage = event_usage(&payload);
     event.model = event_model(&payload).unwrap_or_default();
     event.stop_reason = event_stop_reason(&payload).unwrap_or_default();
+    if event.event_type == "kin_response_headers" {
+        event.extra_headers = rate_limit_headers_from_value(&payload);
+    }
     Ok(event)
+}
+
+fn rate_limit_headers_from_value(payload: &Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(map) = payload.get("headers").and_then(Value::as_object) else {
+        return out;
+    };
+    for (key, value) in map {
+        let lower = key.to_ascii_lowercase();
+        if !(lower.starts_with("anthropic-ratelimit-")
+            || lower == "retry-after"
+            || lower == "request-id")
+        {
+            continue;
+        }
+        let text = match value {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        if !text.is_empty() {
+            out.insert(lower, text);
+        }
+    }
+    out
 }
 
 fn truncate_raw(raw: &[u8]) -> String {
@@ -446,5 +497,38 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
             "{:?}",
             outcome.error
         );
+    }
+
+    #[tokio::test]
+    async fn pump_captures_rate_limit_headers_after_stop() {
+        let body = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\"}}\n\n\
+data: {\"type\":\"message_stop\"}\n\n\
+event: kin_response_headers\ndata: {\"type\":\"kin_response_headers\",\"headers\":{\"anthropic-ratelimit-unified-5h-utilization\":\"0.81\",\"set-cookie\":\"nope\"}}\n\n",
+        );
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, String>(body)]);
+        let outcome = pump(
+            stream,
+            PumpOptions {
+                max_event_bytes: 1024,
+                first_byte: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                shutdown: CancellationToken::new(),
+            },
+            |_event| async { Ok(()) },
+        )
+        .await;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            outcome
+                .result
+                .extra_headers
+                .get("anthropic-ratelimit-unified-5h-utilization")
+                .map(String::as_str),
+            Some("0.81")
+        );
+        assert!(!outcome.result.extra_headers.contains_key("set-cookie"));
+        assert!(String::from_utf8_lossy(&outcome.result.body).contains("kin_response_headers"));
+        assert_eq!(outcome.result.event_count, 2);
     }
 }

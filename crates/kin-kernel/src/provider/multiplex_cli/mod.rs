@@ -1503,6 +1503,13 @@ impl MultiplexCliProvider {
         })
     }
 
+    pub fn new(cfg: MultiplexConfig) -> Self {
+        Self {
+            cfg,
+            runtime: OnceCell::new(),
+        }
+    }
+
     #[cfg(test)]
     pub fn simulated(slot_count: usize) -> Self {
         Self {

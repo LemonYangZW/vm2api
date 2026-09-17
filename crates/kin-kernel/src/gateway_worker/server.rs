@@ -19,19 +19,23 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use super::cli_hop;
 use super::config::WorkerConfig;
 use super::credential::{Credential, now_ms};
 use super::error::{WorkerError, truncate};
 use super::hop::{HopClient, HopResponse, copyable_response_header};
 use super::sse::{PumpOptions, PumpResult, pump};
+use crate::provider::Provider;
+use crate::provider::multiplex_cli::MultiplexCliProvider;
 
-const TRAILER_NAMES: &str =
-    "X-Kin-Terminal-State, X-Kin-Event-Count, X-Kin-Usage, X-Kin-Model, X-Kin-Stop-Reason";
+pub(super) const TRAILER_NAMES: &str =
+    "X-Kin-Terminal-State, X-Kin-Event-Count, X-Kin-Usage, X-Kin-Model, X-Kin-Stop-Reason, X-Kin-Rate-Limit-Headers";
 
 #[derive(Clone)]
 pub struct WorkerState {
     pub config: Arc<WorkerConfig>,
     pub hop: Arc<HopClient>,
+    pub cli: Option<Arc<MultiplexCliProvider>>,
     pub started: Instant,
     pub shutdown: CancellationToken,
 }
@@ -49,18 +53,30 @@ struct Envelope {
 
 pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = WorkerConfig::load(config_path)?;
+    if !config.is_local_cli() {
+        return Err(
+            "gateway-worker rust is Claude Code wrap only; anthropic_api HTTP hop was removed"
+                .into(),
+        );
+    }
     let hop = HopClient::new(&config)?;
+    cli_hop::apply_cli_env(&config);
+    let provider = MultiplexCliProvider::new(cli_hop::multiplex_config(&config));
+    provider.boot().await?;
+    let cli = Some(Arc::new(provider));
     let socket = config.socket_path();
     let shutdown = CancellationToken::new();
     let state = WorkerState {
         config: Arc::new(config),
         hop: Arc::new(hop),
+        cli,
         started: Instant::now(),
         shutdown: shutdown.clone(),
     };
     info!(
         vm_id = %state.config.vm_id,
         socket = %socket.display(),
+        provider = %state.config.provider.as_str(),
         "kin-kernel gateway-worker listening"
     );
     prepare_socket(&socket)?;
@@ -121,19 +137,32 @@ async fn health(State(state): State<WorkerState>) -> Json<Value> {
         }
         Err(_) => (false, "missing"),
     };
-    Json(json!({
+    let mut body = json!({
         "ok": ok,
         "engine": "rust",
         "version": env!("CARGO_PKG_VERSION"),
         "worker_version": env!("CARGO_PKG_VERSION"),
         "vm_id": state.config.vm_id,
+        "provider": state.config.provider.as_str(),
         "proxy_configured": !state.config.proxy_url.trim().is_empty(),
         "proxy_required": state.config.proxy_required,
         "credential_state": credential_state,
         "delivery_mode": state.config.delivery_mode,
         "runtime_kind": state.config.runtime_kind,
         "uptime_seconds": state.started.elapsed().as_secs(),
-    }))
+    });
+    if let Some(cli) = &state.cli
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("cli_pid".into(), json!(cli.session_pid("")));
+        object.insert(
+            "ready_slots".into(),
+            cli.memory_snapshot()
+                .and_then(|snap| snap.get("ready_slots").cloned())
+                .unwrap_or(Value::Null),
+        );
+    }
+    Json(body)
 }
 
 async fn messages(State(state): State<WorkerState>, body: Bytes) -> Response {
@@ -154,8 +183,27 @@ async fn process_messages(state: WorkerState, body: Bytes) -> Result<Response, W
             "body is required",
         ));
     }
-    let payload = apply_stream_flag(&envelope.body, envelope.stream);
     let credential = load_live_credential(&state.config)?;
+    let mode = delivery_mode(&envelope.delivery_mode, &state.config.delivery_mode);
+    if state.config.is_local_cli() {
+        let Some(cli) = state.cli.as_ref() else {
+            return Err(WorkerError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "local_cli provider missing",
+            ));
+        };
+        return cli_hop::handle(
+            cli,
+            &state.config,
+            state.shutdown.clone(),
+            &envelope.body,
+            envelope.stream,
+            &mode,
+        )
+        .await;
+    }
+    let payload = apply_stream_flag(&envelope.body, envelope.stream);
     let upstream = state
         .hop
         .messages(&payload, &envelope.headers, &credential)
@@ -166,7 +214,7 @@ async fn process_messages(state: WorkerState, body: Bytes) -> Result<Response, W
     if !envelope.stream {
         return buffer_json(upstream, state.config.max_response_bytes).await;
     }
-    if delivery_mode(&envelope.delivery_mode, &state.config.delivery_mode) == "verified" {
+    if mode == "verified" {
         return verified_stream(upstream, &state.config, state.shutdown.clone()).await;
     }
     Ok(realtime_stream(
@@ -334,7 +382,7 @@ async fn pump_realtime(
     let _ = tx.send(Ok(Frame::trailers(trailers))).await;
 }
 
-fn incomplete_event(message: &str) -> Vec<u8> {
+pub(super) fn incomplete_event(message: &str) -> Vec<u8> {
     let payload = json!({
         "type": "error",
         "error": {
@@ -346,7 +394,7 @@ fn incomplete_event(message: &str) -> Vec<u8> {
     format!("event: error\ndata: {payload}\n\n").into_bytes()
 }
 
-fn apply_stream_meta(headers: &mut HeaderMap, result: &PumpResult) {
+pub(super) fn apply_stream_meta(headers: &mut HeaderMap, result: &PumpResult) {
     let _ = headers.insert(
         HeaderName::from_static("x-kin-event-count"),
         HeaderValue::from_str(&result.event_count.to_string())
@@ -368,9 +416,15 @@ fn apply_stream_meta(headers: &mut HeaderMap, result: &PumpResult) {
     {
         headers.insert(HeaderName::from_static("x-kin-stop-reason"), value);
     }
+    if !result.extra_headers.is_empty()
+        && let Ok(raw) = serde_json::to_string(&result.extra_headers)
+        && let Ok(value) = HeaderValue::from_str(&raw)
+    {
+        headers.insert(HeaderName::from_static("x-kin-rate-limit-headers"), value);
+    }
 }
 
-fn pump_options(config: &WorkerConfig, shutdown: CancellationToken) -> PumpOptions {
+pub(super) fn pump_options(config: &WorkerConfig, shutdown: CancellationToken) -> PumpOptions {
     PumpOptions {
         max_event_bytes: config.max_event_bytes(),
         first_byte: config.first_byte(),
@@ -727,6 +781,7 @@ mod tests {
             state: WorkerState {
                 config: Arc::new(config),
                 hop: Arc::new(hop),
+                cli: None,
                 started: Instant::now(),
                 shutdown: CancellationToken::new(),
             },
@@ -800,6 +855,7 @@ mod tests {
         let state = WorkerState {
             config: Arc::new(config),
             hop: env.state.hop.clone(),
+            cli: None,
             started: Instant::now(),
             shutdown: env.state.shutdown.clone(),
         };
