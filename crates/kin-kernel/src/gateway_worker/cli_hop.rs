@@ -661,8 +661,16 @@ mod tests {
             connect_bridge_addr("socks5h://127.0.0.1:10808"),
             Some("127.0.0.1:10808".into())
         );
-        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../scripts/http_to_socks.py");
-        assert!(script.exists(), "missing {}", script.display());
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = [
+            manifest.join("../../scripts/http_to_socks.py"),
+            manifest.join("../scripts/http_to_socks.py"),
+        ]
+        .into_iter()
+        .find(|path| path.exists());
+        assert!(
+            script.is_some(),
+            "missing http_to_socks.py next to the crate"
+        );
     }
 }

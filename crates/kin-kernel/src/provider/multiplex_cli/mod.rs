@@ -1174,9 +1174,10 @@ fn latest_text(request: &MessageRequest) -> String {
 /// protocol the real CLI speaks, so tests exercise `write_cli_stdin`,
 /// `decode_stdout` and `handle_native_frame` instead of a bespoke fake.
 ///
-/// The request text selects the reply shape: `[use_tool:NAME]` ends the turn
-/// on `tool_use`, `[web_search]` emits server tool blocks, anything else
-/// answers with a single text block.
+/// The request text selects the reply shape: `[job_error]` emits
+/// `kin_job_error`, `[use_tool:NAME]` ends the turn on `tool_use`,
+/// `[web_search]` emits server tool blocks, anything else answers with a
+/// single text block.
 ///
 /// Cancel semantics mirror the real runner: a `kin_cancel` for a job the CLI
 /// no longer owns is dropped **without** an ack, because the CLI releases its
@@ -1293,6 +1294,18 @@ async fn simulated_job<W: tokio::io::AsyncWrite + Unpin>(
         return;
     }
     tokio::time::sleep(latency).await;
+    if text.contains("[job_error]") {
+        let _ = write_sim_frame(
+            &writer,
+            &native_protocol::KinStdout::JobError {
+                job_id,
+                slot_id: Some(slot_id),
+                error: "simulated job error".into(),
+            },
+        )
+        .await;
+        return;
+    }
     let (stop_reason, usage) = if let Some(tool) = text
         .split("[use_tool:")
         .nth(1)
