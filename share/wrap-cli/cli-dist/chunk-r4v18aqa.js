@@ -1,0 +1,354 @@
+// @bun
+import {
+  init_skillLearning
+} from "./chunk-tnmpwsgx.js";
+import {
+  findGapKeyByDraftPath,
+  promoteGapToDraft,
+  readSkillGaps,
+  recordDraftHit,
+  recordSkillGap,
+  rejectSkillGap,
+  shouldPromoteToActive,
+  shouldPromoteToDraft
+} from "./chunk-wt2b631b.js";
+import {
+  RUNTIME_SESSION_ID,
+  checkPromotion,
+  classifyEvolutionTarget,
+  clusterInstincts,
+  exportInstincts,
+  findPromotionCandidates,
+  generateAgentCandidates,
+  generateAgentDraft,
+  generateAllCandidates,
+  generateCommandCandidates,
+  generateCommandDraft,
+  generateSkillCandidates,
+  getGlobalInstinctsDir,
+  getLearnedAgentPath,
+  getLearnedCommandPath,
+  getRuntimeTurn,
+  importInstincts,
+  initSkillLearning,
+  loadInstincts,
+  prunePendingInstincts,
+  resetPromotionBookkeeping,
+  resetRuntimeLLMBookkeeping,
+  resetRuntimeObserverForTest,
+  runSkillLearningPostSampling,
+  saveInstinct,
+  suggestEvolutions,
+  updateConfidence,
+  upsertInstinct,
+  writeLearnedAgent,
+  writeLearnedCommand
+} from "./chunk-hvzznwgz.js";
+import {
+  DUPLICATE_SKILL_OVERLAP_THRESHOLD,
+  MAX_SKILL_NAME_LENGTH,
+  MIN_CONFIDENCE_TO_GENERATE_SKILL,
+  appendInstinctEvidenceToSkill,
+  applySkillLifecycleDecision,
+  archiveSkill,
+  buildLearnedSkillName,
+  compareExistingArtifacts,
+  compareExistingSkills,
+  decideDefaultScope,
+  decideSkillLifecycle,
+  deleteSkill,
+  generateOrMergeSkillDraft,
+  generateSkillDraft,
+  getLearnedSkillPath,
+  isGenericSkillName,
+  isValidLearnedSkillName,
+  loadExistingArtifacts,
+  loadExistingSkills,
+  normalizeSkillName,
+  scoreArtifactOverlap,
+  shouldGenerateSkillFromInstincts,
+  writeLearnedSkill,
+  writeReplacementManifest
+} from "./chunk-9qdmdnvh.js";
+import {
+  getProjectContextPath,
+  getProjectStorageDir,
+  getProjectsRegistryPath,
+  getSkillLearningRootDir,
+  listKnownProjects,
+  resolveProjectContext
+} from "./chunk-20bwbvrs.js";
+import {
+  INSTINCT_DOMAINS,
+  analyzeObservations,
+  analyzeObservationsAsync,
+  analyzeWithActiveBackend,
+  getActiveObserverBackend,
+  heuristicAnalyze,
+  heuristicObserverBackend,
+  listObserverBackends,
+  llmObserverBackend,
+  observeSession,
+  registerObserverBackend,
+  resetObserverBackendsForTest,
+  resolveDefaultObserverBackend,
+  setActiveObserverBackend
+} from "./chunk-8vcncbz8.js";
+import {
+  createInstinct,
+  parseInstinct,
+  serializeInstinct
+} from "./chunk-w9ddp3yf.js";
+import {
+  hasToolHookObservationsForTurn,
+  pruneEmittedTurns,
+  recordToolComplete,
+  recordToolError,
+  recordToolStart,
+  recordUserCorrection,
+  resetToolHookBookkeeping,
+  resetToolHookDepsCache,
+  runToolCallWithSkillLearningHooks
+} from "./chunk-tw7w3dqa.js";
+import {
+  appendObservation,
+  ingestTranscript,
+  readObservations,
+  scrubObservation,
+  scrubText
+} from "./chunk-v3ey5j7f.js";
+import"./chunk-92frfsdm.js";
+import"./chunk-14p6wvsq.js";
+import"./chunk-sndpqnmg.js";
+import"./chunk-5w7gsjdj.js";
+import"./chunk-28jd8qjx.js";
+import"./chunk-ptxteaeh.js";
+import"./chunk-hkv7c3s6.js";
+import"./chunk-f40jvwgw.js";
+import"./chunk-w9t7xj87.js";
+import"./chunk-xah6e91t.js";
+import"./chunk-qvq9z8k4.js";
+import"./chunk-9a9g5hbj.js";
+import"./chunk-rgyzsbs3.js";
+import"./chunk-qn6me9n1.js";
+import"./chunk-0rhrpnpv.js";
+import"./chunk-wgwq4gvd.js";
+import"./chunk-djt39ze3.js";
+import"./chunk-4x9pek6a.js";
+import"./chunk-71sdcaq6.js";
+import"./chunk-9hn8e6h1.js";
+import"./chunk-4rer68y0.js";
+import"./chunk-f2rhkq3t.js";
+import"./chunk-5cf3czgf.js";
+import"./chunk-bhgvey4s.js";
+import"./chunk-xp6v07f0.js";
+import"./chunk-ffq9eh6d.js";
+import"./chunk-kbkxsgv3.js";
+import"./chunk-24kv69g3.js";
+import"./chunk-2vk6e88k.js";
+import"./chunk-n1j46ncq.js";
+import"./chunk-hdtp7tn1.js";
+import"./chunk-jt482g7x.js";
+import"./chunk-4spgkgr3.js";
+import"./chunk-8wzca1dh.js";
+import"./chunk-833fsr7s.js";
+import"./chunk-2m7k0qdy.js";
+import"./chunk-60fkafk2.js";
+import"./chunk-mt660rpv.js";
+import"./chunk-7b68gcqs.js";
+import"./chunk-q4dg9ftz.js";
+import"./chunk-7tfdhkpy.js";
+import {
+  isSkillLearningCompiledIn,
+  isSkillLearningEnabled
+} from "./chunk-nde5ym6a.js";
+import"./chunk-a4q88q6t.js";
+import"./chunk-1d7prqr7.js";
+import"./chunk-nfc2mwg3.js";
+import"./chunk-c40ryser.js";
+import"./chunk-qw03ehq0.js";
+import"./chunk-1qgb1568.js";
+import"./chunk-0jw2cfy8.js";
+import"./chunk-935nrvdb.js";
+import"./chunk-8zz4z1q3.js";
+import"./chunk-w6cgk6nk.js";
+import"./chunk-hqxp6b72.js";
+import"./chunk-2ehn4hjt.js";
+import"./chunk-zymr6ztr.js";
+import"./chunk-w5hnghah.js";
+import"./chunk-vdz79ezt.js";
+import"./chunk-msarpzkm.js";
+import"./chunk-s76nvx50.js";
+import"./chunk-gb0km2ev.js";
+import"./chunk-ghhmj79c.js";
+import"./chunk-73g8bk52.js";
+import"./chunk-khh8a09c.js";
+import"./chunk-rwny7j7h.js";
+import"./chunk-epvbnq43.js";
+import"./chunk-h7cy00tf.js";
+import"./chunk-srzb9n7s.js";
+import"./chunk-6tzyv21c.js";
+import"./chunk-8kf8h7xf.js";
+import"./chunk-bgan4cpf.js";
+import"./chunk-jmv7k0jn.js";
+import"./chunk-psygyacq.js";
+import"./chunk-e2d0hkcr.js";
+import"./chunk-g2931ep0.js";
+import"./chunk-vwenx8ke.js";
+import"./chunk-kkpmm4b2.js";
+import"./chunk-etzpfazg.js";
+import"./chunk-v4ypszbb.js";
+import"./chunk-bk6ck5c2.js";
+import"./chunk-ym6j0wv1.js";
+import"./chunk-hjmatcgt.js";
+import"./chunk-6mdh70q0.js";
+import"./chunk-ch92ycde.js";
+import"./chunk-e4dsy4g1.js";
+import"./chunk-326zehp8.js";
+import"./chunk-kc67kt75.js";
+import"./chunk-40t1d75v.js";
+import"./chunk-1k7v4v6f.js";
+import"./chunk-e3abfxpy.js";
+import"./chunk-q44zc68f.js";
+import"./chunk-fejeqe61.js";
+import"./chunk-v5yhfnx0.js";
+import"./chunk-hn4w9pkj.js";
+import"./chunk-1ekct4sm.js";
+import"./chunk-x9xf2qa8.js";
+import"./chunk-j1mep9ck.js";
+import"./chunk-6x35ffpx.js";
+import"./chunk-1zbwhcbt.js";
+import"./chunk-wdyw5x2b.js";
+import"./chunk-3yga13e5.js";
+import"./chunk-ye35qwfx.js";
+import"./chunk-e3j7m7k2.js";
+import"./chunk-t37nnsvj.js";
+import"./chunk-ew28k9dk.js";
+import"./chunk-mhjmeh6r.js";
+import"./chunk-m28vg9w4.js";
+import"./chunk-m4zp6cf9.js";
+import"./chunk-w8n8j7aw.js";
+import"./chunk-c1yc761e.js";
+import"./chunk-c5g9shkw.js";
+import"./chunk-82pkdrt0.js";
+import"./chunk-kb3758f7.js";
+import"./chunk-v4e7ch76.js";
+import"./chunk-tj0dzck2.js";
+import"./chunk-aeysytks.js";
+import"./chunk-ns1htxgd.js";
+import"./chunk-ztqzmfx1.js";
+import"./chunk-6k1rsk85.js";
+import"./chunk-nxzx0ey9.js";
+import"./chunk-yes1my80.js";
+import"./chunk-pecy49yr.js";
+import"./chunk-azbab59e.js";
+import"./chunk-3nk9q8dr.js";
+import"./chunk-hhsxm2yr.js";
+init_skillLearning();
+
+export {
+  writeReplacementManifest,
+  writeLearnedSkill,
+  writeLearnedCommand,
+  writeLearnedAgent,
+  upsertInstinct,
+  updateConfidence,
+  suggestEvolutions,
+  shouldPromoteToDraft,
+  shouldPromoteToActive,
+  shouldGenerateSkillFromInstincts,
+  setActiveObserverBackend,
+  serializeInstinct,
+  scrubText,
+  scrubObservation,
+  scoreArtifactOverlap,
+  saveInstinct,
+  runToolCallWithSkillLearningHooks,
+  runSkillLearningPostSampling,
+  resolveProjectContext,
+  resolveDefaultObserverBackend,
+  resetToolHookDepsCache,
+  resetToolHookBookkeeping,
+  resetRuntimeObserverForTest,
+  resetRuntimeLLMBookkeeping,
+  resetPromotionBookkeeping,
+  resetObserverBackendsForTest,
+  rejectSkillGap,
+  registerObserverBackend,
+  recordUserCorrection,
+  recordToolStart,
+  recordToolError,
+  recordToolComplete,
+  recordSkillGap,
+  recordDraftHit,
+  readSkillGaps,
+  readObservations,
+  prunePendingInstincts,
+  pruneEmittedTurns,
+  promoteGapToDraft,
+  parseInstinct,
+  observeSession,
+  normalizeSkillName,
+  loadInstincts,
+  loadExistingSkills,
+  loadExistingArtifacts,
+  llmObserverBackend,
+  listObserverBackends,
+  listKnownProjects,
+  isValidLearnedSkillName,
+  isSkillLearningEnabled,
+  isSkillLearningCompiledIn,
+  isGenericSkillName,
+  initSkillLearning,
+  ingestTranscript,
+  importInstincts,
+  heuristicObserverBackend,
+  heuristicAnalyze,
+  hasToolHookObservationsForTurn,
+  getSkillLearningRootDir,
+  getRuntimeTurn,
+  getProjectsRegistryPath,
+  getProjectStorageDir,
+  getProjectContextPath,
+  getLearnedSkillPath,
+  getLearnedCommandPath,
+  getLearnedAgentPath,
+  getGlobalInstinctsDir,
+  getActiveObserverBackend,
+  generateSkillDraft,
+  generateSkillCandidates,
+  generateOrMergeSkillDraft,
+  generateCommandDraft,
+  generateCommandCandidates,
+  generateAllCandidates,
+  generateAgentDraft,
+  generateAgentCandidates,
+  findPromotionCandidates,
+  findGapKeyByDraftPath,
+  exportInstincts,
+  deleteSkill,
+  decideSkillLifecycle,
+  decideDefaultScope,
+  createInstinct,
+  compareExistingSkills,
+  compareExistingArtifacts,
+  clusterInstincts,
+  classifyEvolutionTarget,
+  checkPromotion,
+  buildLearnedSkillName,
+  archiveSkill,
+  applySkillLifecycleDecision,
+  appendObservation,
+  appendInstinctEvidenceToSkill,
+  analyzeWithActiveBackend,
+  analyzeObservationsAsync,
+  analyzeObservations,
+  RUNTIME_SESSION_ID,
+  MIN_CONFIDENCE_TO_GENERATE_SKILL,
+  MAX_SKILL_NAME_LENGTH,
+  INSTINCT_DOMAINS,
+  DUPLICATE_SKILL_OVERLAP_THRESHOLD
+};
+
+//# debugId=AC30D31F5800192B64756E2164756E21
+//# sourceMappingURL=chunk-r4v18aqa.js.map
