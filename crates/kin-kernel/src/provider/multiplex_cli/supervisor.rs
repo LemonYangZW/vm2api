@@ -39,6 +39,11 @@ pub fn native_cli_args(model: &str) -> Vec<String> {
     .collect()
 }
 
+/// Product surface sent on Anthropic TLS. Must stay `cli` for subscriber OAuth.
+pub fn spawn_cli_entrypoint() -> &'static str {
+    "cli"
+}
+
 pub async fn spawn(spec: &SpawnSpec) -> Result<Supervised, KernelError> {
     let auth = if spec.reuse_credentials {
         None
@@ -67,7 +72,8 @@ pub async fn spawn(spec: &SpawnSpec) -> Result<Supervised, KernelError> {
     }
     cmd.current_dir(&spec.session_dir)
         .env("CLAUDE_CONFIG_DIR", &spec.session_dir)
-        .env("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
+        // Interactive Claude Code surface. `sdk-cli` bills subscriber OAuth as extra usage (Opus/Sonnet 429).
+        .env("CLAUDE_CODE_ENTRYPOINT", spawn_cli_entrypoint())
         .env("USER_TYPE", "external")
         .env(
             "CLAUDE_CODE_VERSION",
@@ -175,5 +181,11 @@ mod tests {
             .unwrap(),
             ProxyEnvPlan::Http("http://127.0.0.1:7890".into())
         );
+    }
+
+    #[test]
+    fn subscriber_oauth_uses_interactive_cli_entrypoint() {
+        // Spawn env must match kin-gateway. sdk-cli is Agent SDK extra-usage billing.
+        assert_eq!(super::spawn_cli_entrypoint(), "cli");
     }
 }
