@@ -16,6 +16,7 @@ pub mod supervisor;
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Read,
     path::PathBuf,
     sync::{
         Arc, OnceLock, Weak,
@@ -695,6 +696,7 @@ impl Runtime {
                 slot_id,
                 stop_reason,
                 usage,
+                headers,
             } => {
                 if let Some(job) = self.jobs.lock().await.get(&job_id)
                     && job.slot_id != slot_id
@@ -706,6 +708,17 @@ impl Runtime {
                         "native job_done slot_id mismatch"
                     );
                     return;
+                }
+                if !headers.is_empty() {
+                    let _ = self
+                        .emit(
+                            &job_id,
+                            StreamItem::Event(json!({
+                                "type": "kin_response_headers",
+                                "headers": headers,
+                            })),
+                        )
+                        .await;
                 }
                 let _ = self
                     .complete_job(&job_id, String::new(), false, &stop_reason, usage)
@@ -1029,10 +1042,16 @@ async fn job_egress(
         if let Some(terminal) = sink.terminal.get()
             && terminal.is_failure()
         {
+            // Flush queued frames (Extra 5h headers) before the error so
+            // Node trailers still ingest the window on wrap 400/limit.
+            while let Ok(envelope) = data_rx.try_recv() {
+                sink.budget.release(envelope.bytes);
+                if let Some(tx) = sink.client_tx.lock().await.clone() {
+                    let _ = tx.send(Ok(envelope.item)).await;
+                }
+            }
             fail_client_stream(&sink, terminal).await;
             if let Some(runtime) = runtime.upgrade() {
-                // The CLI is still streaming this job: cancel it and wait for
-                // kin_cancel_ack to free the slot.
                 runtime.abort_terminal_job(&job_id, true).await;
             }
             break;
@@ -1400,6 +1419,7 @@ async fn simulated_job<W: tokio::io::AsyncWrite + Unpin>(
             slot_id,
             stop_reason: stop_reason.to_string(),
             usage,
+            headers: Default::default(),
         },
     )
     .await;
@@ -1435,8 +1455,21 @@ fn ensure_socks_http_bridge() -> Result<(), KernelError> {
         .map_err(|err| KernelError::Provider(format!("http_to_socks spawn: {err}")))?;
     std::thread::sleep(Duration::from_millis(200));
     if let Ok(Some(status)) = child.try_wait() {
+        let err = child
+            .stderr
+            .as_mut()
+            .and_then(|pipe| {
+                let mut buf = String::new();
+                pipe.read_to_string(&mut buf).ok()?;
+                Some(buf)
+            })
+            .unwrap_or_default();
+        if err.contains("Address already in use") || err.contains("EADDRINUSE") {
+            tracing::info!(proxy = %proxy, "cli https proxy already bound");
+            return Ok(());
+        }
         return Err(KernelError::Provider(format!(
-            "http_to_socks exited {status}"
+            "http_to_socks exited {status}: {err}"
         )));
     }
     std::mem::forget(child);

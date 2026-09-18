@@ -28,8 +28,7 @@ use super::sse::{PumpOptions, PumpResult, pump};
 use crate::provider::Provider;
 use crate::provider::multiplex_cli::MultiplexCliProvider;
 
-pub(super) const TRAILER_NAMES: &str =
-    "X-Kin-Terminal-State, X-Kin-Event-Count, X-Kin-Usage, X-Kin-Model, X-Kin-Stop-Reason, X-Kin-Rate-Limit-Headers";
+pub(super) const TRAILER_NAMES: &str = "X-Kin-Terminal-State, X-Kin-Event-Count, X-Kin-Usage, X-Kin-Model, X-Kin-Stop-Reason, X-Kin-Rate-Limit-Headers";
 
 #[derive(Clone)]
 pub struct WorkerState {

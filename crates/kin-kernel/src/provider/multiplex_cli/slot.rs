@@ -56,10 +56,12 @@ impl Slot {
         true
     }
 
-    /// Keep tenant+session sticky. Clearing them would let another tenant
-    /// inherit leftover subagent context.
+    /// native_messages jobs are stateless. Keep the slot reusable by the next
+    /// /v1 session; sticky leftover only applies to subagent native slots.
     pub fn unbind_ready(&mut self) {
         self.job_id = None;
+        self.tenant_id = None;
+        self.session_id = None;
         self.phase = SlotPhase::ReadyBlocked;
         self.last_change = Instant::now();
     }
@@ -68,13 +70,14 @@ impl Slot {
         if self.jobs_completed >= max_jobs {
             return true;
         }
-        if self.created_at.elapsed() >= max_lifetime {
-            return true;
+        // Wrap native_messages keeps ReadyBlocked slots as the hot pool.
+        // Lifetime used to Dead them after 30m; forget() dropped the
+        // scheduler queue without respawn, so health still showed
+        // ready_slots=20 while pick() returned NoCapacity.
+        if self.phase == SlotPhase::ReadyBlocked {
+            return self.tenant_id.is_some() && self.last_change.elapsed() >= idle;
         }
-        if self.phase == SlotPhase::ReadyBlocked
-            && self.tenant_id.is_some()
-            && self.last_change.elapsed() >= idle
-        {
+        if self.created_at.elapsed() >= max_lifetime {
             return true;
         }
         false
@@ -95,4 +98,17 @@ pub struct SlotSnapshot {
     pub session_id: Option<String>,
     pub tenant_id: Option<String>,
     pub jobs_completed: u32,
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn ready_blocked_survives_zero_lifetime() {
+        let mut slot = Slot::new("s00");
+        slot.unbind_ready();
+        assert!(!slot.should_retire(50, Duration::from_secs(0), Duration::from_secs(600)));
+    }
 }

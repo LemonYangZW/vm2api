@@ -60,7 +60,12 @@ pub async fn spawn(spec: &SpawnSpec) -> Result<Supervised, KernelError> {
     }
     cmd.current_dir(&spec.session_dir)
         .env("CLAUDE_CONFIG_DIR", &spec.session_dir)
-        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")
+        .env("USER_TYPE", "external")
+        .env(
+            "CLAUDE_CODE_VERSION",
+            env::var("CLAUDE_CODE_VERSION").unwrap_or_else(|_| "2.1.263".into()),
+        )
         .env("CLAUDE_CODE_DISABLE_TELEMETRY", "1");
     apply_envelope_env(&mut cmd);
     auth.apply_tokio(&mut cmd);

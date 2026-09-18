@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub const KIN_PROTOCOL_VERSION: u32 = 2;
 pub const KIN_CAPABILITIES: &[&str] = &["multi_slot", "native_sse", "stateless"];
@@ -65,6 +66,8 @@ pub enum KinStdout {
         stop_reason: String,
         #[serde(default)]
         usage: Value,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        headers: HashMap<String, String>,
     },
     #[serde(rename = "kin_job_error")]
     JobError {
@@ -158,6 +161,36 @@ mod tests {
         let parsed = decode_stdout_line(line).unwrap();
         match parsed {
             KinStdout::HostReady { config_hash, .. } => assert!(config_hash.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_done_headers_optional() {
+        let bare = decode_stdout_line(
+            r#"{"type":"kin_job_done","job_id":"j1","slot_id":"s00","stop_reason":"end_turn"}"#,
+        )
+        .unwrap();
+        match bare {
+            KinStdout::JobDone { headers, usage, .. } => {
+                assert!(headers.is_empty());
+                assert_eq!(usage, Value::Null);
+            }
+            other => panic!("{other:?}"),
+        }
+        let with = decode_stdout_line(
+            r#"{"type":"kin_job_done","job_id":"j1","slot_id":"s00","stop_reason":"end_turn","headers":{"anthropic-ratelimit-unified-5h-utilization":"0.81"}}"#,
+        )
+        .unwrap();
+        match with {
+            KinStdout::JobDone { headers, .. } => {
+                assert_eq!(
+                    headers
+                        .get("anthropic-ratelimit-unified-5h-utilization")
+                        .map(String::as_str),
+                    Some("0.81")
+                );
+            }
             other => panic!("{other:?}"),
         }
     }
