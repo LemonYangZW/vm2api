@@ -211,7 +211,7 @@ async function runNativeMessagesLoop(_ctx) {
   if (n <= 0)
     return;
   process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK = "1";
-  process.env.CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
+  process.env.CLAUDE_CODE_ENTRYPOINT = process.env.CLAUDE_CODE_ENTRYPOINT || "cli";
   process.env.USER_TYPE = process.env.USER_TYPE || "external";
   process.env.CLAUDE_CODE_VERSION = process.env.CLAUDE_CODE_VERSION || WRAP_OFFICIAL_CLI_VERSION;
   process.stderr.write(`[kin] native_messages loop n=${n} protocol=${KIN_PROTOCOL_VERSION}

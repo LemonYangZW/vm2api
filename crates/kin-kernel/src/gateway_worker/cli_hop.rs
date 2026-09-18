@@ -105,7 +105,10 @@ pub fn apply_cli_env(config: &WorkerConfig) {
         }
         env::set_var("KIN_SYSTEM_MODE", &config.system_layout);
         env::set_var("CLAUDE_CODE_SYSTEM_LAYOUT", &config.system_layout);
-        env::set_var("CLAUDE_CODE_ENTRYPOINT", "sdk-cli");
+        env::set_var(
+            "CLAUDE_CODE_ENTRYPOINT",
+            crate::provider::multiplex_cli::supervisor::spawn_cli_entrypoint(),
+        );
         env::set_var("USER_TYPE", "external");
         env::set_var("CLAUDE_CODE_VERSION", config.cli_version.trim());
         env::set_var("KIN_SLOTS_PER_WORKER", config.slots_per_worker.to_string());

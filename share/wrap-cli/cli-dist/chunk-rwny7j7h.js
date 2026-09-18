@@ -512,7 +512,7 @@ var init_cliVersion = () => {};
 
 // src/kin/officialFingerprint.ts
 function officialCliUserAgent() {
-  const entry = process.env.CLAUDE_CODE_ENTRYPOINT || "sdk-cli";
+  const entry = process.env.CLAUDE_CODE_ENTRYPOINT || "cli";
   const userType = process.env.USER_TYPE || "external";
   return `claude-cli/${officialCliVersion()} (${userType}, ${entry})`;
 }
@@ -528,8 +528,8 @@ function officialStainlessHeaders() {
     "x-stainless-timeout": "600"
   };
 }
-function applyOfficialOutboundHeaders(headers, userAgent = officialCliUserAgent()) {
-  headers.set("User-Agent", userAgent);
+function applyOfficialOutboundHeaders(headers, _userAgent = officialCliUserAgent()) {
+  headers.set("User-Agent", officialCliUserAgent());
   headers.set("x-app", "cli");
   for (const [key, value] of Object.entries(officialStainlessHeaders())) {
     headers.set(key, value);
