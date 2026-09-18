@@ -55,6 +55,9 @@ pub fn multiplex_config(config: &WorkerConfig) -> MultiplexConfig {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(u64::MAX / 2);
+    let session_dir = std::path::Path::new(&config.credential_path)
+        .parent()
+        .map(std::path::PathBuf::from);
     MultiplexConfig {
         slot_count: slots.min(20),
         simulate: false,
@@ -73,6 +76,7 @@ pub fn multiplex_config(config: &WorkerConfig) -> MultiplexConfig {
         } else {
             Some(config.config_hash.clone())
         },
+        session_dir,
     }
 }
 

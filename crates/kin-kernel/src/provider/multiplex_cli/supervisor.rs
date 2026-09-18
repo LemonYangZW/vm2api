@@ -17,6 +17,7 @@ pub struct SpawnSpec {
     pub slot_count: usize,
     pub session_dir: PathBuf,
     pub desired_config_hash: Option<String>,
+    pub reuse_credentials: bool,
 }
 
 pub fn native_cli_args(model: &str) -> Vec<String> {
@@ -39,8 +40,14 @@ pub fn native_cli_args(model: &str) -> Vec<String> {
 }
 
 pub async fn spawn(spec: &SpawnSpec) -> Result<Supervised, KernelError> {
-    let auth = cli_auth::resolve()?;
-    cli_auth::write_credentials(&spec.session_dir, &auth)?;
+    let auth = if spec.reuse_credentials {
+        None
+    } else {
+        Some(cli_auth::resolve()?)
+    };
+    if let Some(auth) = &auth {
+        cli_auth::write_credentials(&spec.session_dir, auth)?;
+    }
     let n = spec.slot_count.to_string();
     let mut cmd = if spec.mock {
         let mut cmd = Command::new("node");
@@ -68,7 +75,9 @@ pub async fn spawn(spec: &SpawnSpec) -> Result<Supervised, KernelError> {
         )
         .env("CLAUDE_CODE_DISABLE_TELEMETRY", "1");
     apply_envelope_env(&mut cmd);
-    auth.apply_tokio(&mut cmd);
+    if let Some(auth) = &auth {
+        auth.apply_tokio(&mut cmd);
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

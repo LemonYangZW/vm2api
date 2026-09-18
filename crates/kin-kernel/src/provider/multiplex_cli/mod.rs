@@ -63,6 +63,8 @@ pub struct MultiplexConfig {
     /// mirrors `crate::config::Config::desired_config_hash`. Read once at
     /// startup; `None` skips three-way config_hash validation.
     pub desired_config_hash: Option<String>,
+    /// Live Claude config dir. None → temp dir + env oauth write.
+    pub session_dir: Option<PathBuf>,
 }
 
 impl MultiplexConfig {
@@ -119,6 +121,7 @@ impl MultiplexConfig {
                     .unwrap_or(2000),
             ),
             desired_config_hash: env::var("KIN_DESIRED_CONFIG_HASH").ok(),
+            session_dir: None,
         })
     }
 }
@@ -367,7 +370,10 @@ impl Runtime {
 
     async fn start_claude(self: &Arc<Self>) -> Result<(), KernelError> {
         ensure_socks_http_bridge()?;
-        let dir = PathBuf::from("/tmp/kin-cli/multiplex").join(Uuid::new_v4().to_string());
+        let reuse = self.cfg.session_dir.is_some();
+        let dir = self.cfg.session_dir.clone().unwrap_or_else(|| {
+            PathBuf::from("/tmp/kin-cli/multiplex").join(Uuid::new_v4().to_string())
+        });
         let spec = supervisor::SpawnSpec {
             bin: self.cfg.bin.clone(),
             mock: self.cfg.mock_bin,
@@ -375,6 +381,7 @@ impl Runtime {
             slot_count: self.cfg.slot_count,
             session_dir: dir,
             desired_config_hash: self.cfg.desired_config_hash.clone(),
+            reuse_credentials: reuse,
         };
         let mut supervised = supervisor::spawn(&spec).await?;
         self.pid.store(supervised.pid, Ordering::Relaxed);
@@ -569,6 +576,7 @@ impl Runtime {
         }
     }
 
+    #[allow(dead_code)]
     async fn retire_idle(&self) {
         let ids: Vec<String> = {
             let slots = self.slots.lock().await;
@@ -665,24 +673,23 @@ impl Runtime {
                 slot_id,
                 event,
             } => {
-                if let Some(job) = self.jobs.lock().await.get(&job_id)
-                    && job.slot_id != slot_id
-                {
-                    tracing::warn!(
-                        %job_id,
-                        expected = %job.slot_id,
-                        got = %slot_id,
-                        "native stream slot_id mismatch"
-                    );
-                    return;
-                }
-                let model = self
-                    .jobs
-                    .lock()
-                    .await
-                    .get(&job_id)
-                    .map(|job| job.request.model.clone())
-                    .unwrap_or_default();
+                let model = {
+                    let jobs = self.jobs.lock().await;
+                    if let Some(job) = jobs.get(&job_id)
+                        && job.slot_id != slot_id
+                    {
+                        tracing::warn!(
+                            %job_id,
+                            expected = %job.slot_id,
+                            got = %slot_id,
+                            "native stream slot_id mismatch"
+                        );
+                        return;
+                    }
+                    jobs.get(&job_id)
+                        .map(|job| job.request.model.clone())
+                        .unwrap_or_default()
+                };
                 self.stream_assemblers
                     .lock()
                     .await
@@ -926,13 +933,8 @@ impl Runtime {
         context: ExecutionContext,
         tx: StreamTx,
     ) -> Result<(), KernelError> {
-        let request_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+        let request_bytes = request.messages.len().saturating_mul(1024).max(1024);
         self.memory.admit(request_bytes)?;
-        self.retire_idle().await;
-        // A slot that just finished a job is briefly neither Running nor back
-        // in slot_wait (ReadyBlocked). A burst of submissions can hit that
-        // re-entry gap and see NoCapacity even though the pool is not full,
-        // so retry with a bounded wait instead of failing fast.
         let deadline = tokio::time::Instant::now() + self.cfg.submit_wait;
         let (slot_id, job_id) = loop {
             let mut slots = self.slots.lock().await;
@@ -957,9 +959,6 @@ impl Runtime {
                 Err(err) => {
                     drop(sched);
                     drop(slots);
-                    // Busy-now is not full-forever: keep retrying until the
-                    // deadline. A genuinely saturated pool still 503s, just
-                    // submit_wait later.
                     if tokio::time::Instant::now() >= deadline {
                         return Err(err);
                     }
@@ -972,22 +971,19 @@ impl Runtime {
             slot_id: slot_id.clone(),
             request,
         };
-        self.jobs.lock().await.insert(job_id.clone(), job.clone());
+        let request_value = serde_json::to_value(&job.request).unwrap_or_else(|_| json!({}));
+        self.jobs.lock().await.insert(job_id.clone(), job);
         self.start_job_sink(job_id.clone(), tx).await;
-        self.job_sizes
-            .lock()
-            .await
-            .insert(job_id.clone(), request_bytes);
+        self.write_cli_stdin(native_protocol::KinStdin::JobStart {
+            job_id: job_id.clone(),
+            slot_id,
+            request: request_value,
+        })
+        .await?;
+        self.job_sizes.lock().await.insert(job_id, request_bytes);
         self.memory.begin(request_bytes);
         let n = self.running.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak_running.fetch_max(n, Ordering::Relaxed);
-        let request = serde_json::to_value(&job.request).unwrap_or_else(|_| json!({}));
-        self.write_cli_stdin(native_protocol::KinStdin::JobStart {
-            job_id,
-            slot_id,
-            request,
-        })
-        .await?;
         Ok(())
     }
 
@@ -1573,6 +1569,7 @@ impl MultiplexCliProvider {
                 client_stall_timeout: Duration::from_secs(crate::config::DEFAULT_CLIENT_STALL_SECS),
                 submit_wait: Duration::from_millis(200),
                 desired_config_hash: None,
+                session_dir: None,
             },
             runtime: OnceCell::new(),
         }
@@ -1581,21 +1578,7 @@ impl MultiplexCliProvider {
     async fn runtime(&self) -> Result<&Arc<Runtime>, KernelError> {
         self.runtime
             .get_or_try_init(|| async {
-                let runtime = Runtime::new(MultiplexConfig {
-                    slot_count: self.cfg.slot_count,
-                    simulate: self.cfg.simulate,
-                    bin: self.cfg.bin.clone(),
-                    mock_bin: self.cfg.mock_bin,
-                    model: self.cfg.model.clone(),
-                    max_jobs_per_slot: self.cfg.max_jobs_per_slot,
-                    slot_max_lifetime: self.cfg.slot_max_lifetime,
-                    session_idle_ttl: self.cfg.session_idle_ttl,
-                    simulate_latency: self.cfg.simulate_latency,
-                    continuation_ttl_secs: self.cfg.continuation_ttl_secs,
-                    client_stall_timeout: self.cfg.client_stall_timeout,
-                    submit_wait: self.cfg.submit_wait,
-                    desired_config_hash: self.cfg.desired_config_hash.clone(),
-                });
+                let runtime = Runtime::new(self.cfg.clone());
                 runtime.start().await?;
                 Ok(runtime)
             })
@@ -1725,6 +1708,7 @@ mod tests {
             client_stall_timeout: stall,
             submit_wait: Duration::from_millis(200),
             desired_config_hash: None,
+            session_dir: None,
         }
     }
 

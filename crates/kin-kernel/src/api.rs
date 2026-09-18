@@ -253,6 +253,7 @@ impl ActiveTurn {
         headers: &HeaderMap,
         mut request: MessageRequest,
     ) -> Result<Self, KernelError> {
+        request.strip_server_tool_extras();
         validate_request(&request)?;
         let tenant_id = header_or_default(headers, "x-tenant-id", &state.config.default_tenant)?;
         let session_id = header_or_generated(headers, "x-kin-session-id")?;
