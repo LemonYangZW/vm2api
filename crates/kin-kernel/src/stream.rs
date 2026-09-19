@@ -19,9 +19,11 @@ pub struct StreamAssembler {
     stop: StopReason,
     usage: Usage,
     tool_json: Vec<String>,
+    saw_stop: bool,
 }
 
 impl StreamAssembler {
+
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             id: format!("msg_{}", Uuid::new_v4().simple()),
@@ -30,6 +32,7 @@ impl StreamAssembler {
             stop: StopReason::EndTurn,
             usage: Usage::default(),
             tool_json: Vec::new(),
+            saw_stop: false,
         }
     }
 
@@ -199,6 +202,7 @@ impl StreamAssembler {
                     self.stop = map_stop_reason(reason);
                 }
             }
+            Some("message_stop") => self.saw_stop = true,
             _ => {}
         }
     }
@@ -221,6 +225,10 @@ impl StreamAssembler {
 
     pub fn parts(self) -> (Vec<ContentBlock>, StopReason, Usage) {
         (self.content, self.stop, self.usage)
+    }
+
+    pub fn saw_stop(&self) -> bool {
+        self.saw_stop
     }
 
     fn ensure_index(&mut self, index: usize) {
@@ -378,6 +386,14 @@ mod tests {
             ContentBlock::Text { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("expected text"),
         }
+    }
+
+    #[test]
+    fn message_stop_sets_saw_stop() {
+        let mut assembler = StreamAssembler::new("claude-sonnet-5");
+        assert!(!assembler.saw_stop());
+        assembler.apply_event(&json!({ "type": "message_stop" }));
+        assert!(assembler.saw_stop());
     }
 
     #[test]
