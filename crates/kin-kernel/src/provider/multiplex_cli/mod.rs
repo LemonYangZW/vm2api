@@ -488,13 +488,17 @@ impl Runtime {
             self.abort_terminal_job(job_id, false).await;
             return Ok(());
         }
-        let (content, assembled_stop, assembled_usage) = self
-            .stream_assemblers
-            .lock()
-            .await
-            .remove(job_id)
-            .map(StreamAssembler::parts)
-            .unwrap_or_else(|| {
+        let assembler = self.stream_assemblers.lock().await.remove(job_id);
+        if assembler.as_ref().is_none_or(|a| !a.saw_stop()) {
+            // First-byte path flushes message_start before the CLI turn
+            // ends. JobDone is the authority; without message_stop the hop
+            // client marks incomplete and the panel paints api_error.
+            let _ = self
+                .emit(job_id, StreamItem::Event(json!({ "type": "message_stop" })))
+                .await;
+        }
+        let (content, assembled_stop, assembled_usage) =
+            assembler.map(StreamAssembler::parts).unwrap_or_else(|| {
                 (
                     Vec::new(),
                     native_stop_reason(stop_reason),

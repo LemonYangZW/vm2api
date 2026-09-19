@@ -204,6 +204,7 @@ fn event_to_sse(event: &Value) -> Vec<u8> {
 
 struct SseByteStream {
     rx: StreamRx,
+    saw_stop: bool,
 }
 
 impl Stream for SseByteStream {
@@ -214,9 +215,20 @@ impl Stream for SseByteStream {
         loop {
             match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(Ok(StreamItem::Event(event)))) => {
+                    if event.get("type").and_then(Value::as_str) == Some("message_stop") {
+                        this.saw_stop = true;
+                    }
                     return Poll::Ready(Some(Ok(RawBytes::from(event_to_sse(&event)))));
                 }
-                Poll::Ready(Some(Ok(StreamItem::Finished(_)))) => continue,
+                Poll::Ready(Some(Ok(StreamItem::Finished(_)))) => {
+                    if !this.saw_stop {
+                        this.saw_stop = true;
+                        return Poll::Ready(Some(Ok(RawBytes::from(event_to_sse(&json!({
+                            "type": "message_stop"
+                        }))))));
+                    }
+                    continue;
+                }
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
@@ -226,7 +238,10 @@ impl Stream for SseByteStream {
 }
 
 fn sse_byte_stream(rx: StreamRx) -> SseByteStream {
-    SseByteStream { rx }
+    SseByteStream {
+        rx,
+        saw_stop: false,
+    }
 }
 
 async fn buffer_json(rx: StreamRx) -> Result<Response, WorkerError> {
@@ -654,6 +669,38 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
     }
+
+    #[tokio::test]
+    async fn sse_byte_stream_injects_message_stop_when_job_done_skips_it() {
+        let (tx, rx) = crate::provider::job_event_channel();
+        let mut stream = sse_byte_stream(rx);
+        tx.send(Ok(StreamItem::Event(json!({ "type": "message_start" }))))
+            .await
+            .unwrap();
+        tx.send(Ok(StreamItem::Finished(crate::model::MessageResponse {
+            id: "msg_test".into(),
+            r#type: "message",
+            role: "assistant",
+            model: "claude-haiku-4-5-20251001".into(),
+            content: vec![],
+            stop_reason: crate::model::StopReason::EndTurn,
+            usage: crate::model::Usage::default(),
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+
+        use futures_util::StreamExt;
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        let end = stream.next().await;
+        let first = String::from_utf8_lossy(&first);
+        let second = String::from_utf8_lossy(&second);
+        assert!(first.contains("message_start"), "{first}");
+        assert!(second.contains("message_stop"), "{second}");
+        assert!(end.is_none());
+    }
+
 
     #[test]
     fn frozen_container_paths_are_loopback_cli_and_python_bridge() {
