@@ -1865,9 +1865,7 @@ function attachBillingMeta(billing, accounts = []) {
   if (!billing) return null
   const labeled = (billing.accounts || []).map((row) => {
     // Slot ids get reused, so a vm_id match alone would stamp the new account's email on old rows.
-    const acc = (accounts || []).find((a) =>
-      row.account_id ? a.account_id === row.account_id : a.vm_id === row.vm_id,
-    )
+    const acc = (accounts || []).find((a) => (row.account_id ? a.account_id === row.account_id : a.vm_id === row.vm_id))
     return {
       ...row,
       email: acc?.email || row.email || null,
