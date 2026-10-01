@@ -1,3 +1,4 @@
+import type { BillingAccountRow } from '@/types/panel-overview'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { isCodexVm } from '@/lib/vm-kind'
@@ -5,6 +6,37 @@ import { isCodexVm } from '@/lib/vm-kind'
 function num(v: unknown): number {
   const n = Number(v)
   return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * Slot ids get reused, so one vm_id can carry billing rows from an earlier account.
+ * Keep one row per slot: the bound account (vm.account_uuid) if present, else the first.
+ */
+export function dedupeBySlot(
+  rows: BillingAccountRow[],
+  byId: Map<string, Vm>
+): BillingAccountRow[] {
+  const picked = new Map<string, BillingAccountRow>()
+  const out: BillingAccountRow[] = []
+  for (const row of rows) {
+    if (!row.vm_id) {
+      out.push(row)
+      continue
+    }
+    const vmId = String(row.vm_id)
+    const prev = picked.get(vmId)
+    if (!prev) {
+      picked.set(vmId, row)
+      out.push(row)
+      continue
+    }
+    const bound = byId.get(vmId)?.account_uuid
+    if (bound && row.account_id === bound && prev.account_id !== bound) {
+      picked.set(vmId, row)
+      out[out.indexOf(prev)] = row
+    }
+  }
+  return out
 }
 
 /**

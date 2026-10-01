@@ -4,6 +4,7 @@ import type { BillingAccountRow, BillingSnapshot } from '@/types/panel-overview'
 import type { Vm } from '@/types/panel-vm'
 import { fmtUsd } from '@/lib/format'
 import { indexVms, isCodexVm } from '@/lib/vm-kind'
+import { dedupeBySlot } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
 import { SlotIdentity } from '@/components/platform-chip'
 import { billingQueryOptions } from '@/features/billing/queries'
@@ -41,9 +42,10 @@ export function BillingStrip({
       else claudeCost += cost
     }
   }
-  const rows: BillingAccountRow[] = (billing?.accounts || [])
-    .filter((a) => Number(a.total_cost) > 0)
-    .slice(0, 8)
+  const rows: BillingAccountRow[] = dedupeBySlot(
+    (billing?.accounts || []).filter((a) => Number(a.total_cost) > 0),
+    byId
+  ).slice(0, 8)
 
   return (
     <PanelCard
