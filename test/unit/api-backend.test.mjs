@@ -7,10 +7,7 @@ import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
-import {
-  CRS_OFFICIAL_AGENT_PROMPT,
-  CRS_OFFICIAL_CLI_SYSTEM,
-} from '../../src/lib/identity/crs-persona.mjs'
+import { CRS_OFFICIAL_AGENT_PROMPT, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 import { CRS_REPORTING_OUTCOMES } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
