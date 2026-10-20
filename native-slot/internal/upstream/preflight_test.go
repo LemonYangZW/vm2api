@@ -30,7 +30,11 @@ func TestPreflight(t *testing.T) {
 	}{
 		{"plain", map[string]any{"messages": []any{user("hi")}}, ""},
 		{"no messages", map[string]any{"messages": []any{}}, "at least one message"},
-		{"bad role", map[string]any{"messages": []any{map[string]any{"role": "system", "content": "x"}}}, "role"},
+		{"mid-conversation system", map[string]any{"messages": []any{user("hi"),
+			map[string]any{"role": "system", "content": "note"}, asst("ok")}}, ""},
+		{"system between tool_use and result", map[string]any{"messages": []any{user("hi"), asst([]any{use("a")}),
+			map[string]any{"role": "system", "content": "note"}, user([]any{result("a")})}}, ""},
+		{"bad role", map[string]any{"messages": []any{map[string]any{"role": "tool", "content": "x"}}}, "role"},
 		{"bad content", map[string]any{"messages": []any{user(5)}}, "valid list"},
 		{"tool round trip", map[string]any{"messages": []any{user("hi"), asst([]any{use("a"), use("b")}),
 			user([]any{result("b"), result("a"), text("go on")})}}, ""},

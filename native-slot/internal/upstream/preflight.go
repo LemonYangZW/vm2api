@@ -86,8 +86,9 @@ func checkMessages(req map[string]any) string {
 	var turns []turn
 	for i, raw := range msgs {
 		m, _ := raw.(map[string]any)
+		// role=system 是 mid-conversation-system beta 的合法用法（控制面会插入）。
 		role := asText(m["role"])
-		if role != "user" && role != "assistant" {
+		if role != "user" && role != "assistant" && role != "system" {
 			return fmt.Sprintf("messages.%d.role: Input should be 'user' or 'assistant'", i)
 		}
 		content := m["content"]
@@ -105,6 +106,10 @@ func checkMessages(req map[string]any) string {
 	seen := map[string]bool{}
 	var pending []string // 上一个 assistant turn 中的 tool_use id
 	for _, t := range turns {
+		// system 消息不参与工具配对，视作透明。
+		if t.role == "system" {
+			continue
+		}
 		if t.role == "assistant" {
 			for _, b := range t.blocks {
 				bm, _ := b.(map[string]any)
