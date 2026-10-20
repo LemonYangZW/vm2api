@@ -7,7 +7,11 @@ import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
-import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
+import {
+  CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_CLI_SYSTEM,
+} from '../../src/lib/identity/crs-persona.mjs'
+import { CRS_REPORTING_OUTCOMES } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
 import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
@@ -133,8 +137,11 @@ test('API backend applies the global official_full persona setting', async () =>
     assert.equal(response.status, 200)
     assert.ok(received)
     const outbound = JSON.parse(received.body)
-    assert.equal(outbound.system.length, 4)
-    assert.equal(outbound.system[2].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
+    // 2.1.296 五段：billing / identity_cli / reporting / agent / env
+    assert.equal(outbound.system.length, 5)
+    assert.equal(outbound.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
+    assert.equal(outbound.system[2].text, CRS_REPORTING_OUTCOMES)
+    assert.equal(outbound.system[3].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
   } finally {
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
