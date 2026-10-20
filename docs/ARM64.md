@@ -12,9 +12,37 @@ checkout 本机构建。
 | 控制面镜像（多架构） | `vX.Y.Z` / `latest`，按拉取平台选择 | 同左 |
 | Release 附件 | 无后缀：`kin-kernel`、`cli-node`、`kin-worker` 等 | `kin-worker-linux-arm64`、`kin-egress-linux-arm64` |
 
-无后缀附件保持 linux amd64，已部署的面板按原名下载 kernel / CLI。slot 内
-kernel、OAuth、CLI 和控制面造机服务 `kin-computer` 只有 amd64，ARM64 主机
-经 QEMU 运行它们；只有控制面自身的 Go helper 有原生 ARM64 版本。
+无后缀附件保持 linux amd64，已部署的面板按原名下载 kernel / CLI。ARM64
+控制面镜像另外从 `native-slot/` 源码编译原生 `kin-kernel` 与 `cli-node`，见
+下文「原生槽位 kernel / CLI」。cc-node、crag kernel、Codex kernel、OAuth 和
+控制面造机服务 `kin-computer` 仍只有 amd64，ARM64 主机经 QEMU 运行它们。
+
+## 原生槽位 kernel / CLI
+
+ARM64 镜像把静态链接的 aarch64 `kin-kernel.bin` 与 `cli-node` 放在
+`/opt/vm2api/image-wrap-cli/linux-arm64/`，entrypoint 每次启动刷新到
+`share/wrap-cli/linux-arm64/`。控制面在宿主为 ARM64 时，物化本机 Docker 槽
+的 `.kin` 目录改用这一对文件，包装脚本 `kin-kernel` 不再经过 x86 glibc
+loader；数据面热路径（kernel 调度与 CLI 上游请求）因此不再经 QEMU。
+
+| 槽位 | kernel / cli-node |
+| --- | --- |
+| 本机 Docker 槽（wrap、cc 数据面） | 原生 ARM64；cc 数据面的 cc-node 仍为 amd64 |
+| crag 数据面 | 不变：crag kernel + cc-node，均为 amd64 |
+| KVM 槽 | amd64（客体是 x86 虚拟机） |
+| 集群节点槽 | amd64（烤进节点镜像，见 `cluster/slot-image.mjs`） |
+
+槽位容器本身仍是 `linux/amd64` 客体镜像，`DOCKER_DEFAULT_PLATFORM` 不变；
+原生二进制是静态 ELF，只依赖客体内的 CA 证书。
+
+- 回退：控制容器设置 `KIN_NATIVE_SLOTS=0` 后重新同步槽位（面板“同步 wrap”
+  或重启槽），槽回到 amd64 + QEMU。
+- 更新：面板上传 kernel / cli-node 时，aarch64 ELF 写入 `linux-arm64/`，
+  x86-64 ELF 照旧写入 amd64 模板；GitHub Release 一键更新只更新 amd64 模板。
+  镜像重启会用镜像内版本覆盖 `linux-arm64/`，与 amd64 文件的行为一致。
+- 采样：原生槽的 `.kin` 不能作为 wrap 样本（拒绝码 `wrap_sample_native`），
+  避免 ARM64 文件进入 amd64 模板。
+- 面板 `describeWrapSample` 的 `native_arm64` 字段显示原生对是否就绪、是否启用。
 
 版本参数可带架构后缀：`v1.2.3`、`v1.2.3-arm64`、`v1.2.3-aarch64` 都解析为
 版本 `v1.2.3`；后缀只用于核对，与宿主架构不一致时一键脚本和面板都会拒绝。
@@ -27,8 +55,9 @@ kernel、OAuth、CLI 和控制面造机服务 `kin-computer` 只有 amd64，ARM6
 ## 支持范围与已验证情况
 
 控制镜像中的 Node.js 22、Python、iptables、Docker 27 CLI，以及静态 Go
-worker 和 egress 二进制均为 ARM64。已有 Rust kernels、OAuth 和 CLI 预编译
-资产仍为 amd64，由 QEMU 执行；slot 默认平台也是 `linux/amd64`。
+worker、egress 和原生槽位 kernel / cli-node 二进制均为 ARM64。其余 Rust
+kernels、OAuth 和 cc-node 预编译资产仍为 amd64，由 QEMU 执行；slot 默认平台
+也是 `linux/amd64`。
 构建从固定的 Ubuntu 24.04 amd64 stage 提取 glibc 2.39 等 x86 库，Go builder
 和最终控制平面 stage 使用 ARM64。
 
@@ -36,6 +65,7 @@ worker 和 egress 二进制均为 ARM64。已有 Rust kernels、OAuth 和 CLI �
 | --- | --- |
 | Oracle Ampere、Ubuntu 24.04 主机上的 ARM64 控制平面 | 已在现有部署验证 |
 | 该部署中的 Ubuntu amd64 Claude slot | 已在现有部署验证 |
+| 原生 ARM64 槽位 kernel / cli-node | 单元与端到端测试通过（mock 上游），未做真机请求验证 |
 | 原生 ARM64 远程节点 | 未验证 |
 | Codex 模型真实请求、其他 guest 镜像 | 未验证 |
 | 主机重启后的恢复、性能与容量 | 未验证 |

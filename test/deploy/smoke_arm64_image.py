@@ -53,6 +53,13 @@ for name in ('cli-node', 'cc-node'):
     version = subprocess.check_output([str(binary), '--version'], text=True, timeout=60).strip()
     assert version, name
     print(name + ': ' + version)
+native = root / 'image-wrap-cli' / 'linux-arm64'
+for name in ('kin-kernel.bin', 'cli-node'):
+    binary = native / name
+    elf(binary, 183, static=True)
+    version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10).strip()
+    assert version, name
+    print('native ' + name + ': ' + version)
 
 env = {**os.environ, 'HOST': '127.0.0.1', 'PORT': '18787', 'KIN_AUTO_SYNC_WRAP': '0',
        'VM2API_ADMIN_PASSWORD': secrets.token_hex(24), 'VM2API_API_KEY': secrets.token_hex(32),
@@ -75,6 +82,8 @@ try:
     for name in ('kin-worker', 'kin-egress', 'kin-api-kernel'):
         elf(root / 'bin' / name, 183, static=True)
         assert (root / 'bin' / name).read_bytes() == (root / 'image-bin' / name).read_bytes()
+    for name in ('kin-kernel.bin', 'cli-node'):
+        assert (root / 'share' / 'wrap-cli' / 'linux-arm64' / name).read_bytes() == (native / name).read_bytes()
     subprocess.run(['node', '--input-type=module', '-e', r"""
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -103,7 +112,7 @@ finally:
     except subprocess.TimeoutExpired:
         server.kill()
         server.wait(timeout=5)
-print('PASS: native control plane, amd64 cluster helpers, QEMU CLI/computer, stable Docker/KVM identities, entrypoint refresh, health and console')
+print('PASS: native control plane, native slot kernel/CLI, amd64 cluster helpers, QEMU CLI/computer, stable Docker/KVM identities, entrypoint refresh, health and console')
 '''
 
 

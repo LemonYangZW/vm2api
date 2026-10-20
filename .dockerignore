@@ -25,3 +25,6 @@ worker/bin
 *.md
 !README.md
 !CHANGELOG.md
+native-slot/dist
+native-slot/_prototype
+native-slot/testdata

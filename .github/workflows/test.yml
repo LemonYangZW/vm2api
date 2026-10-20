@@ -1,4 +1,4 @@
-# PR/main gate: Node + Go + pinned amd64 payload ELFs + web + native ARM64 deployment.
+# PR/main gate: Node + Go (incl. native-slot) + pinned amd64 payload ELFs + web + native ARM64 deployment.
 name: ci
 
 on:
@@ -85,7 +85,7 @@ jobs:
             api-kernel/go.sum
       - name: gofmt
         run: |
-          files=$(gofmt -l worker api-kernel)
+          files=$(gofmt -l worker api-kernel native-slot/cmd native-slot/internal)
           if [ -n "$files" ]; then
             printf 'gofmt needed:\n%s\n' "$files" >&2
             exit 1
@@ -94,14 +94,17 @@ jobs:
         run: |
           (cd worker && go test -race ./...)
           (cd api-kernel && go test -race ./...)
+          (cd native-slot && go test ./...)
       - name: go vet
         run: |
           (cd worker && go vet ./...)
           (cd api-kernel && go vet ./...)
+          (cd native-slot && go vet ./...)
       - name: build Go commands
         run: |
           (cd worker && CGO_ENABLED=0 go build -trimpath ./cmd/...)
           (cd api-kernel && CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/kin-api-kernel" ./cmd/kin-api-kernel)
+          (cd native-slot && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o "$RUNNER_TEMP/native-arm64/" ./cmd/...)
 
   kernel:
     runs-on: ubuntu-latest

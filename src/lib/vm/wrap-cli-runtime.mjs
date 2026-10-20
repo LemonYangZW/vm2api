@@ -6,12 +6,18 @@
  *   cc:   cc-node + wrap kin-kernel
  *   crag: cc-node + share/crag/kin-kernel
  * Engine rust only chooses which process serves /v1. Credentials stay out.
+ *
+ * On an ARM64 host, Docker slots take the native kin-kernel and cli-node from
+ * share/wrap-cli/linux-arm64 instead of running the amd64 pair under QEMU.
+ * KVM guests are x86 machines and keep the amd64 payload. KIN_NATIVE_SLOTS=0
+ * turns the native pair off.
  */
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
@@ -21,6 +27,8 @@ export const WRAP_KERNEL_BIN = 'kin-kernel.bin'
 export const WRAP_KERNEL_WRAPPER = 'kin-kernel'
 export const WRAP_GLIBC_DIR = 'glibc239'
 export const WRAP_GLIBC_LIBS = Object.freeze(['ld-linux-x86-64.so.2', 'libc.so.6', 'libm.so.6', 'libgcc_s.so.1'])
+export const WRAP_NATIVE_ARM64_DIR = 'linux-arm64'
+const ELF_MACHINES = Object.freeze({ amd64: 62, arm64: 183 })
 
 const SECRET_NAMES = new Set(['credentials.json', '.credentials.json', 'oauth.json', '.claude.json', 'internal.token'])
 
@@ -28,8 +36,17 @@ const SECRET_NAMES = new Set(['credentials.json', '.credentials.json', 'oauth.js
  * The kernel job watchdog reads the unprefixed env JOB_IDLE_SECS (default 180s)
  * only at start; KIN_JOB_IDLE_SECS is ignored by the kernel. Take it from
  * kernel.json idle_timeout_seconds so it follows the panel stream idle setting.
+ * The native ARM64 kernel is static: its wrapper never goes through the x86
+ * glibc loader, even when an older glibc239 shim is still in the slot home.
  */
-export function wrapKernelWrapperScript() {
+export function wrapKernelWrapperScript({ native = false } = {}) {
+  const loader = native
+    ? ''
+    : `LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
+if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
+  exec "$LOADER" --library-path "$DIR/${WRAP_GLIBC_DIR}" "$BIN" "$@"
+fi
+`
   return `#!/bin/sh
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -z "$JOB_IDLE_SECS" ]; then
@@ -45,11 +62,7 @@ if [ -z "$JOB_IDLE_SECS" ]; then
   fi
 fi
 BIN="$DIR/${WRAP_KERNEL_BIN}"
-LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
-if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
-  exec "$LOADER" --library-path "$DIR/${WRAP_GLIBC_DIR}" "$BIN" "$@"
-fi
-if [ -x "$BIN" ]; then
+${loader}if [ -x "$BIN" ]; then
   exec "$BIN" "$@"
 fi
 exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
@@ -180,6 +193,10 @@ export function describeCcNodePayload(projectRoot) {
 }
 
 export function inspectLinuxAmd64Elf(buf) {
+  return inspectLinuxElf(buf, 'amd64')
+}
+
+export function inspectLinuxElf(buf, arch = 'amd64') {
   const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
   if (bytes.length < 64) {
     return { ok: false, code: 'kernel_too_small', error: 'kernel binary is too small to be an ELF' }
@@ -193,10 +210,67 @@ export function inspectLinuxAmd64Elf(buf) {
   if (bytes[5] !== 1) {
     return { ok: false, code: 'kernel_not_le', error: 'kernel binary is not little-endian ELF' }
   }
-  if (bytes.readUInt16LE(18) !== 62) {
-    return { ok: false, code: 'kernel_not_amd64', error: 'kernel binary is not linux amd64' }
+  if (bytes.readUInt16LE(18) !== ELF_MACHINES[arch]) {
+    return { ok: false, code: `kernel_not_${arch}`, error: `kernel binary is not linux ${arch}` }
   }
   return { ok: true, size: bytes.length }
+}
+
+function readElfHead(file) {
+  let fd
+  try {
+    fd = fs.openSync(file, 'r')
+    const head = Buffer.alloc(64)
+    const n = fs.readSync(fd, head, 0, 64, 0)
+    return head.subarray(0, n)
+  } catch {
+    return Buffer.alloc(0)
+  } finally {
+    if (fd != null) fs.closeSync(fd)
+  }
+}
+
+function slotHostArch() {
+  const raw = String(process.env.KIN_SLOT_HOST_ARCH || process.arch)
+    .trim()
+    .toLowerCase()
+  if (raw === 'arm64' || raw === 'aarch64') return 'arm64'
+  if (raw === 'x64' || raw === 'amd64' || raw === 'x86_64') return 'amd64'
+  return raw
+}
+
+export function nativeArm64Dir(projectRoot) {
+  const dir = wrapCliTemplateDir(projectRoot)
+  return dir ? path.join(dir, WRAP_NATIVE_ARM64_DIR) : ''
+}
+
+/** Native ARM64 kin-kernel + cli-node pair; both must be aarch64 ELFs. */
+export function describeNativeArm64Payload(projectRoot) {
+  const dir = nativeArm64Dir(projectRoot)
+  const kernel = dir ? path.join(dir, WRAP_KERNEL_BIN) : ''
+  const cliNode = dir ? path.join(dir, WRAP_CLI_BIN) : ''
+  const out = { dir, kernel, cli_node: cliNode, host_arch: slotHostArch(), enabled: false }
+  for (const [file, name] of [
+    [kernel, 'kin-kernel'],
+    [cliNode, WRAP_CLI_BIN],
+  ]) {
+    if (!isFile(file)) return { ...out, ok: false, code: 'native_arm64_missing', error: `${name} missing: ${file}` }
+    const check = inspectLinuxElf(readElfHead(file), 'arm64')
+    if (!check.ok) return { ...out, ok: false, code: 'native_arm64_invalid', error: `${name} is not linux arm64` }
+  }
+  const enabled = out.host_arch === 'arm64' && String(process.env.KIN_NATIVE_SLOTS || '').trim() !== '0'
+  return { ...out, ok: true, enabled }
+}
+
+/**
+ * The native pair a slot should run, or null for the amd64 payload. Only local
+ * Docker slots qualify: a KVM guest is an x86 machine, and a node slot bakes the
+ * amd64 kernel into its image (vm.node_id; see cluster/slot-image.mjs).
+ */
+export function nativeSlotPayload(projectRoot, vm) {
+  if (isKvmRuntime(vm) || vm?.node_id) return null
+  const native = describeNativeArm64Payload(projectRoot)
+  return native.ok && native.enabled ? native : null
 }
 
 export function inspectWrapCliDir(dir) {
@@ -422,9 +496,9 @@ export function materializeSlotDataplane(projectRoot, vm, dataplane, opts = {}) 
   return materializeWrapCli(projectRoot, vm, opts)
 }
 
-function writeWrapper(destDir) {
+function writeWrapper(destDir, { native = false } = {}) {
   const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
-  const body = wrapKernelWrapperScript()
+  const body = wrapKernelWrapperScript({ native })
   try {
     if (fs.readFileSync(wrapper, 'utf8') === body) return
   } catch {}
@@ -443,13 +517,18 @@ function writeWrapper(destDir) {
   fs.renameSync(tmp, wrapper)
 }
 
-function installKernelPayload(src, dest, projectRoot = '') {
-  const binSrc = kernelPayloadPath(src, projectRoot)
+function installKernelPayload(src, dest, projectRoot = '', native = null) {
+  const binSrc = native ? native.kernel : kernelPayloadPath(src, projectRoot)
   const kernelChanged = binSrc && isFile(binSrc) ? replaceFile(binSrc, path.join(dest, WRAP_KERNEL_BIN)) : false
+  // cc-node stays amd64 under QEMU, so the shim is still copied for native slots.
   const glibcSrc = path.join(src, WRAP_GLIBC_DIR)
   if (isDir(glibcSrc)) copyDir(glibcSrc, path.join(dest, WRAP_GLIBC_DIR))
-  writeWrapper(dest)
+  writeWrapper(dest, { native: Boolean(native) })
   return kernelChanged
+}
+
+function slotKernelSource(projectRoot, vm, sampleDir) {
+  return nativeSlotPayload(projectRoot, vm)?.kernel || kernelPayloadPath(sampleDir, projectRoot)
 }
 
 export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null } = {}) {
@@ -459,17 +538,20 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null } =
   const src = wrapCliTemplateDir(projectRoot)
   const status = inspectWrapCliDir(src)
   if (!status.ok) return status
+  const native = nativeSlotPayload(projectRoot, vm)
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   for (const name of WRAP_CLI_FILES) {
-    copyFile(path.join(src, name), path.join(dest, name))
+    const from = native && name === WRAP_CLI_BIN ? native.cli_node : path.join(src, name)
+    copyFile(from, path.join(dest, name))
   }
-  const kernelChanged = installKernelPayload(src, dest, projectRoot)
+  const kernelChanged = installKernelPayload(src, dest, projectRoot, native)
   chownTree(dest, uid, gid)
   return {
     ok: true,
     dest,
     src,
+    arch: native ? 'arm64' : 'amd64',
     changed: kernelChanged,
     kernel_changed: kernelChanged,
     glibc_shim: isDir(path.join(dest, WRAP_GLIBC_DIR)),
@@ -506,6 +588,16 @@ export function captureWrapSample(projectRoot, vm) {
       ok: false,
       code: status.code || 'wrap_cli_incomplete',
       error: `slot ${vm.id} is not a usable wrap sample: ${status.error}`,
+    }
+  }
+  // share/wrap-cli is the amd64 template; a native slot home would poison it.
+  for (const name of [WRAP_KERNEL_BIN, WRAP_CLI_BIN]) {
+    if (inspectLinuxElf(readElfHead(path.join(src, name)), 'arm64').ok) {
+      return {
+        ok: false,
+        code: 'wrap_sample_native',
+        error: `slot ${vm.id} runs the native ARM64 ${name}; sample an amd64 slot instead`,
+      }
     }
   }
   const dest = wrapCliTemplateDir(projectRoot)
@@ -556,6 +648,7 @@ export function describeWrapSample(projectRoot) {
     kernel: describeKernelPayload(projectRoot),
     cli_node: describeCliNodePayload(projectRoot),
     cc_node: describeCcNodePayload(projectRoot),
+    native_arm64: describeNativeArm64Payload(projectRoot),
   }
 }
 
@@ -642,8 +735,23 @@ function kernelWriteTargets(projectRoot) {
   return targets
 }
 
+function writeNativeArm64Binary(projectRoot, bytes, name) {
+  const dir = nativeArm64Dir(projectRoot)
+  if (!dir) return { ok: false, code: 'wrap_cli_template_missing', error: 'wrap CLI template dir unset' }
+  const dest = path.join(dir, name)
+  writeKernelBytes(dest, bytes)
+  return {
+    ok: true,
+    arch: 'arm64',
+    written: [dest],
+    size: bytes.length,
+    native_arm64: describeNativeArm64Payload(projectRoot),
+  }
+}
+
 export function replaceKernelBinary(projectRoot, buf, extra = {}) {
   const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
+  if (inspectLinuxElf(bytes, 'arm64').ok) return writeNativeArm64Binary(projectRoot, bytes, WRAP_KERNEL_BIN)
   const check = inspectLinuxAmd64Elf(bytes)
   if (!check.ok) return check
   const metaExtra = extra && typeof extra === 'object' ? extra : {}
@@ -690,6 +798,10 @@ export function replaceKernelBinary(projectRoot, buf, extra = {}) {
 }
 function replaceNamedCliBinary(projectRoot, buf, name) {
   const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
+  // Only cli-node has a native build; cc-node stays amd64.
+  if (name === WRAP_CLI_BIN && inspectLinuxElf(bytes, 'arm64').ok) {
+    return writeNativeArm64Binary(projectRoot, bytes, WRAP_CLI_BIN)
+  }
   const check = inspectLinuxAmd64Elf(bytes)
   if (!check.ok) {
     return {
@@ -729,7 +841,7 @@ export function inspectKernelChanges(projectRoot, vms, { routing } = {}) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
     const dest = path.join(wrapCliHomeDir(projectRoot, vm.id), WRAP_KERNEL_BIN)
-    const src = dataplane === 'crag' ? crag.path : kernelPayloadPath(sample.dir, projectRoot)
+    const src = dataplane === 'crag' ? crag.path : slotKernelSource(projectRoot, vm, sample.dir)
     if (dataplane === 'crag' && !crag.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
       continue

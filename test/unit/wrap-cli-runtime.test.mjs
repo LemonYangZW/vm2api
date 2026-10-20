@@ -8,16 +8,21 @@ import {
   WRAP_CLI_FILES,
   CC_NODE_BIN,
   captureWrapSample,
+  describeWrapSample,
   inspectLinuxAmd64Elf,
+  inspectLinuxElf,
   inspectWrapCliDir,
   makeWrapSample,
   materializeSlotDataplane,
   materializeWrapCli,
+  replaceCcNodeBinary,
+  replaceCliNodeBinary,
   replaceKernelBinary,
   inspectKernelChanges,
   syncWrapSample,
   wrapCliHomeDir,
   wrapCliTemplateDir,
+  wrapKernelWrapperScript,
 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
 
@@ -42,7 +47,7 @@ function seedTemplate(root) {
   return src
 }
 
-function fakeElf64Amd64(payload = 'host-kernel') {
+function fakeElf64(machine, payload) {
   const extra = Buffer.from(String(payload))
   const buf = Buffer.alloc(64 + extra.length)
   buf[0] = 0x7f
@@ -52,9 +57,44 @@ function fakeElf64Amd64(payload = 'host-kernel') {
   buf[4] = 2
   buf[5] = 1
   buf.writeUInt16LE(3, 16)
-  buf.writeUInt16LE(62, 18)
+  buf.writeUInt16LE(machine, 18)
   extra.copy(buf, 64)
   return buf
+}
+
+function fakeElf64Amd64(payload = 'host-kernel') {
+  return fakeElf64(62, payload)
+}
+
+function fakeElf64Arm64(payload = 'native') {
+  return fakeElf64(183, payload)
+}
+
+function seedNative(root) {
+  const dir = path.join(root, 'share', 'wrap-cli', 'linux-arm64')
+  fs.mkdirSync(dir, { recursive: true })
+  const kernel = fakeElf64Arm64('native-kernel')
+  const cli = fakeElf64Arm64('native-cli')
+  fs.writeFileSync(path.join(dir, 'kin-kernel.bin'), kernel)
+  fs.writeFileSync(path.join(dir, WRAP_CLI_BIN), cli)
+  return { kernel, cli }
+}
+
+function withEnv(vars, fn) {
+  const prev = {}
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k]
+    if (v == null) delete process.env[k]
+    else process.env[k] = v
+  }
+  try {
+    return fn()
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v == null) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
 }
 
 test('materializeWrapCli copies both CLIs into slot home', () => {
@@ -412,4 +452,145 @@ test('replaceKernelBinary rejects non-ELF payloads', () => {
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
   }
+})
+
+test('ARM64 host materializes the native kernel and cli-node into Docker slots', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-native-'))
+  try {
+    seedTemplate(project)
+    const native = seedNative(project)
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: null }, () => {
+      assert.equal(describeWrapSample(project).native_arm64.enabled, true)
+      const result = materializeWrapCli(project, { id: 'vm-20' })
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.arch, 'arm64')
+      const dest = wrapCliHomeDir(project, 'vm-20')
+      assert.ok(fs.readFileSync(path.join(dest, 'kin-kernel.bin')).equals(native.kernel))
+      assert.ok(fs.readFileSync(path.join(dest, WRAP_CLI_BIN)).equals(native.cli))
+      // cc-node has no native build and stays the amd64 template copy.
+      assert.equal(fs.readFileSync(path.join(dest, CC_NODE_BIN), 'utf8'), 'cc-node')
+      const wrapper = fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8')
+      assert.doesNotMatch(wrapper, /ld-linux/)
+      assert.match(wrapper, /export JOB_IDLE_SECS=/)
+      assert.equal(inspectKernelChanges(project, [{ id: 'vm-20' }]).changed_count, 0)
+    })
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('native pair is skipped for KVM, node slots, amd64 hosts and KIN_NATIVE_SLOTS=0', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-native-skip-'))
+  try {
+    seedTemplate(project)
+    seedNative(project)
+    const cases = [
+      [{ KIN_SLOT_HOST_ARCH: 'arm64' }, { id: 'vm-k', runtime: { type: 'kvm' } }],
+      [{ KIN_SLOT_HOST_ARCH: 'arm64' }, { id: 'vm-n', node_id: 'node-1' }],
+      [{ KIN_SLOT_HOST_ARCH: 'x64' }, { id: 'vm-x' }],
+      [{ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: '0' }, { id: 'vm-o' }],
+    ]
+    for (const [env, vm] of cases) {
+      withEnv({ KIN_NATIVE_SLOTS: null, ...env }, () => {
+        const result = materializeWrapCli(project, vm)
+        assert.equal(result.ok, true, result.error)
+        assert.equal(result.arch, 'amd64', vm.id)
+        const dest = wrapCliHomeDir(project, vm.id)
+        assert.equal(fs.readFileSync(path.join(dest, WRAP_CLI_BIN), 'utf8'), WRAP_CLI_BIN)
+        assert.match(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /ld-linux-x86-64/)
+      })
+    }
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('switching a slot between amd64 and native counts as a kernel change', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-native-switch-'))
+  try {
+    seedTemplate(project)
+    seedNative(project)
+    const vm = { id: 'vm-21' }
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: '0' }, () => materializeWrapCli(project, vm))
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: null }, () => {
+      assert.equal(inspectKernelChanges(project, [vm]).changed_count, 1)
+      assert.equal(syncWrapSample(project, [vm]).items[0].kernel_changed, true)
+      assert.equal(inspectKernelChanges(project, [vm]).changed_count, 0)
+    })
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('incomplete or non-arm64 native payload falls back to amd64', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-native-bad-'))
+  try {
+    seedTemplate(project)
+    seedNative(project)
+    const dir = path.join(project, 'share', 'wrap-cli', 'linux-arm64')
+    fs.writeFileSync(path.join(dir, WRAP_CLI_BIN), fakeElf64Amd64('wrong-arch'))
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: null }, () => {
+      const described = describeWrapSample(project).native_arm64
+      assert.equal(described.ok, false)
+      assert.equal(described.code, 'native_arm64_invalid')
+      assert.equal(materializeWrapCli(project, { id: 'vm-22' }).arch, 'amd64')
+      fs.rmSync(path.join(dir, 'kin-kernel.bin'))
+      assert.equal(describeWrapSample(project).native_arm64.code, 'native_arm64_missing')
+    })
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('captureWrapSample refuses a native slot home', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-native-capture-'))
+  try {
+    seedTemplate(project)
+    seedNative(project)
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: null }, () => {
+      assert.equal(materializeWrapCli(project, { id: 'vm-23' }).arch, 'arm64')
+      const captured = captureWrapSample(project, { id: 'vm-23' })
+      assert.equal(captured.ok, false)
+      assert.equal(captured.code, 'wrap_sample_native')
+      assert.equal(fs.readFileSync(path.join(wrapCliTemplateDir(project), WRAP_CLI_BIN), 'utf8'), WRAP_CLI_BIN)
+    })
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('uploading an arm64 kernel or cli-node writes the native pair only', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-native-upload-'))
+  try {
+    seedTemplate(project)
+    const kernel = fakeElf64Arm64('uploaded-native-kernel')
+    const cli = fakeElf64Arm64('uploaded-native-cli')
+    const k = replaceKernelBinary(project, kernel)
+    assert.equal(k.ok, true, k.error)
+    assert.equal(k.arch, 'arm64')
+    const c = replaceCliNodeBinary(project, cli)
+    assert.equal(c.ok, true, c.error)
+    assert.equal(c.native_arm64.ok, true)
+    const dir = path.join(project, 'share', 'wrap-cli', 'linux-arm64')
+    assert.ok(fs.readFileSync(path.join(dir, 'kin-kernel.bin')).equals(kernel))
+    assert.ok(fs.readFileSync(path.join(dir, WRAP_CLI_BIN)).equals(cli))
+    assert.equal(fs.existsSync(path.join(project, 'bin', 'kin-kernel')), false)
+    assert.equal(fs.readFileSync(path.join(wrapCliTemplateDir(project), WRAP_CLI_BIN), 'utf8'), WRAP_CLI_BIN)
+    assert.equal(replaceCcNodeBinary(project, fakeElf64Arm64('cc')).ok, false)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('inspectLinuxElf checks the requested architecture', () => {
+  assert.equal(inspectLinuxElf(fakeElf64Arm64(), 'arm64').ok, true)
+  assert.equal(inspectLinuxElf(fakeElf64Arm64(), 'amd64').code, 'kernel_not_amd64')
+  assert.equal(inspectLinuxElf(fakeElf64Amd64(), 'arm64').code, 'kernel_not_arm64')
+})
+
+test('the amd64 wrapper keeps the glibc loader and the native one drops it', () => {
+  assert.match(wrapKernelWrapperScript(), /exec "\$LOADER" --library-path/)
+  const native = wrapKernelWrapperScript({ native: true })
+  assert.doesNotMatch(native, /LOADER/)
+  assert.match(native, /exec "\$BIN" "\$@"/)
 })
