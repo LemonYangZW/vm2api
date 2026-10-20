@@ -15,6 +15,8 @@
  * the panel can re-reveal a key for copying after creation.
  */
 
+import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
+import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
@@ -33,6 +35,13 @@ function clampInt(n, min, max, fallback) {
 
 function nowIso() {
   return new Date().toISOString()
+}
+function storedKeyScope(scope) {
+  return {
+    group_type: scope.group_type,
+    allowed_vms: JSON.stringify(scope.allowed_vms),
+    vm_pool_id: scope.vm_pool_id || null,
+  }
 }
 
 export function generateApiKey(prefix = KEY_PREFIX) {
@@ -98,6 +107,7 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     tokens_in: rec.tokens_in || 0,
     tokens_out: rec.tokens_out || 0,
     category: rec.category === 'api' ? 'api' : 'oauth',
+    ...keyScopeFromRecord(rec),
     inflight: undefined, // filled by store.snapshot
   }
 }
@@ -151,9 +161,16 @@ export class ApiKeyStore {
   }
 
   list({ reveal = false } = {}) {
+    const names = new Map()
+    try {
+      for (const pool of new VmPoolsRepo(this.db).list()) names.set(pool.id, pool.name)
+    } catch {
+      // A database opened before migration 034 still lists keys.
+    }
     return this.repo.list().map((k) => {
       const v = publicKeyView(k, { reveal })
       v.inflight = this.inflight.get(k.id) || 0
+      if (v.vm_pool_id) v.vm_pool_name = names.get(v.vm_pool_id) || null
       return v
     })
   }
@@ -228,6 +245,13 @@ export class ApiKeyStore {
       tokens_in: 0,
       tokens_out: 0,
       category: String(input.category || 'oauth').toLowerCase() === 'api' ? 'api' : 'oauth',
+      ...storedKeyScope(
+        normalizeKeyScope({
+          group_type: input.group_type,
+          allowed_vms: input.allowed_vms,
+          ...(Object.prototype.hasOwnProperty.call(input, 'vm_pool_id') ? { vm_pool_id: input.vm_pool_id } : {}),
+        }),
+      ),
     }
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
@@ -279,6 +303,8 @@ export class ApiKeyStore {
     if (patch.category != null) {
       rec.category = String(patch.category).toLowerCase() === 'api' ? 'api' : 'oauth'
     }
+    const scope = normalizeKeyScope(patch, { partial: true, current: rec })
+    if (scope) Object.assign(rec, storedKeyScope(scope))
     rec.updated_at = nowIso()
     return this.repo.update(rec)
   }
@@ -410,7 +436,8 @@ export class ApiKeyStore {
         detail: { inflight, max: rec.max_concurrency },
       }
     }
-    // sub2api user-level cap: sum of inflight across all of the owner's keys
+    // sub2api user-level cap: sum of inflight across all of the owner's keys.
+    // The operator (admin) is never capped: its traffic is the platform's own.
     if (rec.user_id) {
       const owner = (() => {
         try {
@@ -419,7 +446,7 @@ export class ApiKeyStore {
           return null
         }
       })()
-      const cap = Number(owner?.concurrency) || 0
+      const cap = owner?.role === 'admin' ? 0 : Number(owner?.concurrency) || 0
       if (cap > 0) {
         let total = 0
         for (const k of this.repo.list()) {
@@ -458,24 +485,27 @@ export class ApiKeyStore {
     else this.inflight.set(id, n)
   }
 
-  recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1 } = {}) {
+  recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1, officialCost } = {}) {
     const id = typeof recOrId === 'string' ? recOrId : recOrId?.id
     if (!this.repo.getById(id)) return null
-    let cost = Number(usage.cost ?? usage.actual_cost) || 0
-    if (!cost && model) {
+    const normalized = normalizeUsage(usage)
+    let billed = officialCost
+    if (billed == null) billed = usage.total_cost
+    if (billed == null && model) {
       try {
-        const c = calculateCost(normalizeUsage(usage), model)
-        if (c?.known) cost = c.total_cost
+        const c = calculateCost(normalized, model)
+        if (c?.known) billed = c.total_cost
       } catch {}
     }
+    if (billed == null) billed = Number(usage.cost ?? usage.actual_cost) || 0
     // key quota/windows track actual (group-rated) spend, sub2api-style
     const rate = Number.isFinite(Number(rateMultiplier)) ? Number(rateMultiplier) : 1
-    cost *= rate
+    const cost = billed * rate
     const rec = this.repo.recordUsage(id, {
-      tokens_in: Number(usage.input_tokens) || Number(usage.tokens_in) || 0,
-      tokens_out: Number(usage.output_tokens) || Number(usage.tokens_out) || 0,
-      cache_read_tokens: Number(usage.cache_read_input_tokens ?? usage.cache_read_tokens) || 0,
-      cache_creation_tokens: Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0,
+      tokens_in: Number(normalized.input_tokens) || Number(normalized.tokens_in) || 0,
+      tokens_out: Number(normalized.output_tokens) || Number(normalized.tokens_out) || 0,
+      cache_read_tokens: Number(normalized.cache_read_input_tokens ?? normalized.cache_read_tokens) || 0,
+      cache_creation_tokens: Number(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens) || 0,
       cost,
     })
     // sub2api: the billing write flips the key when the USD quota runs out

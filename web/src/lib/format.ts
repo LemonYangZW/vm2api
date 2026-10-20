@@ -46,6 +46,12 @@ export function fmtUsd(n: unknown, digits?: number): string {
   return `$${v.toFixed(d)}`
 }
 
+function nestedCached(usage: Record<string, unknown>, key: string): unknown {
+  const details = usage[key]
+  if (!details || typeof details !== 'object') return undefined
+  return (details as Record<string, unknown>).cached_tokens
+}
+
 export function fmtTok(
   row: Record<string, unknown> | null | undefined
 ): string {
@@ -53,7 +59,12 @@ export function fmtTok(
   const usage = (row.usage as Record<string, unknown> | undefined) || {}
   const inn = row.input_tokens ?? usage.input_tokens
   const out = row.output_tokens ?? usage.output_tokens
-  const cr = row.cache_read_tokens ?? usage.cache_read_input_tokens
+  // OpenAI/Codex rows may only carry the cache read nested under *_tokens_details.
+  const cr =
+    row.cache_read_tokens ??
+    usage.cache_read_input_tokens ??
+    nestedCached(usage, 'input_tokens_details') ??
+    nestedCached(usage, 'prompt_tokens_details')
   const cc = row.cache_creation_tokens ?? usage.cache_creation_input_tokens
   if (inn == null && out == null && cr == null && cc == null) return '—'
   let s = `${inn || 0}/${out || 0}`
@@ -87,11 +98,34 @@ export function fmtCountdown(leftMs: number): string {
   return `${m}m`
 }
 
+/** ISO 时间 → `刚刚` / `5 分钟前` / `3 小时前` / `2 天前`；无法解析返回空串。 */
+export function fmtAgo(value: unknown, now: number = Date.now()): string {
+  const t = Date.parse(String(value ?? ''))
+  if (!Number.isFinite(t)) return ''
+  const min = Math.floor(Math.max(0, now - t) / 60000)
+  if (min < 1) return '刚刚'
+  if (min < 60) return `${min} 分钟前`
+  const h = Math.floor(min / 60)
+  if (h < 24) return `${h} 小时前`
+  return `${Math.floor(h / 24)} 天前`
+}
+
 export function fmtMs(ms: unknown): string {
   if (ms == null || !Number.isFinite(Number(ms))) return '—'
   const n = Number(ms)
   if (n >= 10000) return `${(n / 1000).toFixed(1)}s`
   return `${Math.round(n)}ms`
+}
+
+/** 设置项用的人读时长：`500 毫秒` / `45 秒` / `2 分钟` / `1 分 30 秒`。 */
+export function fmtDuration(ms: number): string {
+  const n = Math.max(0, Math.round(Number(ms) || 0))
+  if (n < 1000) return `${n} 毫秒`
+  const sec = n / 1000
+  if (sec < 60) return `${Number.isInteger(sec) ? sec : sec.toFixed(1)} 秒`
+  const min = Math.floor(sec / 60)
+  const rest = Math.round(sec - min * 60)
+  return rest ? `${min} 分 ${rest} 秒` : `${min} 分钟`
 }
 
 export function fmtRate(n: unknown, digits?: number): string {

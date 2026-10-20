@@ -36,6 +36,9 @@ function keysIntersect(left, right) {
       // The corrected 5-1 id must not widen a Fable 5 allowlist (or vice versa).
       const fable51 = /^claude-fable-5(?:-1|\.1)(?:-|$)/
       if (fable51.test(a) !== fable51.test(b)) continue
+      // claude-opus-5 is a prefix of claude-opus-5-5. They are different models.
+      const opus55 = /^claude-opus-5(?:-5|\.5)(?:-|$)/
+      if (opus55.test(a) !== opus55.test(b)) continue
       if (a.startsWith(`${b}-`) || b.startsWith(`${a}-`)) return true
     }
   }
@@ -95,11 +98,20 @@ function quotaView(vm, account) {
     status_7d_oi: unified.status_7d_oi || unified['7d_oi']?.status || vm?.status_7d_oi,
     '7d_oi': unified['7d_oi'],
     account_tier: unified.account_tier || vm?.claude?.account_tier || vm?.account_tier,
+    usage_has_fable: unified.usage_has_fable ?? vm?.usage_has_fable ?? null,
   }
 }
 
 export function resolveSlotTier(vm, account = null) {
   const quota = quotaView(vm, account)
+  // An explicit Pro classification must veto stale Max usage evidence. The
+  // latter can survive a credential change or a Fable entitlement rejection.
+  if (
+    String(vm?.claude?.account_tier || vm?.account_tier || '').toLowerCase() === 'pro' ||
+    String(account?.unified?.account_tier || '').toLowerCase() === 'pro'
+  ) {
+    return 'pro'
+  }
   return inferClaudeTier(
     {
       has_token: true,
@@ -108,6 +120,7 @@ export function resolveSlotTier(vm, account = null) {
       utilization_7d_oi: quota.utilization_7d_oi,
       reset_7d_oi: quota.reset_7d_oi,
       status_7d_oi: quota.status_7d_oi,
+      usage_has_fable: quota.usage_has_fable,
     },
     quota,
   ).key
@@ -121,6 +134,9 @@ export function slotAllowsModel({ vm, account = null, model } = {}) {
   } else if (isCodexCatalogModel(modelKey)) {
     return { ok: false, reason: 'claude_model_required' }
   }
+  const canonical = resolvePolicyModelId(modelKey) || modelKey
+  const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
+  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
   if (isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
     return { ok: false, reason: 'fable_requires_max' }
   }

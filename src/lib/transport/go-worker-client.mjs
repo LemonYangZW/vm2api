@@ -1,20 +1,59 @@
 import http from 'node:http'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
+import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
+import { applyThinkingDisplay, thinkingDisplayMode } from '../protocol/thinking.mjs'
+import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
 import {
+  classifyCredentialRefresh,
   hasAccessPresence,
   hasCredentialPresence,
   hasRefreshPresence,
+  needsRefresh,
+  readWorkerCredentialFile,
+  REFRESH_SKEW_MS,
   writeWorkerCredentialFile,
 } from '../oauth/oauth-credentials.mjs'
-import { refreshSlotCredentialIfNeeded } from '../oauth/host-token-refresh.mjs'
-import { hostCountTokens, hostModels, hostOauthUsage } from '../oauth/host-anthropic.mjs'
+import { isApiKeyMode } from '../oauth/credential-mode.mjs'
+import { runSlotOauth } from './slot-oauth.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
+import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
+import {
+  clientCancelledResult,
+  isClientCancelledResult,
+  isCompleteAssistantMessage,
+  isWrapConnectionError,
+} from '../core/errors.mjs'
+import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
+const credentialRefreshTail = new Map()
+
+function withCredentialRefreshLock(key, fn) {
+  const prev = credentialRefreshTail.get(key) || Promise.resolve()
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const tail = prev.catch(() => {}).then(() => gate)
+  credentialRefreshTail.set(key, tail)
+  return prev
+    .catch(() => {})
+    .then(async () => {
+      try {
+        return await fn()
+      } finally {
+        release()
+        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
+      }
+    })
+}
 
 export function workerPaths(exec = {}) {
   const slotRoot = exec.homeDir ? path.dirname(exec.homeDir) : null
@@ -53,7 +92,11 @@ function workerRequest(
       requestHeaders['content-type'] = 'application/json'
       requestHeaders['content-length'] = String(payload.length)
     }
-    if (internalToken) requestHeaders['x-kin-internal-token'] = internalToken
+    if (internalToken) {
+      // Rust/Codex kernels use the namespaced header; retain the legacy worker header.
+      requestHeaders['x-kin-internal-token'] = internalToken
+      requestHeaders['x-internal-token'] = internalToken
+    }
     let timer = null
     const clearTimer = () => {
       if (timer) {
@@ -88,6 +131,30 @@ function workerRequest(
     if (payload) req.write(payload)
     req.end()
   })
+}
+
+/**
+ * Client went away: name the hop to the kernel so it cancels that job on the
+ * CLI right now. The dropped socket alone left the kernel guessing whether
+ * the CLI still owned the job. Best effort: the kernel also sees the drop,
+ * and an old worker without the route just answers 404.
+ */
+function cancelOnAbort(exec, signal, requestId) {
+  if (!signal || signal.aborted) return () => {}
+  const onAbort = () => {
+    workerRequest(exec, {
+      method: 'POST',
+      requestPath: '/internal/v1/cancel',
+      body: { request_id: requestId },
+      timeoutMs: 3000,
+    })
+      .then((res) => res.resume())
+      .catch((error) => {
+        console.warn(`[kernel-cancel] ${exec?.vmId || 'slot'} ${requestId}: ${error?.code || error?.message || error}`)
+      })
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  return () => signal.removeEventListener('abort', onAbort)
 }
 
 async function readAll(stream, limit = MAX_BODY) {
@@ -127,10 +194,10 @@ function publicHeaders(headers = {}) {
   return result
 }
 
-/** Flatten wrap `X-Kin-Rate-Limit-Headers` JSON into Anthropic Extra keys. */
+/** Flatten wrap `X-Rate-Limit-Headers` JSON into Anthropic Extra keys. */
 function mergeRateLimitHeaders(headers = {}) {
   const out = { ...headers }
-  const packed = headers['x-kin-rate-limit-headers']
+  const packed = headers['x-rate-limit-headers']
   if (!packed) return out
   try {
     const parsed = typeof packed === 'string' ? JSON.parse(packed) : packed
@@ -146,18 +213,18 @@ function mergeRateLimitHeaders(headers = {}) {
   return out
 }
 
-/** Parse the X-Kin-Usage / X-Kin-Model / X-Kin-Stop-Reason worker metadata. */
+/** Parse the X-Usage / X-Model / X-Stop-Reason worker metadata. */
 function streamMetaFromHeaders(headers = {}) {
   let usage = null
-  if (headers['x-kin-usage']) {
+  if (headers['x-usage']) {
     try {
-      usage = JSON.parse(headers['x-kin-usage'])
+      usage = JSON.parse(headers['x-usage'])
     } catch {}
   }
   return {
     usage,
-    model: headers['x-kin-model'] || null,
-    stopReason: headers['x-kin-stop-reason'] || null,
+    model: headers['x-model'] || null,
+    stopReason: headers['x-stop-reason'] || null,
   }
 }
 
@@ -174,6 +241,83 @@ function mergeUsage(current, next) {
   return out
 }
 
+/** First user-visible assistant output — never transport/terminal metadata alone. */
+export function isDownstreamCommitEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const t = String(event.type || '')
+  if (t === 'error' || t === 'message_start' || t === 'response_headers') return false
+  if (t === 'message_stop' || t === 'response.completed' || t === 'response.done' || t === 'message_delta') return false
+
+  if (t === 'content_block_delta') {
+    const d = event.delta || {}
+    return !!(d.text || d.thinking || d.partial_json || d.refusal || d.signature)
+  }
+  if (t === 'content_block_start') {
+    const b = event.content_block || {}
+    const kind = String(b.type || '')
+    return (
+      kind === 'text' ||
+      kind === 'thinking' ||
+      kind === 'redacted_thinking' ||
+      kind === 'refusal' ||
+      kind === 'tool_use' ||
+      kind === 'server_tool_use' ||
+      kind === 'mcp_tool_use' ||
+      kind.endsWith('_tool_use') ||
+      !!(b.text || b.thinking)
+    )
+  }
+  return t.startsWith('response.output_')
+}
+
+/**
+ * Timing starts at generated content, independently of downstream commitment.
+ * A generated tool name is first output: name-only tools often never send a
+ * parameter delta. Omitted thinking reports generated tokens without text.
+ * Connection metadata, empty blocks, and trailers are not TTFT.
+ * Shared Claude/Codex kernel stream path only; API transport still stamps the
+ * first `data:` line in api-protocol.mjs.
+ */
+function hasGeneratedContent(block) {
+  if (!block || typeof block !== 'object') return false
+  const nonempty = (value) => typeof value === 'string' && value.length > 0
+  if ([block.text, block.thinking, block.refusal].some(nonempty)) return true
+  if (block.type === 'redacted_thinking') return nonempty(block.data)
+  return (
+    (block.type === 'function_call' ||
+      block.type === 'custom_tool_call' ||
+      String(block.type || '').endsWith('tool_use')) &&
+    (nonempty(block.name) || nonempty(block.arguments) || nonempty(block.input))
+  )
+}
+
+function isFirstTokenEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '')
+  if (type === 'content_block_delta') {
+    const delta = event.delta || {}
+    return (
+      [delta.text, delta.thinking, delta.partial_json, delta.refusal].some(
+        (value) => typeof value === 'string' && value.length > 0,
+      ) ||
+      (delta.type === 'thinking_delta' && Number.isFinite(delta.estimated_tokens) && delta.estimated_tokens > 0)
+    )
+  }
+  if (type === 'content_block_start') return hasGeneratedContent(event.content_block)
+  if (type.startsWith('response.') && type.endsWith('.delta')) {
+    return typeof event.delta === 'string' && event.delta.length > 0
+  }
+  if (type === 'response.content_part.added' || type === 'response.content_part.done')
+    return hasGeneratedContent(event.part)
+  if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+    return (
+      hasGeneratedContent(event.item) ||
+      (Array.isArray(event.item?.content) && event.item.content.some(hasGeneratedContent))
+    )
+  }
+  return false
+}
+
 /** Anthropic SSE: message_start.message.usage + message_delta.usage. OpenAI Responses: response.usage. */
 export function usageFromSseEvent(event) {
   if (!event || typeof event !== 'object') return null
@@ -181,6 +325,81 @@ export function usageFromSseEvent(event) {
   if (event.response?.usage && typeof event.response.usage === 'object') return event.response.usage
   if (event.message?.usage && typeof event.message.usage === 'object') return event.message.usage
   return null
+}
+
+import { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
+
+export { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
+
+/**
+ * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
+ * Restore recognized permission denials and plan-limit / overload statuses.
+ */
+export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {}) {
+  if (!result || result.ok || Number(result.status) !== 502) return result
+  const body = result.body
+  if (!(body?.type === 'error' || body?.error)) return result
+  const status = semanticStatusForStreamError(body)
+  if (status !== 403 && status !== 429 && status !== 529) return result
+  const headers =
+    status === 429
+      ? extraHeadersFromLimitError(String(body?.error?.message || ''), result.headers || {}, now)
+      : result.headers
+  return { ...result, status, headers, terminalState: 'rejected' }
+}
+
+/**
+ * Uncommitted hop that streamed a real provider error gets that status.
+ * A hop that ended with no visible output stays on its 2xx status and is an
+ * empty hop. Promoting it to 502 makes a healthy VM look overloaded.
+ */
+function unfinishedEmptyHop(result) {
+  return {
+    ...result,
+    ok: false,
+    terminalState: 'incomplete',
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'empty_response',
+        message: 'Upstream stream ended without visible output',
+      },
+    },
+  }
+}
+
+export function restoreUncommittedHop(result = {}, { now = Date.now() } = {}) {
+  if (!result || result.committed || result.ok || isClientCancelledResult(result)) return result
+  if (Number(result.status) < 200 || Number(result.status) >= 300) return result
+  const body = result.body
+  if (body?.type === 'error' || body?.error) {
+    const status = semanticStatusForStreamError(body)
+    const message = String(body?.error?.message || body?.message || '')
+    const code = String(body?.error?.code || '')
+    if (code && code !== 'empty_response') {
+      const retryAfter = body?.error?.retry_after
+      const coded = retryAfter ? { ...(result.headers || {}), 'retry-after': String(retryAfter) } : result.headers
+      const headers = status === 429 ? extraHeadersFromLimitError(message, coded || {}, now) : coded
+      return {
+        ...result,
+        status,
+        headers,
+        terminalState: status === 502 ? result.terminalState || 'incomplete' : 'rejected',
+        streamError: status !== 502,
+      }
+    }
+    if (status === 502 && !/overload|usage policy/i.test(message)) {
+      if (isWrapConnectionError(message)) return { ...result, ok: false, terminalState: 'incomplete' }
+      return unfinishedEmptyHop(result)
+    }
+    const headers =
+      status === 429 ? extraHeadersFromLimitError(String(message), result.headers || {}, now) : result.headers
+    const terminalState = status === 502 ? result.terminalState : 'rejected'
+    return { ...result, status, headers, terminalState, streamError: status !== 502 }
+  }
+  if (Array.isArray(body?.content) && body.content.length) return result
+  return unfinishedEmptyHop(result)
 }
 
 function dumpSessionEnvelope(envelope) {
@@ -206,29 +425,83 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
-export function finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m = false }) {
+/**
+ * `cliHop`: the slot cli-node builds the wire and always sends
+ * mid-conversation-system; the kernel drops these envelope headers. Gating the
+ * body on the VM's HTTP betas would lift every role=system turn into system[],
+ * so system grows each turn and no cached prefix is ever read.
+ */
+export function finalizeWorkerPayload({
+  body,
+  reqHeaders,
+  exec,
+  identity,
+  routing,
+  want1m = false,
+  cliHop = false,
+  requestContext = null,
+} = {}) {
   const model = body?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
     want1m: want1m === true,
   })
+  const displayed =
+    requestContext?.purpose === 'auto_mode_classifier' ? body : applyThinkingDisplay(body, thinkingDisplayMode(routing))
+  const thread = pinThreadBetas(
+    displayed,
+    withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), displayed),
+  )
+  const betas = thread.betas
+  headers['anthropic-beta'] = betas.join(',')
+  // Envelope headers are discarded; the existing MessageRequest.betas channel
+  // carries request gates to the native CLI, which builds the actual HTTP wire.
+  const gated = cliHop
+    ? { ...displayed, betas }
+    : sanitizeAnthropicBodyForBetaTokens(displayed, headers['anthropic-beta'])
   return {
     headers,
-    body: sanitizeAnthropicBodyForBetaTokens(body, headers?.['anthropic-beta'] || ''),
+    body: sealClaudeCodeCch(gated, { enabled: routing?.compatibility?.cch_enabled !== false, seal: !cliHop }),
+    thread: thread.turn,
   }
 }
 
-function workerEnvelope({ body, reqHeaders, exec, identity, stream, deliveryMode, want1m = false }) {
-  const finalized = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m })
+function workerEnvelope({
+  requestContext = null,
+  body,
+  reqHeaders,
+  exec,
+  identity,
+  routing,
+  stream,
+  deliveryMode,
+  want1m = false,
+  cacheTtl = null,
+  preserveCacheBreakpoints = null,
+  cliHop = false,
+} = {}) {
+  const finalized = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec,
+    identity,
+    routing,
+    want1m,
+    cliHop,
+    requestContext,
+  })
   const envelope = {
+    ...(requestContext ? { request_context: requestContext } : {}),
     body: finalized.body,
     headers: finalized.headers,
     stream: !!stream,
     delivery_mode: deliveryMode || 'realtime',
+    preserve_cache_breakpoints: preserveCacheBreakpoints == null ? cacheTtl == null : preserveCacheBreakpoints === true,
+    cache_ttl: cacheTtl == null ? null : String(cacheTtl),
   }
   dumpSessionEnvelope(envelope)
-  return envelope
+  return { envelope, thread: finalized.thread }
 }
 
 function mockScenario(exec) {
@@ -241,18 +514,32 @@ function mockScenario(exec) {
 }
 
 export async function callGoWorker({
+  requestContext = null,
   exec,
   body,
   reqHeaders = {},
   timeoutMs,
   identity = null,
+  routing,
   signal,
   want1m = false,
+  cacheTtl = null,
+  preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
+  cliHop = false,
 } = {}) {
   if (isCrsMock()) {
-    const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m })
+    const { body: outboundBody, headers } = finalizeWorkerPayload({
+      body,
+      reqHeaders,
+      exec,
+      identity,
+      routing,
+      want1m,
+      cliHop,
+      requestContext,
+    })
     writeCrsTrace({ body: outboundBody, headers, stream: false })
     const mock = mockCrsPayload({ scenario: mockScenario(exec) })
     return {
@@ -264,19 +551,38 @@ export async function callGoWorker({
       stopReason: mock.body?.stop_reason || null,
     }
   }
+  const requestId = randomUUID()
+  const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
+    const prepared = envelope
+      ? { envelope, thread: null }
+      : workerEnvelope({
+          body,
+          reqHeaders,
+          exec,
+          identity,
+          routing,
+          stream: false,
+          want1m,
+          cacheTtl,
+          preserveCacheBreakpoints,
+          cliHop,
+          requestContext,
+        })
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body: envelope || workerEnvelope({ body, reqHeaders, exec, identity, stream: false, want1m }),
+      body: { ...prepared.envelope, request_id: requestId },
       signal,
       timeoutMs,
     })
     const data = await readAll(response)
     const parsed = parseJson(data)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
-    return {
-      ok: response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error',
+    const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
+    if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
+    return restoreKernelErrorStatus({
+      ok,
       status: response.statusCode || 0,
       via: 'go-worker',
       body: parsed,
@@ -284,9 +590,10 @@ export async function callGoWorker({
       usage: parsed?.usage || null,
       model: parsed?.model || null,
       stopReason: parsed?.stop_reason || null,
-      terminalState: headers['x-kin-terminal-state'] || null,
+      terminalState: headers['x-terminal-state'] || null,
       transportError: false,
-    }
+      threadBetas: prepared.thread,
+    })
   } catch (error) {
     return {
       ok: false,
@@ -304,26 +611,42 @@ export async function callGoWorker({
       terminalState: 'transport_error',
       transportError: true,
     }
+  } finally {
+    stopCancel()
   }
 }
 
 export async function streamGoWorker({
+  requestContext = null,
   exec,
   body,
   reqHeaders = {},
   timeoutMs,
   idleTimeoutMs = 0,
   identity = null,
+  routing,
   signal,
   deliveryMode = 'realtime',
   onEvent,
   onCommit,
   want1m = false,
+  cacheTtl = null,
+  preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
+  cliHop = false,
 } = {}) {
   if (isCrsMock()) {
-    const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m })
+    const { body: outboundBody, headers } = finalizeWorkerPayload({
+      body,
+      reqHeaders,
+      exec,
+      identity,
+      routing,
+      want1m,
+      cliHop,
+      requestContext,
+    })
     writeCrsTrace({ body: outboundBody, headers, stream: true })
     const scenario = mockScenario(exec)
     const mockStartedAt = Date.now()
@@ -373,7 +696,10 @@ export async function streamGoWorker({
     let mockTtftMs = null
     await emitMockSse(async (line) => {
       if (line.startsWith('data:')) {
-        if (mockTtftMs == null) mockTtftMs = Date.now() - mockStartedAt
+        try {
+          if (mockTtftMs == null && isFirstTokenEvent(JSON.parse(line.slice(5))))
+            mockTtftMs = Date.now() - mockStartedAt
+        } catch {}
         if (typeof onCommit === 'function') onCommit()
       }
       if (onEvent) await onEvent(line)
@@ -387,16 +713,36 @@ export async function streamGoWorker({
       model: payload.body?.model || null,
       stopReason: payload.body?.stop_reason || null,
       ttftMs: mockTtftMs,
+      firstTokenAt: mockTtftMs == null ? null : mockStartedAt + mockTtftMs,
     }
   }
   let committed = false
+  // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
   const startedAt = Date.now()
   let ttftMs = null
+  const requestId = randomUUID()
+  const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
+    const prepared = envelope
+      ? { envelope, thread: null }
+      : workerEnvelope({
+          body,
+          reqHeaders,
+          exec,
+          identity,
+          routing,
+          stream: true,
+          deliveryMode,
+          want1m,
+          cacheTtl,
+          preserveCacheBreakpoints,
+          cliHop,
+          requestContext,
+        })
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body: envelope || workerEnvelope({ body, reqHeaders, exec, identity, stream: true, deliveryMode, want1m }),
+      body: { ...prepared.envelope, request_id: requestId },
       signal,
       timeoutMs,
       timeoutMode: 'first-byte',
@@ -405,27 +751,27 @@ export async function streamGoWorker({
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
-      return {
+      return restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
         body: parseJson(data),
         headers,
         committed: false,
-        terminalState: headers['x-kin-terminal-state'] || 'error',
+        terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
-      }
+        threadBetas: prepared.thread,
+      })
     }
-    committed = true
-    if (typeof onCommit === 'function') onCommit()
     let buffer = ''
     let lastError = null
-    let sawTerminal = false
     let dataBuf = ''
     let sseUsage = null
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
+    const assembler = createClaudeMessageAssembler()
+    const pendingLines = []
     const takeSseEvent = () => {
       try {
         const event = JSON.parse(dataBuf)
@@ -435,24 +781,43 @@ export async function streamGoWorker({
         return null
       }
     }
+    const flushCommit = async () => {
+      if (committed) return
+      committed = true
+      if (typeof onCommit === 'function') onCommit()
+      if (onEvent) {
+        for (const queued of pendingLines) await onEvent(queued)
+      }
+      pendingLines.length = 0
+    }
+    const emitLine = async (line) => {
+      if (!committed) {
+        pendingLines.push(line)
+        return
+      }
+      if (onEvent) await onEvent(line)
+    }
     const observeSseEvent = (event) => {
-      if (!event) return
-      if (event.type === 'kin_response_headers' && event.headers && typeof event.headers === 'object') {
+      if (!event) return event
+      if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
+      if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
-      if (event.type === 'message_stop' || event.type === 'response.completed' || event.type === 'response.done')
-        sawTerminal = true
       if (event.type === 'error') lastError = event
+      if (event.type === 'message_stop') sawMessageStop = true
+      if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
       if (event.message?.model) sseModel = event.message.model
       const stop = event.message?.stop_reason || event.delta?.stop_reason
       if (stop) sseStop = stop
+      return event
     }
     const firstByteMs = Math.max(0, Number(timeoutMs) || 0)
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
     let lastChunkAt = Date.now()
     let sawChunk = false
+    let sawMessageStop = false
     let idleTimer = null
     if (firstByteMs > 0 || idleMs > 0) {
       idleTimer = setInterval(() => {
@@ -467,6 +832,9 @@ export async function streamGoWorker({
       idleTimer.unref?.()
     }
     try {
+      // message_stop is the protocol terminal event, but the kernel still sends
+      // job_done and its trailers afterward. Keep reading until the worker
+      // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
         sawChunk = true
         lastChunkAt = Date.now()
@@ -475,51 +843,77 @@ export async function streamGoWorker({
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
           buffer = buffer.slice(newline + 1)
+          applyClaudeSSELineToMessage(line, assembler)
           if (line.startsWith('data:')) {
             const piece = line.slice(5).trim()
             if (piece && piece !== '[DONE]') {
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
-              observeSseEvent(takeSseEvent())
+              const event = observeSseEvent(takeSseEvent())
+              if (isDownstreamCommitEvent(event)) await flushCommit()
             }
-            if (ttftMs == null) ttftMs = Date.now() - startedAt
           } else if (line === '') {
             if (dataBuf) {
               const event = takeSseEvent()
               dataBuf = ''
               observeSseEvent(event)
+              if (isDownstreamCommitEvent(event)) await flushCommit()
             }
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
             dataBuf = `${dataBuf}\n${line}`
-            observeSseEvent(takeSseEvent())
+            const event = observeSseEvent(takeSseEvent())
+            if (isDownstreamCommitEvent(event)) await flushCommit()
           }
-          if (onEvent) await onEvent(line)
+          await emitLine(line)
         }
       }
-      if (buffer && onEvent) await onEvent(buffer)
-      if (dataBuf) observeSseEvent(takeSseEvent())
+      if (buffer) {
+        applyClaudeSSELineToMessage(buffer, assembler)
+        await emitLine(buffer)
+      }
+      if (dataBuf) {
+        const event = observeSseEvent(takeSseEvent())
+        if (isDownstreamCommitEvent(event)) await flushCommit()
+      }
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
-      const terminalState =
-        trailers['x-kin-terminal-state'] || headers['x-kin-terminal-state'] || (sawTerminal ? 'verified' : 'incomplete')
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
+      const assembled = assembler.message
+      const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
+      const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop })
+      if (!committed && complete) await flushCommit()
+      const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
-      return {
-        ok: response.statusCode === 200 && !lastError && terminalState === 'verified',
+      return restoreUncommittedHop({
+        ok: response.statusCode === 200 && !lastError && complete,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: lastError || { type: 'message', role: 'assistant', content: [] },
+
+        body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
         headers: rateHeaders,
-        usage: meta.usage || sseUsage,
-        model: meta.model || sseModel,
-        stopReason: meta.stopReason || sseStop,
+        // Trailer stays authoritative, but it may carry totals only (Codex/Responses hops).
+        // Merge so SSE `input_tokens_details` / cache breakdown survives instead of being short-circuited.
+        usage: mergeUsage(mergeUsage(assembled?.usage || null, sseUsage), meta.usage),
+        model: meta.model || sseModel || assembled?.model || null,
+        stopReason,
+        sawMessageStop,
         ttftMs,
+        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
         committed,
         terminalState,
         transportError: false,
-      }
+        threadBetas: prepared.thread,
+      })
     } finally {
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    if (signal?.aborted) {
+      return clientCancelledResult({
+        via: 'go-worker-stream',
+        ttftMs,
+        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
+        committed,
+      })
+    }
     return {
       ok: false,
       status: 0,
@@ -534,10 +928,13 @@ export async function streamGoWorker({
       },
       headers: {},
       ttftMs,
+      firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
       committed,
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,
     }
+  } finally {
+    stopCancel()
   }
 }
 
@@ -590,24 +987,100 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
       },
     }
   }
-  const result = await refreshSlotCredentialIfNeeded({
-    homeDir: exec.homeDir,
-    vm: exec.vm,
-    force: !!force,
+
+  const credential = readWorkerCredentialFile(exec.homeDir)
+  if (!credential) {
+    return {
+      ok: false,
+      status: 400,
+      refreshed: false,
+      error: { code: 'credential_required', message: 'slot has no credential file' },
+    }
+  }
+
+  const now = Date.now()
+  const apiKey = isApiKeyMode(credential.type || credential.mode)
+  const alreadyFresh = apiKey || (!force && !needsRefresh(credential.expires_at, now, REFRESH_SKEW_MS))
+  if (alreadyFresh) {
+    return {
+      ok: true,
+      status: 200,
+      refreshed: false,
+      refresh_class: 'already_fresh',
+      credential: credentialSummary(credential, now),
+    }
+  }
+
+  const snapshotRefresh = String(credential.refresh_token || '')
+  const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
+  return withCredentialRefreshLock(lockKey, async () => {
+    const live = readWorkerCredentialFile(exec.homeDir) || credential
+    const liveRefresh = String(live?.refresh_token || '')
+    if (snapshotRefresh && liveRefresh && snapshotRefresh !== liveRefresh) {
+      return {
+        ok: true,
+        status: 200,
+        refreshed: false,
+        refresh_class: 'already_fresh',
+        credential: credentialSummary(live, Date.now()),
+      }
+    }
+    const liveNow = Date.now()
+    if (!force && !needsRefresh(live.expires_at, liveNow, REFRESH_SKEW_MS) && !isApiKeyMode(live.type || live.mode)) {
+      return {
+        ok: true,
+        status: 200,
+        refreshed: false,
+        refresh_class: 'already_fresh',
+        credential: credentialSummary(live, liveNow),
+      }
+    }
+    const result = await runSlotOauth(exec, 'refresh', { force: !!force })
+    const body = result?.body || {}
+    const refreshedCredential = readWorkerCredentialFile(exec.homeDir)
+    const mapped = {
+      ok: !!result?.ok,
+      status: result?.status || 0,
+      refreshed: !!body.refreshed,
+      refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
+      credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
+      error: result?.ok ? undefined : body.error,
+    }
+    if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
+    return mapped
   })
+}
+
+function credentialSummary(credential, now = Date.now()) {
+  if (!credential) return undefined
+  const expiresAt = credential.expires_at ?? null
+  const expiresAtMs =
+    Number(expiresAt) && Number(expiresAt) < 10_000_000_000 ? Number(expiresAt) * 1000 : Number(expiresAt)
   return {
-    ok: !!result.ok,
-    status: result.ok ? 200 : 400,
-    refreshed: !!result.refreshed,
-    refresh_class: result.refresh_class,
-    credential: result.credential,
-    error: result.error,
+    type: credential.type || credential.mode || null,
+    mode: credential.mode || credential.type || null,
+    account_uuid: credential.account_uuid || null,
+    org_uuid: credential.org_uuid || null,
+    email: credential.email || null,
+    scope: credential.scope || null,
+    auth_scheme: credential.auth_scheme || null,
+    has_access: credential.has_access ?? !!(credential.access_token || credential.api_key),
+    has_refresh: credential.has_refresh ?? !!credential.refresh_token,
+    needs_refresh: isApiKeyMode(credential.type || credential.mode)
+      ? false
+      : needsRefresh(expiresAt, now, REFRESH_SKEW_MS),
+    expires_at: expiresAt,
+    ttl_seconds:
+      Number.isFinite(expiresAtMs) && expiresAtMs > 0 ? Math.max(0, Math.ceil((expiresAtMs - now) / 1000)) : null,
+    generation: credential._token_version || null,
   }
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
   try {
     writeWorkerCredentialFile(exec.homeDir, credential)
+    // Import is the one case where the control plane's credential replaces the slot's copy.
+    await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
   } catch (error) {
     return {
       ok: false,
@@ -690,12 +1163,10 @@ export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, sign
     }
   }
   if (requestPath === '/internal/v1/models') {
-    const hop = await hostModels(exec, { timeoutMs })
-    return { ...hop, via: hop.via || 'host-socks' }
+    return runSlotOauth(exec, 'models', { timeoutMs })
   }
   if (requestPath === '/internal/oauth/usage') {
-    const hop = await hostOauthUsage(exec, { timeoutMs })
-    return { ...hop, via: hop.via || 'host-socks' }
+    return runSlotOauth(exec, 'usage', { timeoutMs })
   }
   try {
     const response = await workerRequest(exec, { requestPath, timeoutMs, signal })
@@ -721,10 +1192,9 @@ export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, sign
   }
 }
 
-export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs = 45000, fetchImpl } = {}) {
+export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs = 45000 } = {}) {
   if (isCrsMock()) {
     return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'go-worker-mock' }
   }
-  const hop = await hostCountTokens(exec, { body, headers, timeoutMs, fetchImpl })
-  return { ...hop, via: hop.via || 'host-socks' }
+  return runSlotOauth(exec, 'count-tokens', { body, headers, timeoutMs })
 }

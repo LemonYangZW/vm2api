@@ -3,19 +3,31 @@ import type {
   OfficialCcBootstrapPayload,
   SetupTokenSession,
   TestModelsPayload,
+  VmCreateOptions,
   VmCredentialResponse,
   VmDetailPayload,
+  VmSeedSettings,
+  VmsListResponse,
 } from '@/types/panel-vm'
 import { api } from '@/lib/api'
+
+/** 创建表单默认规格 + 本机 KVM 能力。ACL 与 POST /vms/create 相同，租户可读。 */
+export function vmCreateOptionsQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'vms', 'create-options'] as const,
+    queryFn: () => api<VmCreateOptions>('/api/panel/vms/create-options'),
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+}
 
 export function vmsListQueryOptions(refetchInterval?: number) {
   return queryOptions({
     queryKey: ['panel', 'vms'] as const,
     queryFn: async () => {
-      const data = await api<{ items?: import('@/types/panel-vm').Vm[] }>(
-        '/api/panel/vms'
-      )
-      return { items: data.items || [] }
+      const data = await api<VmsListResponse>('/api/panel/vms')
+      return { items: data.items || [], pool_queue: data.pool_queue }
     },
     ...(refetchInterval
       ? { refetchInterval, refetchOnWindowFocus: false }
@@ -35,9 +47,29 @@ export function vmSeedQueryOptions(id: string) {
   return queryOptions({
     queryKey: ['panel', 'vm', id, 'seed'] as const,
     queryFn: () =>
-      api<Record<string, unknown>>(
+      api<VmSeedSettings>(
         `/api/panel/vms/${encodeURIComponent(id)}/seed-settings`
       ),
+    refetchInterval: false,
+  })
+}
+
+/** Upload audit lines only — does not share the seed form query key. */
+export function vmSeedUploadLogQueryOptions(id: string) {
+  return queryOptions({
+    queryKey: ['panel', 'vm', id, 'seed-upload-log'] as const,
+    queryFn: async () => {
+      const data = await api<VmSeedSettings>(
+        `/api/panel/vms/${encodeURIComponent(id)}/seed-settings?debug=1`
+      )
+      const lines = data.telemetry_log
+      return Array.isArray(lines)
+        ? lines.filter(
+            (line): line is string => typeof line === 'string' && line !== ''
+          )
+        : []
+    },
+    refetchInterval: false,
   })
 }
 

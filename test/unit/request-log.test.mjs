@@ -14,6 +14,7 @@ import {
 } from '../../src/lib/admin/request-log.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
+import { gateVerdict } from '../../src/lib/protocol/intercept-stats.mjs'
 
 function tmpStore(mode = 'normal') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-'))
@@ -103,7 +104,7 @@ test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', ()
   assert.equal(sum.first_token_ms, 42)
   assert.equal(sum.stop_reason, 'end_turn')
   // Sonnet 5 official: $2/$10/cache 5m $2.50/1h $4/read $0.20 per MTok
-  assert.equal(sum.pricing_model, 'sonnet-5')
+  assert.equal(sum.pricing_model, 'claude-sonnet-5')
   assert.ok(Math.abs(sum.total_cost - 0.0000926) < 1e-12)
   const row = store.queryNormal({ limit: 1 }).items[0]
   assert.equal(row.cache_creation_5m_tokens, 4)
@@ -134,12 +135,148 @@ test('backfillMissingCosts restores actual cost with the stored group multiplier
   assert.deepEqual(
     rows.map((row) => ({ ...row })),
     [
-      { id: 'log_old_bill_default', total_cost: 5, actual_cost: 5, pricing_model: 'opus-5' },
-      { id: 'log_old_bill_double', total_cost: 5, actual_cost: 10, pricing_model: 'opus-5' },
-      { id: 'log_old_bill_free', total_cost: 5, actual_cost: 0, pricing_model: 'opus-5' },
+      { id: 'log_old_bill_default', total_cost: 5, actual_cost: 5, pricing_model: 'claude-opus-5' },
+      { id: 'log_old_bill_double', total_cost: 5, actual_cost: 10, pricing_model: 'claude-opus-5' },
+      { id: 'log_old_bill_free', total_cost: 5, actual_cost: 0, pricing_model: 'claude-opus-5' },
     ],
   )
   assert.equal(store.repo.backfillMissingCosts(), 0)
+})
+
+function finishWith(store, model, usage) {
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x', pathName: '/v1' })
+  return store.finish(ctx, { status: 200, model, upstream_model: model, vm_id: 'vm-t', account_id: 'acc-t', usage })
+}
+
+test('tier-unpriced rows stay unpriced after backfill', () => {
+  const store = tmpStore('normal')
+  // gpt-5.5 publishes no >272K fast column; gpt-5.3-codex has no flex band.
+  const a = finishWith(store, 'gpt-5.5', { input_tokens: 1_000_000, output_tokens: 0, service_tier: 'priority' })
+  const b = finishWith(store, 'gpt-5.3-codex', { input_tokens: 1000, output_tokens: 0, service_tier: 'flex' })
+  assert.equal(a.total_cost, null)
+  assert.equal(a.pricing_model, 'unpriced')
+  assert.equal(a.service_tier, 'priority')
+  assert.equal(b.pricing_model, 'unpriced')
+  store.repo.billingStats()
+  const rows = store.db.prepare('SELECT total_cost, actual_cost, pricing_model FROM usage_logs ORDER BY id').all()
+  for (const r of rows) {
+    assert.equal(r.total_cost, null)
+    assert.equal(r.actual_cost, null)
+    assert.equal(r.pricing_model, 'unpriced')
+  }
+})
+
+test('backfill reprices with the stored service tier and speed', () => {
+  const store = tmpStore('normal')
+  const insert = store.db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, model, upstream_model, status,
+      input_tokens, output_tokens, service_tier, speed)
+    VALUES (?, ?, ?, ?, ?, 200, ?, 0, ?, ?)
+  `)
+  const now = new Date().toISOString()
+  // 100K stays under the 272K long-context threshold → plain flex band ($2.5/MTok input).
+  insert.run('log_bf_flex', 'rid_bf_flex', now, 'gpt-5.5', 'gpt-5.5', 100_000, 'flex', null)
+  insert.run('log_bf_fast', 'rid_bf_fast', now, 'claude-opus-4-8', 'claude-opus-4-8', 1_000_000, null, 'fast')
+  insert.run('log_bf_weird', 'rid_bf_weird', now, 'gpt-5.5', 'gpt-5.5', 1000, 'weird', null)
+  store.repo.backfillMissingCosts()
+  const got = Object.fromEntries(
+    store.db
+      .prepare("SELECT id, total_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_bf_%'")
+      .all()
+      .map((r) => [r.id, [r.total_cost, r.pricing_model]]),
+  )
+  assert.deepEqual(got.log_bf_flex, [0.25, 'gpt-5.5'])
+  assert.deepEqual(got.log_bf_fast, [10, 'claude-opus-4-8'])
+  assert.deepEqual(got.log_bf_weird, [null, 'unpriced'])
+  assert.equal(store.repo.backfillMissingCosts(), 0)
+})
+
+test('costByModel splits rows by billing band', () => {
+  const store = tmpStore('normal')
+  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0, speed: 'fast' })
+  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0 })
+  const rows = store.repo.costByModel({ vmId: 'vm-t' })
+  assert.equal(rows.length, 2)
+  const fast = rows.find((r) => r.speed === 'fast')
+  const std = rows.find((r) => r.speed !== 'fast')
+  assert.equal(fast.total_cost, 10)
+  assert.equal(fast.requests, 1)
+  assert.equal(std.total_cost, 5)
+  assert.equal(std.long_context, 0)
+})
+
+test('vmUsageStats buckets by Shanghai day, isolates the slot and ranks models and paths', () => {
+  const store = tmpStore('normal')
+  const insert = store.db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, path, model, upstream_model, status,
+      vm_id, input_tokens, output_tokens, total_cost, duration_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, 50, ?, ?)
+  `)
+  const shanghaiDay = (offsetDays) =>
+    new Date(Date.now() + 8 * 3600_000 - offsetDays * 86400_000).toISOString().slice(0, 10)
+  // 16:30Z is 00:30 the next Shanghai day: a UTC bucket would file it under the wrong date.
+  const at = (offsetDays) => `${shanghaiDay(offsetDays + 1)}T16:30:00.000Z`
+  insert.run('u1', 'r1', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 1000)
+  insert.run('u2', 'r2', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 3000)
+  insert.run('u3', 'r3', at(2), '/v1/chat/completions', 'm-b', 'm-b', 200, 'vm-x', 4, null)
+  insert.run('u4', 'r4', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-other', 99, 1)
+  insert.run('u5', 'r5', at(40), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 99, 1)
+  const out = store.repo.vmUsageStats({ vmId: 'vm-x', days: 30 })
+  assert.deepEqual(
+    out.history.map((h) => [h.day, h.requests, h.total_cost]),
+    [
+      [shanghaiDay(2), 1, 4],
+      [shanghaiDay(0), 2, 2],
+    ],
+  )
+  const today = out.history.at(-1)
+  // rows without a duration must not drag the average toward zero
+  assert.equal(today.duration_ms_sum / today.duration_n, 2000)
+  assert.equal(out.history[0].duration_n, 0)
+  assert.deepEqual(
+    out.models.map((m) => [m.name, m.requests]),
+    [
+      ['m-a', 2],
+      ['m-b', 1],
+    ],
+  )
+  assert.deepEqual(
+    out.endpoints.map((e) => e.name),
+    ['/v1/messages', '/v1/chat/completions'],
+  )
+  assert.equal(out.endpoints[0].tokens, 300)
+  assert.deepEqual(store.repo.vmUsageStats({ vmId: null }).history, [])
+})
+
+test('keyUsageStats counts only that key and ranks VMs', () => {
+  const store = tmpStore('normal')
+  const insert = store.db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, path, model, upstream_model, status,
+      vm_id, api_key_id, input_tokens, output_tokens, total_cost, duration_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 50, ?, ?)
+  `)
+  const now = new Date().toISOString()
+  insert.run('k1', 'rk1', now, '/v1/messages', 'm-a', 'm-a', 200, 'vm-a', 'key_a', 1, 10)
+  insert.run('k2', 'rk2', now, '/v1/messages', 'm-b', 'm-b', 200, 'vm-b', 'key_a', 3, 20)
+  insert.run('k3', 'rk3', now, '/v1/messages', 'm-a', 'm-a', 200, 'vm-a', 'key_b', 99, 1)
+  const out = store.repo.keyUsageStats({ apiKeyId: 'key_a', days: 30 })
+  assert.equal(
+    out.history.reduce((n, row) => n + row.requests, 0),
+    2,
+  )
+  assert.equal(
+    out.history.reduce((n, row) => n + row.total_cost, 0),
+    4,
+  )
+  assert.deepEqual(
+    out.vms.map((row) => [row.name, row.requests]),
+    [
+      ['vm-b', 1],
+      ['vm-a', 1],
+    ],
+  )
+  assert.equal(out.endpoints, undefined)
+  assert.deepEqual(store.repo.keyUsageStats({ apiKeyId: null }).history, [])
 })
 
 test('zero group multiplier keeps usage and key counters but charges no USD', () => {
@@ -181,6 +318,51 @@ test('zero group multiplier keeps usage and key counters but charges no USD', ()
   assert.equal(stored.usage_5h, 0)
 })
 
+test('billingStats Extra window excludes older logs outside reset-5h', () => {
+  const store = tmpStore('normal')
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  const ctxOld = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctxOld, {
+    status: 200,
+    model: 'claude-opus-5',
+    upstream_model: 'claude-opus-5',
+    vm_id: 'vm-01',
+    account_id: 'acc-1',
+    usage: { input_tokens: 1_000_000, output_tokens: 0 },
+  })
+  store.repo.db.prepare('UPDATE usage_logs SET created_at = ? WHERE vm_id = ?').run('2026-09-26T08:00:00.000Z', 'vm-01')
+  const ctxNew = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctxNew, {
+    status: 200,
+    model: 'claude-opus-5',
+    upstream_model: 'claude-opus-5',
+    vm_id: 'vm-01',
+    account_id: 'acc-1',
+    usage: { input_tokens: 200_000, output_tokens: 0 },
+  })
+  store.repo.db
+    .prepare(
+      "UPDATE usage_logs SET created_at = '2026-09-26T11:30:00.000Z' WHERE created_at > '2026-09-26T10:00:00.000Z'",
+    )
+    .run()
+  const reset5h = '2026-09-26T16:00:00.000Z'
+  const bill = store.billingStats({
+    now,
+    accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-01', reset_5h: reset5h }],
+  })
+  assert.equal(bill.accounts[0].window_5h_requests, 1)
+  assert.ok(bill.accounts[0].window_5h_cost < 2)
+  assert.equal(bill.accounts[0].window_5h_cost, bill.window_5h.total_cost)
+  const rolling = store.billingStats({ now })
+  assert.equal(rolling.accounts[0].window_5h_requests, 2)
+})
+
 test('billingStats aggregates official cost per account and today', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -218,6 +400,45 @@ test('billingStats aggregates official cost per account and today', () => {
   assert.equal(models[0].input_tokens, 1_000_000)
 })
 
+test('finish writes OpenAI Responses cache read and cache write', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.responses', pathName: '/v1/responses' },
+  )
+  const sum = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.responses',
+    model: 'gpt-5.6-sol',
+    upstream_model: 'gpt-5.6-sol',
+    usage: {
+      input_tokens: 100,
+      output_tokens: 4,
+      input_tokens_details: { cached_tokens: 80, cache_write_tokens: 10 },
+    },
+  })
+  assert.equal(sum.input_tokens, 10)
+  assert.equal(sum.cache_read_tokens, 80)
+  assert.equal(sum.cache_creation_tokens, 10)
+})
+
+test('finish prices OpenAI usage with top-level cached_tokens', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.chat', pathName: '/v1/chat/completions' },
+  )
+  const sum = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.chat',
+    model: 'gpt-5.5',
+    upstream_model: 'gpt-5.5',
+    usage: { input_tokens: 1_000_000, output_tokens: 0, cached_tokens: 200_000 },
+  })
+  assert.equal(sum.input_tokens, 800_000)
+  assert.equal(sum.cache_read_tokens, 200_000)
+})
+
 test('finish prices OpenAI-shaped usage from third-party clients', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -235,26 +456,109 @@ test('finish prices OpenAI-shaped usage from third-party clients', () => {
       prompt_tokens_details: { cached_tokens: 1_000_000 },
     },
   })
-  assert.equal(sum.input_tokens, 1_000_000)
+  assert.equal(sum.input_tokens, 0)
   assert.equal(sum.cache_read_tokens, 1_000_000)
-  assert.equal(sum.total_cost, 2.2)
 })
 
-test('cache breakdown falls back to the 5m bucket (sub2api normalization)', () => {
+test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h', () => {
+  const store = tmpStore('normal')
+  const five = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-sonnet-5',
+      upstream_model: 'claude-sonnet-5',
+      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 9 },
+    },
+  )
+  assert.equal(five.cache_creation_5m_tokens, 9)
+  assert.equal(five.cache_creation_1h_tokens, 0)
+  assert.equal(five.model_mismatch, 0)
+  const hour = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-sonnet-5',
+      upstream_model: 'claude-sonnet-5',
+      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 9, cache_ttl: '1h' },
+    },
+  )
+  assert.equal(hour.cache_creation_5m_tokens, 0)
+  assert.equal(hour.cache_creation_1h_tokens, 9)
+})
+
+test('finish persists web_search_requests from server_tool_use', () => {
+  const store = tmpStore('normal')
+  const sum = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-sonnet-5',
+      upstream_model: 'claude-sonnet-5',
+      usage: {
+        input_tokens: 10,
+        output_tokens: 2,
+        server_tool_use: { web_search_requests: 3 },
+      },
+    },
+  )
+  assert.equal(sum.web_search_requests, 3)
+  const row = store.db.prepare('SELECT web_search_requests FROM usage_logs WHERE id = ?').get(sum.id)
+  assert.equal(row.web_search_requests, 3)
+})
+
+test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost stays put', () => {
+  const store = tmpStore('normal')
+  const now = new Date().toISOString()
+  store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, model, upstream_model, status,
+      input_tokens, output_tokens, total_cost, actual_cost, pricing_model, rate_multiplier
+    ) VALUES
+      ('log_rp_old', 'rid_rp_old', ?, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, 1, 9, 'opus-5', 1),
+      ('log_rp_null', 'rid_rp_null', ?, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, NULL, 4, NULL, 2)
+  `)
+    .run(now, now)
+  const out = store.repo.repriceRange({ since: now, until: now })
+  assert.equal(out.rows, 2)
+  assert.ok(out.changed >= 1)
+  const rows = Object.fromEntries(
+    store.db
+      .prepare("SELECT id, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_rp_%'")
+      .all()
+      .map((r) => [r.id, r]),
+  )
+  assert.equal(rows.log_rp_old.actual_cost, 9)
+  assert.notEqual(rows.log_rp_old.total_cost, 1)
+  assert.equal(rows.log_rp_null.actual_cost, 4)
+  assert.equal(rows.log_rp_null.pricing_model, 'claude-opus-5')
+  assert.equal(rows.log_rp_null.total_cost, 5)
+})
+
+test('finish records washed Responses path over inbound chat path', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
-    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    { protocol: 'openai.chat', pathName: '/v1/chat/completions' },
   )
   const sum = store.finish(ctx, {
     status: 200,
-    model: 'claude-sonnet-5',
-    upstream_model: 'claude-sonnet-5',
-    usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 9 },
+    protocol: 'openai.responses',
+    path: '/v1/responses',
+    model: 'gpt-5.6-sol',
   })
-  assert.equal(sum.cache_creation_5m_tokens, 9)
-  assert.equal(sum.cache_creation_1h_tokens, 0)
-  assert.equal(sum.model_mismatch, 0)
+  assert.equal(sum.path, '/v1/responses')
+  assert.equal(sum.protocol, 'openai.responses')
 })
 
 test('debug mode stores full redacted body', () => {
@@ -278,12 +582,62 @@ test('debug mode stores full redacted body', () => {
   assert.deepEqual(dbg[0].hop_meta.params.dropped, ['max_tokens'])
 })
 
+test('outbound bodies are stored only when the operator configured debug, not via caller headers', () => {
+  const outbound = { body: { system: 'gateway persona overlay' }, headers: { 'x-app': 'cli' } }
+  const record = (store, headers) => {
+    const ctx = store.start({ method: 'POST', headers, socket: {} }, { pathName: '/v1/messages' })
+    store.finish(ctx, {
+      status: 200,
+      inbound_body: { model: 'm' },
+      outbound_body: outbound.body,
+      outbound_headers: outbound.headers,
+    })
+    return store.getDebug(ctx.request_id)
+  }
+  for (const headers of [{ 'x-kin-debug': '1' }, { 'x-kin-log': 'debug' }]) {
+    const forced = record(tmpStore('normal'), headers)
+    assert.deepEqual(forced.inbound_body, { model: 'm' })
+    assert.equal(forced.outbound_body, null)
+    assert.equal(forced.outbound_headers, null)
+  }
+  const operator = record(tmpStore('debug'), {})
+  assert.deepEqual(operator.outbound_body, outbound.body)
+  assert.deepEqual(operator.outbound_headers, outbound.headers)
+})
+
 test('off mode writes nothing', () => {
   const store = tmpStore('off')
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
   assert.equal(ctx.mode, 'off')
   assert.equal(store.finish(ctx, { status: 200 }), null)
   assert.equal(store.listNormal({ limit: 5 }).length, 0)
+})
+
+test('classifier debug diagnostics omit system and transcript bodies', () => {
+  const store = tmpStore('debug')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const body = {
+    model: 'claude-sonnet-4-6',
+    system: 'sensitive policy',
+    messages: [{ role: 'user', content: 'sensitive transcript' }],
+  }
+  const classifier = {
+    purpose: 'auto_mode_classifier',
+    format: 'xml',
+    layer: 'node_object',
+    wire_observed: false,
+    before: { max_tokens: 64 },
+  }
+  store.finish(ctx, { status: 200, classifier, inbound_body: body, outbound_body: body })
+  const [debug] = store.listDebug({ limit: 1 })
+  assert.deepEqual(debug.classifier, classifier)
+  assert.equal(debug.request_body_snapshot, null)
+  assert.equal(debug.inbound_body, null)
+  assert.equal(debug.outbound_body, null)
+  assert.equal(JSON.stringify(debug).includes('sensitive transcript'), false)
 })
 
 function logOne(store, extra = {}) {
@@ -301,6 +655,38 @@ test('summaries persist in sqlite across store re-open', () => {
   assert.equal(listed.length, 1)
   assert.equal(listed[0].api_key_id, 'key_p')
   assert.equal(s2.snapshot().total_rows, 1)
+})
+
+test('gate stats count every inbound request and keep the stored verdict', () => {
+  const store = tmpStore()
+  // Plain successes: error_code and final_state stay NULL.
+  logOne(store, { intercept: gateVerdict({ kind: 'pass', by: 'jev' }) })
+  logOne(store, { intercept: gateVerdict({ kind: 'pass', by: 'regex' }) })
+  logOne(store, { path: '/v1/responses', intercept: gateVerdict({ kind: 'pass', by: 'regex' }) })
+  logOne(store, { status: 401, error_code: 'invalid_api_key' })
+  logOne(store, {
+    status: 403,
+    via: 'distill-detect',
+    final_state: 'distill_blocked',
+    error_code: 'distill_blocked',
+    intercept: gateVerdict({ kind: 'block', by: 'distill', keyword: 'Memory-stage-one extractor' }),
+  })
+  logOne(store, {
+    status: 503,
+    via: 'refusal-guard',
+    final_state: 'refusal_device',
+    error_code: 'refusal_guard',
+    intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: 'device' }),
+  })
+
+  const stats = store.protocolEntryStats({ since: '1970-01-01T00:00:00.000Z' })
+  assert.equal(stats.total, 6)
+  assert.equal(stats.blocked, 2)
+  assert.equal(stats.passed, 4)
+  const passBy = Object.fromEntries(stats.passes.map((row) => [row.by, row.count]))
+  assert.deepEqual(passBy, { jev: 1, regex: 2, unknown: 1 })
+  const blockBy = Object.fromEntries(stats.blocks.map((row) => [`${row.by}:${row.keyword}`, row.count]))
+  assert.deepEqual(blockBy, { 'distill:Memory-stage-one extractor': 1, 'refusal:device': 1 })
 })
 
 test('queryNormal filters + pagination + total', () => {
@@ -478,6 +864,22 @@ test('sanitizeRequestBodySnapshot redacts secrets and summarizes tools', async (
   assert.ok(String(snap.messages[0].content).includes('…'))
 })
 
+test('sanitizeRequestBodySnapshot omits image bytes', async () => {
+  const { sanitizeRequestBodySnapshot } = await import('../../src/lib/admin/request-log.mjs')
+  const payload = 'iVBORw0KGgo'.repeat(20)
+  const snap = sanitizeRequestBodySnapshot({
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: payload } }],
+      },
+    ],
+  })
+  assert.equal(snap.messages[0].content[0].source.data, undefined)
+  assert.equal(snap.messages[0].content[0].source.bytes, payload.length)
+  assert.equal(JSON.stringify(snap).includes(payload), false)
+})
+
 test('setConfig hot-updates mode', () => {
   const s = tmpStore('normal')
   s.setConfig({ mode: 'debug', retainDays: 3 })
@@ -587,4 +989,117 @@ test('exportRows + csv/jsonl keep presented key and ip', () => {
   assert.match(csv, /198\.51\.100\.4/)
   const jsonl = logsToJsonl(items)
   assert.match(jsonl, /sk-export-plain/)
+})
+
+test('finish persists caller and outbound sessions (capped) and only known reasoning efforts', () => {
+  const store = tmpStore('normal')
+  const write = (extra) => {
+    const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
+    store.finish(ctx, { status: 200, ...extra })
+    return store.repo.getByRequestId(ctx.request_id)
+  }
+  const kept = write({
+    session_id: `  ${'s'.repeat(250)}  `,
+    outbound_session_id: '11111111-2222-4333-8444-555555555555',
+    reasoning_effort: 'xhigh',
+  })
+  assert.equal(kept.session_id, 's'.repeat(200))
+  assert.equal(kept.outbound_session_id, '11111111-2222-4333-8444-555555555555')
+  assert.equal(kept.reasoning_effort, 'xhigh')
+  const dropped = write({ session_id: '   ', outbound_session_id: '', reasoning_effort: 'turbo' })
+  assert.equal(dropped.session_id, null)
+  assert.equal(dropped.outbound_session_id, null)
+  assert.equal(dropped.reasoning_effort, null)
+})
+
+/** Minimal ServerResponse double: write/end/finish/getHeaders like node:http. */
+function fakeRes() {
+  const listeners = []
+  const res = {
+    statusCode: 200,
+    headers: {},
+    setHeader(k, v) {
+      this.headers[String(k).toLowerCase()] = v
+    },
+    getHeaders() {
+      return { ...this.headers }
+    },
+    write() {
+      return true
+    },
+    end() {
+      for (const fn of listeners.splice(0)) fn()
+    },
+    once(event, fn) {
+      if (event === 'finish') listeners.push(fn)
+    },
+  }
+  return res
+}
+
+test('debug mode records the exact client response; normal mode leaves res untouched', () => {
+  const store = new RequestLogStore({
+    dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-')),
+    mode: 'debug',
+    maxDebugBodyChars: 64,
+  })
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
+  const res = fakeRes()
+  store.tapResponse(ctx, res)
+  res.setHeader('content-type', 'text/event-stream')
+  res.setHeader('set-cookie', 'panel=secret')
+  res.write('event: message_start\ndata: {"a":1}\n\n')
+  res.write(Buffer.from('data: {"type":"content_block_delta","delta":{"text":"hello"}}\n\n'))
+  res.end('data: [DONE]\n\n')
+  store.finish(ctx, { status: 200 })
+  const rec = store.getDebug(ctx.request_id)
+  assert.equal(rec.response.status, 200)
+  assert.equal(rec.response.headers['content-type'], 'text/event-stream')
+  assert.equal(rec.response.headers['set-cookie'], '***REDACTED***')
+  assert.equal(rec.response.truncated, true)
+  assert.equal(rec.response.body.length, 64)
+  assert.ok(rec.response.body.startsWith('event: message_start'))
+  assert.ok(rec.response.bytes > 64)
+
+  const normal = tmpStore('normal')
+  const nctx = normal.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
+  const plain = fakeRes()
+  const write = plain.write
+  normal.tapResponse(nctx, plain)
+  assert.equal(plain.write, write)
+  assert.equal(nctx.response, undefined)
+})
+
+test('debug response body masks credentials that fit inside the capture window', () => {
+  const store = tmpStore('debug')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
+  const res = fakeRes()
+  store.tapResponse(ctx, res)
+  res.end('{"echo":"sk-ant-oat01-ABCDEFGH12345678"}')
+  store.finish(ctx, { status: 200 })
+  const body = store.getDebug(ctx.request_id).response.body
+  assert.doesNotMatch(body, /ABCDEFGH12345678/)
+  assert.match(body, /REDACTED/)
+})
+
+test('tenant log scope follows the slot owner at write time, not the current owner', () => {
+  const store = tmpStore()
+  store.db.exec(`
+    INSERT INTO users (id, email, username, password_hash) VALUES ('alice', 'a@x', 'alice', 'x'), ('bob', 'b@x', 'bob', 'x');
+    INSERT INTO vms (id, name, vm_json) VALUES ('vm-a', 'Slot A', '{}');
+  `)
+  logOne(store, { user_id: 'bob', vm_id: 'vm-a', error_code: 'upstream_error', status: 500 })
+  store.db.exec(`UPDATE vms SET owner_user_id = 'alice', origin = 'admin_assigned' WHERE id = 'vm-a'`)
+  const testChat = logOne(store, { api_key_kind: 'master', vm_id: 'vm-a', error_code: 'upstream_error', status: 500 })
+
+  const mine = store.queryNormal({ owner_user_id: 'alice' })
+  assert.deepEqual(
+    mine.items.map((r) => r.request_id),
+    [testChat.request_id],
+  )
+  assert.deepEqual(
+    store.windowStats({ owner_user_id: 'alice' }).error_collection.recent.map((r) => r.request_id),
+    [testChat.request_id],
+  )
+  assert.equal(store.queryNormal({}).total, 2)
 })

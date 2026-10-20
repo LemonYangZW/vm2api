@@ -1,5 +1,12 @@
 import { Link } from '@tanstack/react-router'
-import { ChevronsUpDown, LogOut, Settings } from 'lucide-react'
+import {
+  ChevronsUpDown,
+  Info,
+  ListChecks,
+  LogOut,
+  Settings,
+  Users,
+} from 'lucide-react'
 import { getDisplayNameInitials } from '@/lib/utils'
 import useDialogState from '@/hooks/use-dialog-state'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -75,9 +82,27 @@ export function NavUser({ user }: NavUserProps) {
               <DropdownMenuSeparator />
               <DropdownMenuGroup>
                 <DropdownMenuItem asChild>
+                  <Link to='/welcome'>
+                    <ListChecks />
+                    欢迎与引导
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
                   <Link to='/settings/$tab' params={{ tab: 'sticky' }}>
                     <Settings />
                     设置
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link to='/settings/$tab' params={{ tab: 'about' }}>
+                    <Info />
+                    关于 / 更新
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link to='/users'>
+                    <Users />
+                    用户
                   </Link>
                 </DropdownMenuItem>
               </DropdownMenuGroup>

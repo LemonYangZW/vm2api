@@ -1,7 +1,7 @@
 /**
  * Gateway model catalog.
  * Claude: console model-policy. GPT: gpt_model_policy from Codex /codex/models.
- * GET /v1/models returns both. Never hop a slot worker `/internal/v1/models`.
+ * GET /v1/models returns the families the key's group_type may schedule. Never hop a slot worker `/internal/v1/models`.
  */
 
 import {
@@ -59,14 +59,17 @@ function listGptPublicModels() {
   }
 }
 
-/** Local catalog for GET /v1/models and boot. Does not touch workers. */
-export function gatewayModelCatalog() {
+/**
+ * Local catalog for GET /v1/models and boot. Does not touch workers.
+ * groupType is the key's group_type: openai lists GPT only, anthropic lists Claude only, all lists both.
+ */
+export function gatewayModelCatalog({ groupType = 'all' } = {}) {
   seedModelCatalog()
   try {
     loadModelPolicy()
   } catch {}
-  const gpt = listGptPublicModels()
-  const claude = listOfficialModels()
+  const gpt = groupType === 'anthropic' ? [] : listGptPublicModels()
+  const claude = groupType === 'openai' ? [] : listOfficialModels()
   return {
     object: 'list',
     data: [...gpt, ...claude],
@@ -168,6 +171,12 @@ export function resolveCatalogModel(raw, ids = cache.ids) {
   const lower = bare.toLowerCase()
   if (FAMILY_ALIASES.has(lower)) {
     const fam = FAMILY_ALIASES.get(lower)
+    // Bare `opus` stays on the policy target. Rank would promote claude-opus-5-5;
+    // 2.1.280 uses that id only when the caller names it.
+    if (lower === 'opus') {
+      const pinned = resolvePolicyAliasToCatalog(lower, ids)
+      if (pinned) return { ok: true, model: pinned, alias: fam, want1m }
+    }
     const latest = latestIdForFamily(fam, ids)
     if (latest) return { ok: true, model: latest, alias: fam, want1m }
   }
@@ -193,7 +202,11 @@ export function setModelCatalog(ids, { source = 'go-slot-worker' } = {}) {
     ids: [
       ...new Set(
         (ids || [])
-          .map((id) => (id === 'claude-fable-5.1' ? 'claude-fable-5-1' : id))
+          .map((id) => {
+            if (id === 'claude-fable-5.1') return 'claude-fable-5-1'
+            if (id === 'claude-opus-5.5') return 'claude-opus-5-5'
+            return id
+          })
           .filter((id) => isCatalogModelId(id)),
       ),
     ],

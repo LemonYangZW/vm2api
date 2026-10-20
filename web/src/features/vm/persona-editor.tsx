@@ -11,6 +11,7 @@ import {
   slotPersonaPatchValue,
 } from '@/features/vm/persona-contract'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 export function VmPersonaEditor({ id, vm }: { id: string; vm: Vm }) {
   const qc = useQueryClient()
@@ -20,11 +21,12 @@ export function VmPersonaEditor({ id, vm }: { id: string; vm: Vm }) {
     configured
   )
   const inherits = configured === 'inherit'
+  const canEdit = useVmPerms().admin
   const inherit = useMutation({
     mutationFn: () =>
       patchVm(id, { persona_preset: slotPersonaPatchValue('inherit') }),
     onSuccess: async () => {
-      toast.success('出站协议已改为跟随设置 → 协议')
+      toast.success('出站协议已改为跟随 system提示词')
       await Promise.all([
         qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
@@ -49,16 +51,12 @@ export function VmPersonaEditor({ id, vm }: { id: string; vm: Vm }) {
       </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
         方案只在{' '}
-        <Link
-          to='/settings/$tab'
-          params={{ tab: 'protocol' }}
-          className='underline underline-offset-4'
-        >
-          设置 → 协议
+        <Link to='/system' className='underline underline-offset-4'>
+          system提示词
         </Link>{' '}
         修改。槽位覆盖会盖掉全局方案，这是上次第三方请求没带上官方完整提示词的原因。
       </p>
-      {inherits ? null : (
+      {inherits || !canEdit ? null : (
         <Button
           className='mt-3'
           variant='outline'

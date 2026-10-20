@@ -24,28 +24,44 @@ function installBrowser(hostname: string) {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('panel session storage', () => {
-  it('uses the HttpOnly server cookie on same-origin deployments', () => {
-    const values = installBrowser('ccmax20.cc')
+  it('stores the bearer token even on same-origin deployments', () => {
+    const values = installBrowser('console.example')
 
     setSession('secret-token', 'admin')
 
-    expect(values.get(LS_TOKEN)).toBeUndefined()
+    expect(values.get(LS_TOKEN)).toBe('secret-token')
     expect(values.get(LS_USER)).toBe('admin')
     expect(hasSession()).toBe(true)
   })
 
-  it('keeps the bearer fallback only for a separate API origin', () => {
-    const values = installBrowser('localhost')
-    setApiBase('https://ccmax20.cc')
+  it('stores the bearer token when apiBase is empty (HTTP IP install)', () => {
+    const values = installBrowser('203.0.113.10')
 
     setSession('secret-token', 'admin')
 
-    expect(values.get(LS_BASE)).toBe('https://ccmax20.cc')
+    expect(values.get(LS_TOKEN)).toBe('secret-token')
+    expect(hasSession()).toBe(true)
+  })
+
+  it('does not treat a leftover username as a session', () => {
+    const values = installBrowser('203.0.113.10')
+    values.set(LS_USER, 'admin')
+
+    expect(hasSession()).toBe(false)
+  })
+
+  it('keeps the bearer fallback for a separate API origin', () => {
+    const values = installBrowser('localhost')
+    setApiBase('http://127.0.0.1:8787')
+
+    setSession('secret-token', 'admin')
+
+    expect(values.get(LS_BASE)).toBe('http://127.0.0.1:8787')
     expect(values.get(LS_TOKEN)).toBe('secret-token')
   })
 
   it('calls the server logout endpoint without a readable bearer token', async () => {
-    installBrowser('ccmax20.cc')
+    installBrowser('console.example')
     const fetchMock = vi
       .fn()
       .mockResolvedValue(new Response('{}', { status: 200 }))

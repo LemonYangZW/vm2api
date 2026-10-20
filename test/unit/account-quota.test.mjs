@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { AccountQuota, extraHeadersFromLimitError } from '../../src/lib/pool/account-quota.mjs'
+import { parseResetMs } from '../../src/lib/pool/quota-window.mjs'
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-'))
@@ -20,6 +21,17 @@ test('ensure seeds account and is idempotent', () => {
   assert.equal(acc.email, 'a@x')
   assert.equal(acc.requests, 0)
   assert.equal(acc.unified['5h'].status, 'active')
+})
+
+test('a model entitlement rejection is persisted for that account and model', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-denied' })
+  q.markModelUnsupported('a-denied', 'claude-fable-5')
+  const until = q.repo.get('a-denied').unified.model_denied_until['claude-fable-5']
+  assert.ok(until > Date.now())
+  assert.ok(until <= Date.now() + 60 * 60_000)
+  q.clearModelUnsupported('a-denied', 'claude-fable-5')
+  assert.equal(q.repo.get('a-denied').unified.model_denied_until['claude-fable-5'], undefined)
 })
 
 function futureReset(msFromNow) {
@@ -115,7 +127,7 @@ test('ingestHeaders reads OpenAI prompt_tokens_details cache fields', () => {
     },
   )
   const acc = q.snapshot().accounts.find((a) => a.account_id === 'a-oa')
-  assert.equal(acc.tokens_in, 20)
+  assert.equal(acc.tokens_in, 6)
   assert.equal(acc.tokens_out, 4)
   assert.equal(acc.cache_read_tokens, 11)
   assert.equal(acc.cache_creation_tokens, 3)
@@ -155,17 +167,55 @@ test('cli rate_limit_event blocks via status', () => {
   assert.equal(gate.reason, 'quota_5h_cli')
 })
 
-test('extraHeadersFromLimitError fills Extra 5h when wrap omits headers', () => {
+test('official 26 percent does not trip the quota gate', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { safety_ratio: 0.85, block_on_5h: true, block_on_7d: true } },
+  })
+  q.ingestHeaders('pct-26', {
+    'anthropic-ratelimit-unified-5h-utilization': '26',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': futureReset(4 * 3600_000),
+  })
+  const gate = q.canAccept('pct-26')
+  assert.equal(gate.ok, true)
+  assert.equal(q.headerUnderSafety(q.repo.get('pct-26')), true)
+})
+
+test('extraHeadersFromLimitError fills Extra 5h + reset from the text when wrap omits headers', () => {
+  const now = Date.parse('2026-09-23T12:37:10Z')
   const filled = extraHeadersFromLimitError(
     "provider error: You've hit your limit · resets 7:50pm (America/New_York)",
     {},
+    now,
   )
   assert.equal(filled['anthropic-ratelimit-unified-5h-status'], 'rejected')
+  assert.equal(filled['anthropic-ratelimit-unified-5h-reset'], String(Date.parse('2026-09-23T23:50:00Z') / 1000))
+  const weekly = extraHeadersFromLimitError("You've hit your weekly limit · resets Sep 25, 3pm (UTC)", {}, now)
+  assert.equal(weekly['anthropic-ratelimit-unified-7d-status'], 'rejected')
+  assert.equal(weekly['anthropic-ratelimit-unified-5h-status'], undefined)
   const kept = extraHeadersFromLimitError('hit your limit', {
-    'anthropic-ratelimit-unified-5h-utilization': '0.4',
+    'anthropic-ratelimit-unified-5h-status': 'allowed_warning',
   })
-  assert.equal(kept['anthropic-ratelimit-unified-5h-utilization'], '0.4')
-  assert.equal(kept['anthropic-ratelimit-unified-5h-status'], undefined)
+  assert.equal(kept['anthropic-ratelimit-unified-5h-status'], 'allowed_warning')
+})
+
+test('limit error without a fresh reset does not inherit the elapsed reset', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const elapsed = String(Math.floor((Date.now() - 3_600_000) / 1000))
+  q.ingestHeaders('elapsed-5h', {
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-utilization': '0.4',
+    'anthropic-ratelimit-unified-5h-reset': elapsed,
+  })
+  q.ingestHeaders('elapsed-5h', extraHeadersFromLimitError('hit your limit', {}), null, {
+    exhausted: true,
+    countRequest: false,
+  })
+  const acc = q.repo.get('elapsed-5h')
+  assert.equal(acc.unified.headers['5h'].status, 'rejected')
+  assert.equal(acc.unified.headers['5h'].reset, null)
+  assert.ok(acc.unified.headers.exhausted_at)
 })
 
 test('cli rate_limit_event copies unifiedWindows utilization', () => {
@@ -378,11 +428,107 @@ test('usage ok plus fable 401 does not poison last_probe with revoke text', () =
   assert.equal(acc.unified.last_probe.error, null)
   assert.equal(acc.unified.last_probe.ok, true)
   assert.equal(acc.unified.fable.banned, false)
-  assert.equal(acc.unified.fable.plan_denied, true)
+  assert.equal(acc.unified.fable.plan_denied, false)
   q.clearGrantRevokeLeftover('acc-pro-401')
   const after = q.repo.get('acc-pro-401')
   assert.equal(after.unified.last_probe.error, null)
-  assert.equal(after.unified.fable.plan_denied, true)
+  assert.equal(after.unified.fable.plan_denied, false)
+  assert.equal(after.unified.account_tier, undefined)
+})
+
+test('Fable 403 does not classify Pro when official usage cannot verify the grant', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestOAuthUsage('acc-uncertain-403', {
+    ok: false,
+    usage_status: 500,
+    fable: { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-uncertain-403')
+  assert.equal(acc.unified.account_tier, undefined)
+  assert.equal(acc.unified.fable.plan_denied, false)
+})
+
+test('official usage without Fable evidence does not classify an unprobed account as Pro', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestOAuthUsage('acc-unprobed', {
+    ok: true,
+    usage_status: 200,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-unprobed')
+  assert.equal(acc.unified.account_tier, undefined)
+  assert.equal(acc.unified.fable, undefined)
+})
+
+test('complete official usage without Fable classifies Pro', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestOAuthUsage('acc-complete-pro', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-complete-pro')
+  assert.equal(acc.unified.usage_has_fable, false)
+  assert.equal(acc.unified.account_tier, 'pro')
+})
+
+test('complete official usage overrides a stale profile tier', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'acc-stale-profile' })
+  q.setAccountTier('acc-stale-profile', 'max', { source: 'profile' })
+  q.ingestOAuthUsage('acc-stale-profile', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-stale-profile')
+  assert.equal(acc.unified.account_tier, 'pro')
+  assert.equal(acc.unified.account_tier_source, 'usage')
+})
+
+test('setup-token usage scope failure preserves historical tier and does not mark grant dead', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'acc-setup-scope' })
+  q.setAccountTier('acc-setup-scope', 'max', { source: 'usage' })
+  q.ingestOAuthUsage('acc-setup-scope', {
+    ok: false,
+    usage_status: 403,
+    usage_scope_missing: true,
+    usage_error: '当前凭证缺少 user:profile scope，需导入完整 OAuth 后才能探测官方 /usage',
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-setup-scope')
+  assert.equal(acc.unified.account_tier, 'max')
+  assert.equal(acc.unified.fable, undefined)
+  assert.equal(acc.unified.last_probe.ok, false)
+  assert.match(acc.unified.last_probe.error, /user:profile/)
+})
+
+test('incomplete official usage without Fable does not downgrade a stored Max', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'acc-incomplete-max' })
+  q.setAccountTier('acc-incomplete-max', 'max', { source: 'usage' })
+  q.ingestOAuthUsage('acc-incomplete-max', {
+    ok: true,
+    usage_status: 200,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-incomplete-max')
+  assert.equal(acc.unified.usage_has_fable, undefined)
+  assert.equal(acc.unified.account_tier, 'max')
 })
 
 test('clearGrantRevokeLeftover drops stale revoke after refresh', () => {
@@ -402,7 +548,8 @@ test('clearGrantRevokeLeftover drops stale revoke after refresh', () => {
   const acc = q.repo.get('acc-stale')
   assert.equal(acc.unified.last_probe.error, null)
   assert.equal(acc.unified.fable.banned, false)
-  assert.equal(acc.unified.fable.plan_denied, true)
+  assert.equal(acc.unified.fable.plan_denied, false)
+  assert.equal(acc.unified.account_tier, undefined)
 })
 
 test('clearGrantRevokeLeftover keeps stored Max off leftover Fable revoke', () => {
@@ -413,6 +560,8 @@ test('clearGrantRevokeLeftover keeps stored Max off leftover Fable revoke', () =
   q.ingestOAuthUsage('acc-max', {
     ok: true,
     usage_status: 200,
+    limits_present: true,
+    usage_has_fable: true,
     five_hour: { utilization: 0, status: 'allowed' },
     seven_day: { utilization: 0, status: 'allowed' },
     fable: { ok: true, status: 200, model: 'claude-fable-5' },
@@ -448,13 +597,14 @@ test('fable 429 without 7d_oi window does not invent a full Fable quota', () => 
   })
   const acc = q.repo.get('acc-pro')
   assert.equal(acc.unified.fable.limited, false)
-  assert.equal(acc.unified.fable.plan_denied, true)
+  assert.equal(acc.unified.fable.plan_denied, false)
+  assert.equal(acc.unified.account_tier, undefined)
   assert.equal(acc.unified['7d_oi']?.status || null, null)
   assert.equal(q.canAccept('acc-pro').ok, true)
   assert.equal(q.fableWindowLimited('acc-pro'), false)
 })
 
-test('pro usage probe without fable hop clears leftover 429 as plan_denied', () => {
+test('official usage without Fable hop does not turn leftover 429 into Pro', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
@@ -474,7 +624,7 @@ test('pro usage probe without fable hop clears leftover 429 as plan_denied', () 
     },
     probed_at: '2026-08-22T00:00:00Z',
   })
-  assert.equal(q.repo.get('acc-pro-skip').unified.account_tier, 'pro')
+  assert.equal(q.repo.get('acc-pro-skip').unified.account_tier, undefined)
   q.ingestOAuthUsage('acc-pro-skip', {
     ok: true,
     usage_status: 200,
@@ -484,10 +634,43 @@ test('pro usage probe without fable hop clears leftover 429 as plan_denied', () 
     probed_at: '2026-08-24T00:00:00Z',
   })
   const acc = q.repo.get('acc-pro-skip')
-  assert.equal(acc.unified.fable.plan_denied, true)
+  assert.equal(acc.unified.fable.plan_denied, false)
   assert.equal(acc.unified.fable.ok, false)
-  assert.equal(acc.unified.fable.error, 'plan_denied')
-  assert.equal(acc.unified.account_tier, 'pro')
+  assert.equal(acc.unified.fable.error, 'Error')
+  assert.equal(acc.unified.account_tier, undefined)
+})
+
+test('Fable hop alone does not classify Pro; complete usage can flip stored Pro to Max', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
+  })
+  q.ingestOAuthUsage('acc-mispro', {
+    ok: true,
+    usage_status: 200,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, status: 'allowed' },
+    fable: { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
+    probed_at: '2026-08-22T00:00:00Z',
+  })
+  assert.equal(q.repo.get('acc-mispro').unified.account_tier, undefined)
+  q.setAccountTier('acc-mispro', 'pro', { source: 'usage' })
+  q.ingestOAuthUsage('acc-mispro', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: true,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, resets_at: '2026-08-24T00:00:00Z', status: 'allowed' },
+    seven_day_oi: { utilization: 0.21, resets_at: '2026-08-24T00:00:00Z', status: 'allowed' },
+    fable: { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
+    probed_at: '2026-08-24T00:00:00Z',
+  })
+  const acc = q.repo.get('acc-mispro')
+  assert.equal(acc.unified.account_tier, 'max')
+  assert.equal(acc.unified.usage_has_fable, true)
+  assert.equal(acc.unified.fable.plan_denied, false)
+  assert.equal(acc.unified.fable.ok, true)
 })
 
 test('7d_oi window is Fable-only and does not block the account', () => {
@@ -495,15 +678,71 @@ test('7d_oi window is Fable-only and does not block the account', () => {
     dataDir: tmpDir(),
     config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
   })
+  const reset = futureReset(7 * 24 * 3600_000)
   q.ingestHeaders('acc-oi', {
     'anthropic-ratelimit-unified-7d_oi-utilization': '1',
     'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
-    'anthropic-ratelimit-unified-7d_oi-reset': '2026-08-25T00:00:00Z',
+    'anthropic-ratelimit-unified-7d_oi-reset': reset,
     'anthropic-ratelimit-unified-representative-claim': 'seven_day_overage_included',
   })
   assert.equal(q.canAccept('acc-oi').ok, true)
   assert.equal(q.fableWindowLimited('acc-oi'), true)
-  assert.equal(q.fableWindowResetAt('acc-oi'), Date.parse('2026-08-25T00:00:00Z'))
+  assert.equal(q.fableWindowResetAt('acc-oi'), Date.parse(reset))
+})
+
+test('7d_oi rejected with elapsed second-level reset is not Fable-limited', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
+  })
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792206000'
+  const acc = q.ensure({ account_id: 'acc-oi-elapsed' })
+  acc.unified['7d_oi'] = {
+    utilization: 1,
+    reset: resetSec,
+    status: 'rejected',
+    claim: 'seven_day_overage_included',
+  }
+  q.repo.save(acc)
+  assert.ok(parseResetMs(resetSec) <= now)
+  assert.equal(q.fableWindowLimited('acc-oi-elapsed', now), false)
+  assert.equal(q.fableWindowResetAt('acc-oi-elapsed'), parseResetMs(resetSec))
+})
+
+test('7d_oi rejected without reset stays Fable-limited', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const acc = q.ensure({ account_id: 'acc-oi-no-reset' })
+  acc.unified['7d_oi'] = { utilization: 1, status: 'rejected' }
+  q.repo.save(acc)
+  assert.equal(q.fableWindowLimited('acc-oi-no-reset'), true)
+  assert.equal(q.fableWindowResetAt('acc-oi-no-reset'), null)
+})
+
+test('7d_oi rejected with future second-level reset stays Fable-limited', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792810800'
+  const acc = q.ensure({ account_id: 'acc-oi-future' })
+  acc.unified['7d_oi'] = { utilization: 1, reset: resetSec, status: 'rejected' }
+  q.repo.save(acc)
+  assert.ok(parseResetMs(resetSec) > now)
+  assert.equal(q.fableWindowLimited('acc-oi-future', now), true)
+  assert.equal(q.fableWindowResetAt('acc-oi-future'), parseResetMs(resetSec))
+})
+
+test('persistEffectiveWindows clears elapsed unified 7d_oi', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const acc = q.ensure({ account_id: 'acc-wipe-oi' })
+  acc.unified['7d_oi'] = { utilization: 1, reset: '1792206000', status: 'rejected' }
+  acc.unified.headers = { '5h': { utilization: 0.1, status: 'allowed', reset: '2099-01-01T00:00:00Z' } }
+  q.repo.save(acc)
+  q.persistEffectiveWindows('acc-wipe-oi', { now })
+  const oi = q.repo.get('acc-wipe-oi').unified['7d_oi']
+  assert.equal(oi.utilization, 0)
+  assert.equal(oi.status, 'active')
+  assert.equal(oi.stale_reason, 'reset_elapsed')
 })
 
 test('probe 5h rejected with no last_used stays a hard block until reset', () => {
@@ -522,6 +761,26 @@ test('probe 5h rejected with no last_used stays a hard block until reset', () =>
   const acc = q.snapshot().accounts.find((a) => a.account_id === 'acc-sticky')
   assert.equal(Number(acc.unified['5h'].utilization), 1)
   assert.equal(acc.unified['5h'].status, 'rejected')
+})
+
+test('official probe fills Extra reset when Extra has usage but no reset', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-no-reset', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.44',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  })
+  assert.equal(q.repo.get('acc-no-reset').unified.headers['5h'].reset, null)
+  const reset = futureReset(4 * 3600_000)
+  q.ingestOAuthUsage('acc-no-reset', {
+    ok: true,
+    source: 'official-cc-usage',
+    five_hour: { utilization: 0.12, status: 'allowed', resets_at: reset },
+    seven_day: { utilization: 0.08, status: 'allowed', resets_at: futureReset(6 * 24 * 3600_000) },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-no-reset')
+  assert.equal(acc.unified.headers['5h'].utilization, 0.44)
+  assert.equal(acc.unified.headers['5h'].reset, reset)
 })
 
 test('official leftover 100% does not overwrite live Extra allowed', () => {
@@ -664,6 +923,39 @@ test('429 unified exhausted marks headers rejected without inventing official 10
   assert.equal(q.canAccept('acc-429').ok, false)
 })
 
+test('local 429 without quota evidence does not reject the 5h window', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-local-429', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.23',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '0.04',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+  })
+  q.ingestHeaders('acc-local-429', {}, null, { status: 429, exhausted: false, countRequest: false })
+  q.ingestHeaders('acc-local-503', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.23',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  })
+  q.ingestHeaders('acc-local-503', {}, null, { status: 503, exhausted: false, countRequest: false })
+  const local = q.repo.get('acc-local-429')
+  assert.equal(local.unified.headers['5h'].status, 'allowed')
+  assert.equal(local.unified.headers['5h'].utilization, 0.23)
+  assert.equal(local.unified.headers['7d'].status, 'allowed')
+  assert.equal(q.repo.get('acc-local-503').unified.headers['5h'].status, 'allowed')
+  q.ingestHeaders(
+    'acc-header-429',
+    {
+      'anthropic-ratelimit-unified-5h-utilization': '0.9',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+    },
+    null,
+    { status: 429, exhausted: false, countRequest: false },
+  )
+  assert.equal(q.repo.get('acc-header-429').unified.headers['5h'].status, 'rejected')
+  assert.equal(q.canAccept('acc-local-429').ok, true)
+  assert.equal(q.canAccept('acc-header-429').ok, false)
+})
+
 test('stuck 5h header with growing tokens does not lift official utilization', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
@@ -751,7 +1043,7 @@ test('persistEffectiveWindows clears leftover quota cooldown when official is un
   assert.equal(q.canAccept('acc-reconcile').ok, true)
 })
 
-test('official 0.44 allowed overwrites local 0.85 and clears quota cooldown', () => {
+test('official 0.44 allowed overwrites local 0.9 and clears quota cooldown', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: { quota: { safety_ratio: 0.85, block_on_5h: true, block_on_7d: true } },
@@ -773,7 +1065,8 @@ test('official 0.44 allowed overwrites local 0.85 and clears quota cooldown', ()
   q.ingestOAuthUsage('acc-clear', {
     ok: true,
     source: 'official-cc-usage',
-    five_hour: { utilization: 0.85, status: 'allowed', resets_at: futureReset(4 * 3600_000) },
+    // 0.85 line + 0.05 default overshoot.
+    five_hour: { utilization: 0.9, status: 'allowed', resets_at: futureReset(4 * 3600_000) },
     seven_day: { utilization: 0.36, status: 'allowed' },
     probed_at: new Date().toISOString(),
   })
@@ -935,4 +1228,23 @@ test('elapsed header reset wipes Extra and becomes schedulable', () => {
   const saved = q.persistEffectiveWindows('acc-wipe')
   assert.equal(Number(saved.unified.headers['5h'].utilization), 0)
   assert.equal(saved.unified.headers['5h'].status, 'active')
+})
+
+test('complete usage may replace a profile-sourced tier', async () => {
+  const quota = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  quota.ensure({ account_id: 'acct-profile', vm_id: 'vm-01' })
+  quota.setAccountTier('acct-profile', 'pro', { source: 'profile' })
+  quota.setAccountTier('acct-profile', 'max')
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'pro')
+  quota.ingestOAuthUsage('acct-profile', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: true,
+    seven_day_oi: { utilization: 0.2, resets_at: '2026-09-30T00:00:00Z' },
+  })
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier_source, 'usage')
+  quota.setAccountTier('acct-profile', 'max', { source: 'profile' })
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
 })

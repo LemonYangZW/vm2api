@@ -1,8 +1,7 @@
 /**
  * OAuth credential normalization + metadata persistence.
  *
- * Host Node is the only writer of slot credentials.json and the only
- * refresh owner (grant_type=refresh_token over bound SOCKS5).
+ * The slot worker owns refresh and writes slot credentials.json.
  * Slot kernel/CLI read AT; vm.json / SQLite / panel keep metadata only.
  *
  * persistOauthToVm writes presence flags + expiry/identity, then strips
@@ -13,8 +12,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
-import { credentialModeFromOauth, isApiKeyMode } from './credential-mode.mjs'
+import {
+  credentialModeFromOauth,
+  isApiKeyMode,
+  isAnySetupTokenMode,
+  isOfficialSetupTokenMode,
+  isSetupTokenMode,
+} from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
+import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
 
@@ -56,13 +62,14 @@ export function normalizeOauth(cred = {}) {
   if (exp && exp > 10_000_000_000) exp = Math.floor(exp / 1000)
   if (!exp && cred.expires_in) exp = Math.floor(Date.now() / 1000) + Number(cred.expires_in)
   const scopes = Array.isArray(cred.scopes) ? cred.scopes.filter(Boolean) : []
+  const identity = flattenOauthIdentity(cred)
   return {
     access_token: access,
     refresh_token: refresh,
     expires_at: exp || null,
-    email: cred.email || cred.email_address || cred.emailAddress || null,
-    account_uuid: cred.account_uuid || cred.accountUuid || null,
-    org_uuid: cred.org_uuid || cred.orgUuid || null,
+    email: identity.email,
+    account_uuid: identity.account_uuid,
+    org_uuid: identity.org_uuid,
     scope: cred.scope || (scopes.length ? scopes.join(' ') : null),
     source: cred.source || null,
     session_key: cred.session_key || cred.sessionKey || null,
@@ -121,12 +128,24 @@ export function slotWorkerCredentialPath(homeDir) {
 /**
  * Official CLI reads ~/.claude/.credentials.json. One store: symlink
  * that name onto host-owned credentials.json so wrap cannot copy RT.
+ * A fresh slot has neither file. Create the worker file first; otherwise
+ * official login writes a separate .credentials.json that the worker never reads.
  */
-export function ensureOfficialCredentialLink(homeDir, { uid, gid } = {}) {
+export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
-  if (!homeDir || !fs.existsSync(workerFile)) return { wrote: false, error: 'worker credentials.json missing' }
+  if (!homeDir) return { wrote: false, error: 'home missing' }
+  if (!fs.existsSync(workerFile)) {
+    if (!create) return { wrote: false, error: 'worker credentials.json missing' }
+    fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(workerFile, '{}\n', { mode: 0o600 })
+    if (uid != null && gid != null) {
+      try {
+        fs.chownSync(workerFile, uid, gid)
+      } catch {}
+    }
+  }
   fs.mkdirSync(claudeDir, { recursive: true })
   try {
     const st = fs.lstatSync(officialFile)
@@ -185,10 +204,15 @@ export function readWorkerCredentialFile(homeDir) {
     const scope = Array.isArray(oauth.scopes) ? oauth.scopes.join(' ') : oauth.scope || null
     const mode = credentialModeFromOauth({
       type: doc.type || oauth.type,
+      mode: doc.mode || oauth.mode,
       scope,
       scopes: oauth.scopes,
       access_token: oauth.accessToken || oauth.access_token,
+      refresh_token: oauth.refreshToken || oauth.refresh_token,
+      source: oauth.source,
+      flavor: oauth.flavor,
     })
+
     return {
       type: mode,
       mode,
@@ -199,6 +223,7 @@ export function readWorkerCredentialFile(homeDir) {
       account_uuid: oauth.accountUuid || oauth.account_uuid || null,
       org_uuid: oauth.orgUuid || oauth.org_uuid || null,
       scope,
+      subscription_type: oauth.subscriptionType || oauth.subscription_type || null,
       source: 'go-slot-worker',
       auth_scheme: resolveAuthScheme({
         mode,
@@ -212,14 +237,62 @@ export function readWorkerCredentialFile(homeDir) {
 }
 const SLOT_CLAUDE_FILES = ['credentials.json', 'credentials.json.lock', '.credentials.json']
 
+function slotIndexFromText(value) {
+  const s = String(value || '')
+  const m = s.match(/^vm-(\d+)$/i) || s.match(/^0*(\d+)$/)
+  return m ? Number(m[1]) : null
+}
+
+/** Container --user. Non-numeric ids share index 1, matching socksUidFor. */
+export function slotRuntimeOwner(vm) {
+  const n = slotIndexFromText(vm?.id) || slotIndexFromText(vm?.name) || 1
+  const base = Number(process.env.KIN_VM_UID_BASE || 10000)
+  const gid = Number(process.env.KIN_VM_GID || 987)
+  return {
+    uid: (Number.isFinite(base) ? base : 10000) + n,
+    gid: Number.isFinite(gid) ? gid : 987,
+  }
+}
+
+/** Best-effort. Non-root tests cannot chown; the write must still publish. */
+export function chownSlotRuntimeFile(filePath, vm) {
+  if (!filePath || !vm?.id) return false
+  const { uid, gid } = slotRuntimeOwner(vm)
+  try {
+    const st = fs.statSync(filePath)
+    if (st.uid === uid && st.gid === gid) return false
+    fs.chownSync(filePath, uid, gid)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Temp + rename drops the previous inode. chown the temp first so the
+ * published 0600 file is already the slot uid. Otherwise kin-kernel
+ * (container PID 1) gets EACCES and docker --restart loops.
+ */
+export function replaceSlotOwnedFile(filePath, body, vm) {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    fs.writeFileSync(tempPath, body, { mode: 0o600 })
+    chownSlotRuntimeFile(tempPath, vm)
+    fs.renameSync(tempPath, filePath)
+  } catch (error) {
+    try {
+      fs.rmSync(tempPath, { force: true })
+    } catch {}
+    throw error
+  }
+}
+
 export function slotUidGidFromHomeDir(homeDir) {
-  const m = String(homeDir || '')
+  const id = String(homeDir || '')
     .replace(/\\/g, '/')
-    .match(/\/(vm-\d+)\/cli-home\/?$/i)
-  if (!m) return null
-  const n = Number(String(m[1]).slice(3))
-  if (!Number.isFinite(n) || n < 1) return null
-  return { uid: 10000 + n, gid: Number(process.env.KIN_VM_GID || 987) }
+    .match(/\/([^/]+)\/cli-home\/?$/i)?.[1]
+  if (!id) return null
+  return slotRuntimeOwner({ id })
 }
 
 export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
@@ -255,12 +328,13 @@ function chownSlotCredentialFile(homeDir, file) {
 
 function sealSlotCredentialFile(file) {
   if (!file) return
+  // Slot Claude must not rewrite the shared RT; that drops kinGeneration.
   try {
     fs.chmodSync(file, 0o444)
   } catch {}
 }
 
-/** Write slot credentials.json. Host import/refresh is the only writer. */
+/** Write slot credentials.json for imports and worker-owned credential updates. */
 
 export function writeWorkerCredentialFile(homeDir, cred) {
   const file = slotWorkerCredentialPath(homeDir)
@@ -294,32 +368,85 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   }
   const n = normalizeOauth(cred)
   if (!n.access_token && !n.refresh_token) return null
-  const scopes = Array.isArray(cred.scopes)
+  let scopes = Array.isArray(cred.scopes)
     ? cred.scopes.filter(Boolean)
     : String(n.scope || cred.scope || '')
         .split(/\s+/)
         .filter(Boolean)
+  if (isOfficialSetupTokenMode(mode)) {
+    scopes = ['user:inference']
+  } else if (isSetupTokenMode(mode)) {
+    scopes = scopes.map((s) => (s === 'inference' ? 'user:inference' : s))
+    if (!scopes.includes('user:inference')) scopes = ['user:inference']
+  }
   const expiresAtMs = expiresAtToMs(n.expires_at) || null
+  let previousType = null
+  try {
+    const prev = JSON.parse(fs.readFileSync(file, 'utf8'))
+    previousType = normalizeSubscriptionType(prev?.claudeAiOauth?.subscriptionType)
+  } catch {}
+  const subscriptionType =
+    normalizeSubscriptionType(cred.subscription_type || cred.subscriptionType) ||
+    normalizeSubscriptionType(cred.account_tier) ||
+    previousType
   const oauth = {
     accessToken: n.access_token || '',
   }
-  if (n.refresh_token) oauth.refreshToken = n.refresh_token
+  if (n.refresh_token && !isOfficialSetupTokenMode(mode)) oauth.refreshToken = n.refresh_token
   if (expiresAtMs) oauth.expiresAt = expiresAtMs
   if (n.email) oauth.email = n.email
   if (n.account_uuid) oauth.accountUuid = n.account_uuid
   if (n.org_uuid) oauth.orgUuid = n.org_uuid
   if (scopes.length) oauth.scopes = scopes
-  if (mode === 'setup-token') oauth.type = 'setup-token'
+  if (isAnySetupTokenMode(mode)) oauth.type = mode
+
+  if (subscriptionType) oauth.subscriptionType = subscriptionType
+  const generation = Number(n._token_version || cred.kinGeneration || cred.kin_generation) || Date.now()
+  oauth.kinGeneration = generation
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   ensureSlotClaudeOwnership(homeDir)
   try {
     if (fs.existsSync(file)) fs.chmodSync(file, 0o600)
   } catch {}
-  atomicWriteJson(file, { type: mode, authScheme, claudeAiOauth: oauth }, { mode: 0o600 })
+  atomicWriteJson(file, { type: mode, authScheme, kinGeneration: generation, claudeAiOauth: oauth }, { mode: 0o600 })
   chownSlotCredentialFile(homeDir, file)
   sealSlotCredentialFile(file)
   ensureOfficialCredentialLink(homeDir)
   return file
+}
+
+/**
+ * Old slot files predate subscriptionType. Fill from the identified plan,
+ * otherwise pro; repair the legacy pro fallback for an identified Max slot.
+ */
+export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
+  const file = slotWorkerCredentialPath(homeDir)
+  if (!file || !fs.existsSync(file)) return { wrote: false, reason: 'missing' }
+  let doc
+  try {
+    doc = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return { wrote: false, reason: 'unreadable' }
+  }
+  const oauth = doc?.claudeAiOauth
+  if (!oauth || typeof oauth !== 'object') return { wrote: false, reason: 'no_oauth' }
+  const present = normalizeSubscriptionType(oauth.subscriptionType)
+  const identified = normalizeSubscriptionType(accountTier)
+  // Startup summaries used to lose the identified tier and write pro. A pro
+  // hint may itself be a default, so it must not downgrade an existing plan.
+  if (present && !(present === 'pro' && identified === 'max')) {
+    chownSlotCredentialFile(homeDir, file)
+    return { wrote: false, reason: 'present' }
+  }
+
+  const tier = identified || 'pro'
+  oauth.subscriptionType = tier
+  try {
+    fs.chmodSync(file, 0o600)
+  } catch {}
+  atomicWriteJson(file, doc, { mode: 0o600 })
+  chownSlotCredentialFile(homeDir, file)
+  return { wrote: true, subscriptionType: tier }
 }
 
 export function persistSlotAuthScheme(projectRoot, vmId, rawScheme) {
@@ -402,6 +529,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   const rotated =
     !!(nextExp && prevExp && nextExp > prevExp + 2000) ||
     !!(n._token_version && prev._token_version && Number(n._token_version) > Number(prev._token_version))
+  const mode = credentialModeFromOauth({ ...cred, mode: cred?.mode || cred?.type || prev.mode })
   vm.claude = stripCredentialSecrets({ ...prev })
   if (n.access_token || cred.has_access || cred.has_api_key || cred.api_key) vm.claude.has_access = true
   if (n.refresh_token || cred.has_refresh) vm.claude.has_refresh = true
@@ -409,10 +537,19 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   if (n.email) vm.claude.email = n.email
   if (n.account_uuid) vm.claude.account_uuid = n.account_uuid
   if (n.org_uuid) vm.claude.org_uuid = n.org_uuid
-  if (n.scope) vm.claude.scope = n.scope
+  if (isOfficialSetupTokenMode(mode)) {
+    vm.claude.scope = 'user:inference'
+  } else if (n.scope) {
+    vm.claude.scope = isSetupTokenMode(mode) && n.scope === 'inference' ? 'user:inference' : n.scope
+  } else if (isSetupTokenMode(mode)) {
+    vm.claude.scope = 'user:inference'
+  }
   if (n.source) vm.claude.source = n.source
-  const mode = credentialModeFromOauth({ ...cred, mode: cred?.mode || cred?.type || vm.claude.mode })
   vm.claude.mode = mode
+  if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
+    vm.claude.account_tier = 'pro'
+    vm.claude.account_tier_source = vm.claude.account_tier_source || 'default'
+  }
   vm.claude.auth_scheme = resolveAuthScheme({
     mode,
     auth_scheme: cred.auth_scheme || cred.authScheme || prev.auth_scheme,
@@ -422,7 +559,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
     vm.claude.has_refresh = false
     delete vm.claude.expires_at
     delete vm.claude.scope
-  } else if (mode === 'setup-token' && !n.refresh_token) {
+  } else if (isOfficialSetupTokenMode(mode) || (isSetupTokenMode(mode) && !n.refresh_token)) {
     delete vm.claude.has_api_key
     vm.claude.has_refresh = false
   } else {
@@ -444,11 +581,74 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   return vm
 }
 
+function isQuotaParkReason(reason) {
+  return /^(quota_5h|quota_7d)|account_quota_exhausted|^rate_limited$/i.test(String(reason || ''))
+}
+
 function clearClaudeAuthCooldown(claude = {}) {
   delete claude.temp_unschedulable_until
   delete claude.temp_unschedulable_reason
   delete claude.oauth_401_generation
   return claude
+}
+
+/** Quota / 429 / account cooldown: same temp_unschedulable_* store as auth park. */
+export function markVmRestriction(vmPath, { until, reason } = {}) {
+  if (!vmPath || !fs.existsSync(vmPath)) return null
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  vm.claude = { ...(vm.claude || {}) }
+  const untilMs = Number(until) || 0
+  if (untilMs > Date.now()) {
+    vm.claude.temp_unschedulable_until = untilMs
+    vm.temp_unschedulable_until = untilMs
+  }
+  const why = reason || 'restricted'
+  vm.claude.temp_unschedulable_reason = why
+  vm.temp_unschedulable_reason = why
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(vmPath, vm)
+  return vm
+}
+
+/** Drop quota/429 restriction only. Auth parks stay. */
+export function clearVmQuotaRestriction(vmPath) {
+  if (!vmPath || !fs.existsSync(vmPath)) return null
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  const reason = vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason
+  if (!isQuotaParkReason(reason)) return vm
+  vm.claude = { ...(vm.claude || {}) }
+  delete vm.claude.temp_unschedulable_until
+  delete vm.claude.temp_unschedulable_reason
+  delete vm.temp_unschedulable_until
+  delete vm.temp_unschedulable_reason
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(vmPath, vm)
+  return vm
+}
+
+function isRecoverableCooldownReason(reason) {
+  const text = String(reason || '')
+  if (!text) return true
+  if (/oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|credential_refresh_failed/i.test(text)) {
+    return false
+  }
+  return true
+}
+
+/** Operator recovery: drop quota, RPM, and provider cooldown. Dead grants stay parked. */
+export function clearRecoverableVmCooldown(vmPath) {
+  if (!vmPath || !fs.existsSync(vmPath)) return null
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  const reason = vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason
+  if (!isRecoverableCooldownReason(reason)) return vm
+  vm.claude = { ...(vm.claude || {}) }
+  delete vm.claude.temp_unschedulable_until
+  delete vm.claude.temp_unschedulable_reason
+  delete vm.temp_unschedulable_until
+  delete vm.temp_unschedulable_reason
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(vmPath, vm)
+  return vm
 }
 
 /** First messages 401: park the slot without burning the grant. */
@@ -476,6 +676,7 @@ export function healLeftoverAuthState(vmPath) {
   const reason = String(
     vm.schedule_disabled_reason || vm.claude.refresh_error || vm.claude.temp_unschedulable_reason || '',
   )
+  if (isQuotaParkReason(vm.claude.temp_unschedulable_reason || vm.temp_unschedulable_reason)) return vm
   if (/oauth_revoked|oauth_invalid_grant|token has been revoked/i.test(reason)) return vm
   const had =
     vm.claude.temp_unschedulable_until || vm.claude.temp_unschedulable_reason || vm.claude.oauth_401_generation
@@ -492,6 +693,7 @@ export function clearVmAuthCooldown(vmPath) {
   if (!vmPath || !fs.existsSync(vmPath)) return null
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   if (!vm.claude) return vm
+  if (isQuotaParkReason(vm.claude.temp_unschedulable_reason || vm.temp_unschedulable_reason)) return vm
   const had =
     vm.claude.temp_unschedulable_until || vm.claude.temp_unschedulable_reason || vm.claude.oauth_401_generation
   if (!had) return vm

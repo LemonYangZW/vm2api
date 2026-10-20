@@ -35,6 +35,12 @@ function seedVm(root, id = 'vm-01') {
   )
 }
 
+function seedRouting(root) {
+  const configDir = path.join(root, 'src', 'config')
+  fs.mkdirSync(configDir, { recursive: true })
+  fs.writeFileSync(path.join(configDir, 'routing.json'), JSON.stringify({}))
+}
+
 async function startLoopbackServer(t, respond) {
   const calls = []
   const server = http.createServer(async (req, res) => {
@@ -71,6 +77,7 @@ test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a w
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-v1-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedVm(root)
+  seedRouting(root)
 
   const { baseUrl, calls } = await startLoopbackServer(t, () => ({
     status: 200,
@@ -113,17 +120,22 @@ test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a w
   assert.ok(!result.log.some((l) => /Go slot worker|streamGoWorker|callGoWorker/i.test(l.message)))
 })
 
-test('testChatCredentialMode treats inference-only as setup-token', () => {
+test('testChatCredentialMode treats inference-only as official-setup-token', () => {
   assert.equal(testChatCredentialMode({ claude: { mode: 'setup-token' } }), 'setup-token')
-  assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:inference' } }), 'setup-token')
+  assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:inference' } }), 'official-setup-token')
   assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:profile user:inference' } }), 'oauth')
   assert.equal(testChatCredentialMode({ claude: { mode: 'apikey' } }), 'apikey')
+  assert.equal(
+    testChatCredentialMode({ claude: { mode: 'setup-token', source: 'claude-setup-token', scope: 'user:inference' } }),
+    'official-setup-token',
+  )
 })
 
 test('runVmTestChat uses unofficial inbound for setup-token', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-st-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedVm(root, 'vm-05')
+  seedRouting(root)
   const vmPath = path.join(root, 'vms', 'vm-05.json')
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   vm.claude.mode = 'setup-token'
@@ -149,7 +161,7 @@ test('runVmTestChat uses unofficial inbound for setup-token', async (t) => {
   })
 
   assert.equal(result.ok, false)
-  assert.equal(result.credential_mode, 'setup-token')
+  assert.equal(result.credential_mode, 'official-setup-token')
   assert.equal(result.debug.inbound_class, 'cli_hop_passthrough')
   assert.equal(calls[0].headers['user-agent'], 'kin-console-test/1.0')
   assert.equal(calls[0].headers['anthropic-beta'], undefined)
@@ -177,10 +189,11 @@ test('health probe mode uses the full official Claude Code prompt', () => {
     rewrite: true,
   })
   assert.equal(inbound.system.length, 4)
-  assert.equal(inbound.system[1].text, CRS_OFFICIAL_SYSTEM)
-  assert.equal(inbound.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
-  assert.deepEqual(inbound.system[2].cache_control, { type: 'ephemeral', ttl: '5m' })
-  assert.match(inbound.system[3].text, /# Environment/)
+  assert.equal(inbound.system[0].text, CRS_OFFICIAL_SYSTEM)
+  assert.equal(inbound.system[1].text, CRS_OFFICIAL_AGENT_PROMPT)
+  assert.deepEqual(inbound.system[1].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.match(inbound.system[2].text, /# Environment/)
+  assert.deepEqual(inbound.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), true)
 })
 
@@ -215,10 +228,49 @@ test('runVmTestChat reports cli-hop when slot engine is rust', async (t) => {
   })
   assert.equal(result.ok, true)
   assert.equal(result.inference_engine, 'rust')
+  assert.equal(result.dataplane, 'wrap')
   assert.equal(result.official_cc_inference, 'cli-hop')
   assert.equal(result.debug.inbound_class, 'cli_hop_passthrough')
   assert.equal(calls[0].headers['user-agent'], 'kin-console-test/1.0')
   assert.equal(calls[0].body.system, undefined)
   assert.ok(result.log.some((l) => /cli-hop wrap/.test(l.message)))
-  assert.ok(result.log.some((l) => /cli-hop 0注入|cli-hop 透传入站/.test(l.message)))
+  assert.ok(result.log.some((l) => /cli-hop CLI 官方提示词/.test(l.message)))
+})
+
+test('runVmTestChat reports crag dataplane when routing says crag', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-crag-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seedVm(root, 'vm-13')
+  fs.mkdirSync(path.join(root, 'src/config'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'src/config/routing.json'),
+    JSON.stringify({ inference: { engine: 'rust', dataplane: 'crag', fallback_to_go: false, strict: true } }),
+  )
+  const { baseUrl } = await startLoopbackServer(t, () => ({
+    status: 200,
+    body: {
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-haiku-4-5-20251001',
+      content: [{ type: 'text', text: 'hi' }],
+      usage: { input_tokens: 8, output_tokens: 2 },
+      stop_reason: 'end_turn',
+    },
+  }))
+  const result = await runVmTestChat({
+    projectRoot: root,
+    vmId: 'vm-13',
+    model: 'claude-haiku-4-5',
+    prompt: 'hello',
+    max_tokens: 64,
+    baseUrl,
+    apiKey: 'test-master-key',
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.dataplane, 'crag')
+  assert.ok(result.log.some((l) => /cli-hop crag/.test(l.message)))
+  assert.equal(
+    result.log.some((l) => /cli-hop wrap/.test(l.message)),
+    false,
+  )
 })

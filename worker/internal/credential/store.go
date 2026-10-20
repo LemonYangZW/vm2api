@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	TypeOAuth      = "oauth"
-	TypeSetupToken = "setup-token"
-	TypeAPIKey     = "apikey"
+	TypeOAuth              = "oauth"
+	TypeSetupToken         = "setup-token"
+	TypeOfficialSetupToken = "official-setup-token"
+	TypeAPIKey             = "apikey"
 
 	AuthSchemeXAPIKey = "x_api_key"
 	AuthSchemeBearer  = "authorization_bearer"
@@ -40,7 +41,9 @@ type Credential struct {
 
 func NormalizeType(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(strings.ReplaceAll(raw, "_", "-"))) {
-	case TypeSetupToken, "inference":
+	case TypeOfficialSetupToken, "office-setup-token", "claude-setup-token", "inference":
+		return TypeOfficialSetupToken
+	case TypeSetupToken:
 		return TypeSetupToken
 	case TypeAPIKey, "api-key", "console":
 		return TypeAPIKey
@@ -92,7 +95,8 @@ func (c Credential) NeedsRefresh(now time.Time, skew time.Duration) bool {
 		return true
 	}
 	// Official `claude setup-token` is a one-year oat with no refresh.
-	if NormalizeType(c.Type) == TypeSetupToken && strings.TrimSpace(c.RefreshToken) == "" {
+	if NormalizeType(c.Type) == TypeOfficialSetupToken ||
+		(NormalizeType(c.Type) == TypeSetupToken && strings.TrimSpace(c.RefreshToken) == "") {
 		if c.ExpiresAt <= 0 {
 			return false
 		}
@@ -126,6 +130,10 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 	if oauth == nil {
 		oauth = document
 	}
+	if oauth == nil {
+		return Credential{}, nil, errors.New("credentials oauth object is missing")
+	}
+	scopes := stringSlice(firstValue(oauth, "scopes", "scope"))
 	credential := Credential{
 		Type:         NormalizeType(firstString(document, "type")),
 		AccessToken:  firstString(oauth, "accessToken", "access_token"),
@@ -135,7 +143,7 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 		Email:        firstString(oauth, "email", "emailAddress", "email_address"),
 		AccountUUID:  firstString(oauth, "accountUuid", "account_uuid"),
 		OrgUUID:      firstString(oauth, "orgUuid", "org_uuid", "organization_uuid"),
-		Scopes:       stringSlice(oauth["scopes"]),
+		Scopes:       scopes,
 		AuthScheme:   firstString(document, "authScheme", "auth_scheme"),
 	}
 	if typed := firstString(oauth, "type"); typed != "" && credential.Type == TypeOAuth {
@@ -222,9 +230,12 @@ func (s *Store) Save(credential Credential, document map[string]any) (Credential
 		credential.Generation = now
 	}
 	oauth["accessToken"] = credential.AccessToken
-	if credential.RefreshToken != "" {
+	if NormalizeType(credential.Type) == TypeOfficialSetupToken {
+		delete(oauth, "refreshToken")
+		credential.RefreshToken = ""
+	} else if credential.RefreshToken != "" {
 		oauth["refreshToken"] = credential.RefreshToken
-	} else if credential.Type == TypeSetupToken {
+	} else if NormalizeType(credential.Type) == TypeSetupToken {
 		delete(oauth, "refreshToken")
 	}
 	if credential.ExpiresAt > 0 {
@@ -243,9 +254,10 @@ func (s *Store) Save(credential Credential, document map[string]any) (Credential
 	if len(credential.Scopes) > 0 {
 		oauth["scopes"] = credential.Scopes
 	}
-	if credential.Type == TypeSetupToken {
-		oauth["type"] = TypeSetupToken
+	if t := NormalizeType(credential.Type); t == TypeSetupToken || t == TypeOfficialSetupToken {
+		oauth["type"] = t
 	}
+
 	document["kinGeneration"] = credential.Generation
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
@@ -404,7 +416,6 @@ func asInt64(value any) int64 {
 		return 0
 	}
 }
-
 func stringSlice(value any) []string {
 	switch typed := value.(type) {
 	case []string:

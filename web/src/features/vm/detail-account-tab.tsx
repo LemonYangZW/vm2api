@@ -9,6 +9,7 @@ import {
 } from '@/lib/cred-type'
 import { extraUsageText } from '@/lib/fable-status'
 import { fmtExpiresAt, fmtNum, pct } from '@/lib/format'
+import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { claudeTier, credExpiry } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
@@ -27,8 +28,18 @@ import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { CredentialEditorButton } from '@/features/vm/credential-editor'
 import { CredentialPanel } from '@/features/vm/credential-panel'
 import { Field, Meter } from '@/features/vm/detail-section-primitives'
+import type { VmTodayCounts } from '@/features/vm/detail-today'
 import { OfficialCcCard } from '@/features/vm/official-cc-card'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
+import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
+import {
+  latestProbe,
+  probeOutcome,
+  probeSourceLabel,
+  type ProbeCheck,
+} from '@/features/vm/probe-status'
+import { VmPackageButton } from '@/features/vm/vm-package-dialog'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 type VmAccountTabProps = {
   id: string
@@ -43,9 +54,10 @@ type VmAccountTabProps = {
   todayReadCache: number
   todayWriteCache: number
   todayHit: number | null
+  today: VmTodayCounts
   canRefresh: boolean
   refreshBlocked: string
-  busyPath?: string | null
+  busy: (path: string) => boolean
   onNeedProxy: () => void
   onAction: (path: string, body?: unknown) => void
   onCredentialCommitted: NonNullable<
@@ -63,51 +75,66 @@ export function VmAccountTab(props: VmAccountTabProps) {
     todayReadCache,
     todayWriteCache,
     todayHit,
+    today,
     canRefresh,
     refreshBlocked,
-    busyPath,
+    busy,
     onNeedProxy,
     onAction,
     onCredentialCommitted,
   } = props
+  const perms = useVmPerms()
   const blocked = vm.can_import_credential === false
   const gpt = isCodexVm(vm)
-  const probe =
-    ((acc.last_probe as Record<string, unknown> | undefined) ||
-      vm.last_probe) ??
-    {}
+  const remote = isRemoteVm(vm)
+  const probe = latestProbe(
+    acc.last_probe_check as ProbeCheck | undefined,
+    vm.last_probe_check,
+    acc.last_probe as ProbeCheck | undefined,
+    vm.last_probe
+  )
 
   return (
     <TabsContent value='account' className='space-y-3 pt-3'>
-      <div className='grid gap-3 xl:grid-cols-[minmax(0,1.15fr)_minmax(20rem,0.85fr)]'>
-        <Card>
-          <CardHeader className='pb-2'>
-            <CardTitle className='text-sm'>导入凭证</CardTitle>
-          </CardHeader>
-          <CardContent className='pt-0'>
-            {blocked ? (
-              <div className='space-y-3'>
-                <p className='text-sm text-muted-foreground'>
-                  该槽需要已绑定且健康的 SOCKS5 才能换票。
-                </p>
-                <Button size='sm' onClick={onNeedProxy}>
-                  去绑定代理
-                </Button>
-              </div>
-            ) : gpt ? (
-              <CodexCredentialPanel
-                vm={vm}
-                onCommitted={onCredentialCommitted}
-              />
-            ) : (
-              <CredentialPanel
-                vm={vm}
-                onCommitted={onCredentialCommitted}
-                showConvert={false}
-              />
-            )}
-          </CardContent>
-        </Card>
+      <div
+        className={cn(
+          'grid gap-3',
+          perms.credential &&
+            'xl:grid-cols-[minmax(0,1.15fr)_minmax(20rem,0.85fr)]'
+        )}
+      >
+        {perms.credential ? (
+          <Card>
+            <CardHeader className='pb-2'>
+              <CardTitle className='text-sm'>导入凭证</CardTitle>
+            </CardHeader>
+            <CardContent className='pt-0'>
+              {blocked ? (
+                <div className='space-y-3'>
+                  <p className='text-sm text-muted-foreground'>
+                    该槽需要已绑定且健康的 SOCKS5 才能换票。
+                  </p>
+                  {perms.admin ? (
+                    <Button size='sm' onClick={onNeedProxy}>
+                      去绑定代理
+                    </Button>
+                  ) : null}
+                </div>
+              ) : gpt ? (
+                <CodexCredentialPanel
+                  vm={vm}
+                  onCommitted={onCredentialCommitted}
+                />
+              ) : (
+                <CredentialPanel
+                  vm={vm}
+                  onCommitted={onCredentialCommitted}
+                  showConvert={false}
+                />
+              )}
+            </CardContent>
+          </Card>
+        ) : null}
 
         <div className='space-y-3'>
           <Card>
@@ -128,6 +155,11 @@ export function VmAccountTab(props: VmAccountTabProps) {
                   ) : (
                     <StatusMark tone={claudeTier(vm)} variant='pill' />
                   )}
+                </Field>
+              ) : null}
+              {gpt ? (
+                <Field label='订阅到期（以凭证为准）' compact>
+                  {fmtExpiresAt(vm.chatgpt_subscription_active_until)}
                 </Field>
               ) : null}
               {credType === 'apikey' ? (
@@ -191,24 +223,27 @@ export function VmAccountTab(props: VmAccountTabProps) {
                   />
                 )}
                 {gpt ? null : <CredentialEditorButton vmId={id} />}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <Button
-                        size='sm'
-                        variant='outline'
-                        disabled={!canRefresh}
-                        loading={busyPath === '/oauth/refresh'}
-                        onClick={() => onAction('/oauth/refresh', {})}
-                      >
-                        刷新凭证
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  {refreshBlocked ? (
-                    <TooltipContent>{refreshBlocked}</TooltipContent>
-                  ) : null}
-                </Tooltip>
+                <VmPackageButton vmId={id} />
+                {perms.credential ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span>
+                        <Button
+                          size='sm'
+                          variant='outline'
+                          disabled={!canRefresh}
+                          loading={busy('/oauth/refresh')}
+                          onClick={() => onAction('/oauth/refresh', {})}
+                        >
+                          刷新凭证
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    {refreshBlocked ? (
+                      <TooltipContent>{refreshBlocked}</TooltipContent>
+                    ) : null}
+                  </Tooltip>
+                ) : null}
               </div>
             </CardContent>
           </Card>
@@ -221,12 +256,25 @@ export function VmAccountTab(props: VmAccountTabProps) {
               <CardContent className='divide-y pt-0'>
                 <Field label='时间' compact>
                   <span className='font-mono text-xs'>
-                    {String(probe.at || '未探测')}
+                    {probe.at || probe.probed_at
+                      ? fmtExpiresAt(probe.at || probe.probed_at)
+                      : '未探测'}
                   </span>
                 </Field>
                 <Field label='来源' compact>
-                  {String(acc.probe_source ?? vm.probe_source ?? '—')}
+                  {probeSourceLabel(
+                    probe.source ||
+                      String(acc.probe_source ?? vm.probe_source ?? '')
+                  )}
                 </Field>
+                <Field label='结果' compact>
+                  {probeOutcome(probe)}
+                </Field>
+                {probe.via === 'passive-headers' ? (
+                  <Field label='采样时间' compact>
+                    {probe.data_at ? fmtExpiresAt(probe.data_at) : '未知'}
+                  </Field>
+                ) : null}
                 {gpt ? null : (
                   <Field label='超额' compact>
                     {extraUsageText(acc.extra_usage ?? vm.extra_usage)}
@@ -245,19 +293,19 @@ export function VmAccountTab(props: VmAccountTabProps) {
                       请求
                     </div>
                     <div className='text-sm font-semibold tabular-nums'>
-                      {fmtNum(acc.requests ?? vm.requests)}
+                      {fmtNum(today.requests)}
                     </div>
                   </div>
                   <div>
                     <div className='text-[11px] text-muted-foreground'>入</div>
                     <div className='text-sm font-semibold tabular-nums'>
-                      {fmtNum(acc.tokens_in ?? vm.tokens_in)}
+                      {fmtNum(today.input)}
                     </div>
                   </div>
                   <div>
                     <div className='text-[11px] text-muted-foreground'>出</div>
                     <div className='text-sm font-semibold tabular-nums'>
-                      {fmtNum(acc.tokens_out ?? vm.tokens_out)}
+                      {fmtNum(today.output)}
                     </div>
                   </div>
                 </div>
@@ -281,8 +329,11 @@ export function VmAccountTab(props: VmAccountTabProps) {
         </div>
       </div>
 
-      {gpt ? null : officialCc ? (
-        <OfficialCcCard vmId={id} />
+      {gpt || !perms.admin ? null : officialCc ? (
+        <OfficialCcCard
+          vmId={id}
+          blockedReason={remote ? REMOTE_UNSUPPORTED_TEXT : ''}
+        />
       ) : credType !== 'none' ? (
         <p className='text-xs text-muted-foreground'>
           官方 Claude Code 初装仅支持完整 OAuth 凭证，当前槽为{' '}

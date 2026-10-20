@@ -7,12 +7,21 @@ import {
   prepareAnthropicRequest,
   rewriteToolNames,
   sanitizeAnthropicBodyForBetaTokens,
+  ensureFastModeBeta,
   ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
-  enforceCacheLimit,
+  modelSupportsMidConversationSystem,
 } from './anthropic-policy.mjs'
-import { ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh, normalizeThinkingForModel } from './thinking.mjs'
+import { liftMidConversationSystemMessages } from './sanitize.mjs'
+import {
+  applyThinkingDisplay,
+  ensureUnofficialAdaptiveThinking,
+  ensureUnofficialEffortHigh,
+  normalizeThinkingForModel,
+  thinkingDisplayMode,
+} from './thinking.mjs'
+import { ensureOutputConfigSchema } from './request-rectifier.mjs'
 import {
   applyCrsIdentityReplace,
   extractCallerSession,
@@ -21,12 +30,17 @@ import {
 } from '../identity/identity-rewrite.mjs'
 import { resolveCrsHeaders } from '../identity/crs-headers.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
+import { withRequestProtocolBetas } from './claude-code-betas.mjs'
 import {
   refreshOfficialSystemEnvironment,
+  hasEnvironmentSection,
+  stampBillingPromptId,
+  collapseSystemBudgetReminders,
   CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
   CRS_COMPACT_IDENTITY,
 } from '../identity/crs-persona.mjs'
+import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import {
   CRS_OFFICIAL_AGENT_PROMPT,
   CRS_AGENT_EXPANSION,
@@ -34,12 +48,18 @@ import {
 } from '../identity/official-cc-system-2.1.241.mjs'
 import {
   applyCacheTtlToBody,
-  applyCacheBreakpoints,
+  applyMessageBreakpoints,
+  DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
+  normalizeCacheTtl,
+  removeCacheControlFields,
   stripIllegalCacheControlFields,
+  validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
-import { isApiKeyMode, isSetupTokenMode } from '../oauth/credential-mode.mjs'
+import { applyModelRequestRules } from './model-policy.mjs'
+import { isApiKeyMode, isAnySetupTokenMode } from '../oauth/credential-mode.mjs'
+import { prepareClassifierBody } from './request-purpose.mjs'
 
 export const INFERENCE_UA = 'kin-inference/1.0'
 
@@ -62,67 +82,138 @@ export function isCliOwnedSystemText(text) {
   return false
 }
 
-export function stripCliOwnedSystem(system) {
+export function stripCliOwnedSystem(system, { preserveCallerEnvironment = false } = {}) {
   if (system == null) return undefined
-  if (typeof system === 'string') return isCliOwnedSystemText(system) ? undefined : system
+  const keep = (text) => (preserveCallerEnvironment && hasEnvironmentSection(text)) || !isCliOwnedSystemText(text)
+  if (typeof system === 'string') return keep(system) ? system : undefined
   if (!Array.isArray(system)) return system
-  const kept = system.filter((block) => !isCliOwnedSystemText(systemBlockText(block)))
+  const kept = system.filter((block) => keep(systemBlockText(block)))
   return kept.length ? kept : undefined
 }
 
-/** Wrap CLI already stamps tools + system. Extra tails here overflow the 4-breakpoint cap → 400, often surfaced as Connection error. */
-export const CLI_HOP_CACHE_BREAKPOINTS = Object.freeze({
-  enabled: true,
-  preserve_client: true,
-  system_tail: false,
-  tools_tail: false,
-  messages: 'rewrite',
-})
+/** Official Claude Code 2.1.278 context block. A live counter here changes the cached prefix. */
+const OFFICIAL_CONTEXT_BUDGET = '<total_tokens>15000000 tokens left</total_tokens>'
+const VOLATILE_CONTEXT_BUDGET = /<total_tokens>\d+ tokens left<\/total_tokens>/g
 
-function dropNodeCacheControl(node) {
-  if (!node || typeof node !== 'object' || !node.cache_control) return node
-  const { cache_control: _drop, ...rest } = node
-  return rest
+function stabilizeOfficialContextBudget(text) {
+  const raw = String(text ?? '')
+  if (!raw.includes('<total_tokens>')) return raw
+  return raw.replace(VOLATILE_CONTEXT_BUDGET, OFFICIAL_CONTEXT_BUDGET)
 }
 
-function dropCliOwnedBreakpoints(body) {
-  const out = { ...body }
-  if (Array.isArray(out.tools)) out.tools = out.tools.map(dropNodeCacheControl)
-  if (Array.isArray(out.system)) out.system = out.system.map(dropNodeCacheControl)
-  return out
+/** system[] is before every message breakpoint. A per-turn token counter there
+ * makes the next turn rewrite the whole prefix instead of reading it. */
+function stabilizeSystemBudget(body) {
+  if (!body || body.system == null) return body
+  if (typeof body.system === 'string') {
+    const text = stabilizeOfficialContextBudget(body.system)
+    return text === body.system ? body : { ...body, system: text }
+  }
+  if (!Array.isArray(body.system)) return body
+  let changed = false
+  const system = body.system.map((block) => {
+    if (typeof block === 'string') {
+      const text = stabilizeOfficialContextBudget(block)
+      if (text === block) return block
+      changed = true
+      return text
+    }
+    if (!block || typeof block !== 'object' || typeof block.text !== 'string') return block
+    const text = stabilizeOfficialContextBudget(block.text)
+    if (text === block.text) return block
+    changed = true
+    return { ...block, text }
+  })
+  return changed ? { ...body, system } : body
 }
 
-/** Wrap CLI stamps the current last user. Drop ours so the leftover is sub2api's penultimate user when messages >= 4. */
-function dropLastMessageBreakpoint(body) {
-  const messages = body?.messages
-  if (!Array.isArray(messages) || messages.length === 0) return body
-  const idx = messages.length - 1
-  const last = messages[idx]
-  if (!last || !Array.isArray(last.content)) return body
-  const content = last.content.map(dropNodeCacheControl)
-  const next = messages.slice()
-  next[idx] = { ...last, content }
-  return { ...body, messages: next }
+function stabilizeBlockBudget(block) {
+  if (typeof block === 'string') return stabilizeOfficialContextBudget(block)
+  if (!block || typeof block !== 'object') return block
+  let next = block
+  if (typeof block.text === 'string') {
+    const text = stabilizeOfficialContextBudget(block.text)
+    if (text !== block.text) next = { ...next, text }
+  }
+  if (typeof block.content === 'string') {
+    const content = stabilizeOfficialContextBudget(block.content)
+    if (content !== block.content) next = { ...next, content }
+  }
+  return next
 }
 
-/** Caller fields only. CLI owns UA / billing / metadata / layoutSystemBlocks. */
+/** Historical role=system reminders sit inside the next lookup prefix. */
+function stabilizeMessageBudgets(body) {
+  if (!Array.isArray(body?.messages)) return body
+  let changed = false
+  const messages = body.messages.map((message) => {
+    const content = message?.content
+    if (typeof content === 'string') {
+      const text = stabilizeOfficialContextBudget(content)
+      if (text === content) return message
+      changed = true
+      return { ...message, content: text }
+    }
+    if (!Array.isArray(content)) return message
+    let touched = false
+    const next = content.map((block) => {
+      const stabilized = stabilizeBlockBudget(block)
+      if (stabilized !== block) touched = true
+      return stabilized
+    })
+    if (!touched) return message
+    changed = true
+    return { ...message, content: next }
+  })
+  return changed ? { ...body, messages } : body
+}
+
+/**
+ * Caller fields plus Node-owned message breakpoints.
+ * CLI owns persona layout and system/tools markers; kernel only forwards.
+ *
+ * role=system turns stay where the caller put them, including a trailing one:
+ * Claude Code ends most turns with a reminder (SessionStart context, then
+ * `<total_tokens>`). Moving it into system[] puts a different text in the
+ * cached system block whenever the reminder changes, so the whole prefix
+ * misses. In place, it is history on the next turn and the prefix only grows.
+ * This must not depend on client classification: relays strip the billing
+ * block and rewrite the UA, so relayed Claude Code looks third-party.
+ */
 export function prepareCliHopBody(
   canonicalBody,
   {
     stream = true,
     repaired = false,
-    cacheTtl = null,
-    cacheBreakpoints = CLI_HOP_CACHE_BREAKPOINTS,
-    cacheControlLimit = 4,
+    cacheTtl = DEFAULT_CACHE_TTL,
+    requestContext = null,
+    preserveSystem = false,
+    preserveThinkingBlocks = false,
+    preserveCallerEnvironment = false,
+    autoCompactWindow = null,
   } = {},
 ) {
+  if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
+  if (preserveSystem) validateCacheBreakpoints(canonicalBody)
   let body = officialMessagesBody(canonicalBody, { stream })
+  const windowTokens = Number(autoCompactWindow)
+  if (Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000) {
+    body.auto_compact_window = windowTokens
+  }
   delete body.metadata
-  const leftover = stripCliOwnedSystem(body.system)
-  if (leftover == null) delete body.system
-  else body.system = leftover
-  // Repair already converted thinking→text and deleted body.thinking.
-  // Do not refill adaptive or clear_thinking, or the retry 400s again.
+  if (!preserveSystem) {
+    const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })
+    if (leftover == null) delete body.system
+    else body.system = leftover
+  }
+  if (!preserveSystem) {
+    body = stabilizeSystemBudget(body)
+    body = stabilizeMessageBudgets(body)
+  }
+  // cli-node sends mid-conversation-system. Only models that reject the role need the lift.
+  if (!modelSupportsMidConversationSystem(body.model)) body = liftMidConversationSystemMessages(body)
+  if (!preserveSystem) body = collapseSystemBudgetReminders(body)
+
   if (!repaired) {
     body = ensureUnofficialAdaptiveThinking(body)
     normalizeThinkingForModel(body)
@@ -130,32 +221,27 @@ export function prepareCliHopBody(
     body = ensureUnofficialEffortHigh(body)
     body = ensureClearThinkingContextManagement(body)
   }
-  body = stripInvalidThinkingBlocks(body)
+  body = stripInvalidThinkingBlocks(body, { preserveThinkingBlocks })
+  body = applyModelRequestRules(body)
+  body = ensureOutputConfigSchema(body)
   body = alignSamplingWithThinking(body)
-  body = stripIllegalCacheControlFields(body)
-  if (cacheTtl) body = applyCacheTtlToBody(body, cacheTtl)
-  if (cacheBreakpoints) {
-    body = applyCacheBreakpoints(body, {
-      ttl: cacheTtl || undefined,
-      config: { ...cacheBreakpoints, system_tail: false, tools_tail: false },
-      inbound: body,
-    })
+  if (!preserveSystem) {
+    body = stripIllegalCacheControlFields(body)
+    body = removeCacheControlFields(body)
+    body = applyMessageBreakpoints(body, normalizeCacheTtl(cacheTtl), 'rewrite')
   }
-  body = dropCliOwnedBreakpoints(body)
-  body = dropLastMessageBreakpoint(body)
-  body = enforceCacheTtlOrder(body)
-  enforceCacheLimit(body, cacheControlLimit)
   return body
 }
-
-/** Wrap CLI process is spawned as sonnet-5/adaptive. Haiku rejects thinking. */
+/** Only legacy Haiku rejects thinking; Haiku 5.5 supports adaptive thinking. */
 export function pinHaikuCliThinking(body = {}) {
   if (!body || typeof body !== 'object') return body
-  if (!/haiku/i.test(String(body.model || ''))) return body
+  const model = String(body.model || '')
+  if (!/haiku/i.test(model) || /haiku-5/i.test(model)) return body
   return { ...body, thinking: { type: 'disabled' } }
 }
 
 export function prepareOutboundAttempt({
+  requestContext = null,
   canonicalBody,
   inbound = {},
   identity,
@@ -165,31 +251,70 @@ export function prepareOutboundAttempt({
   toolNameRewrite = true,
   cacheTtl = null,
   cacheBreakpoints = null,
+  preserveThinkingBlocks = false,
+  preserveCallerEnvironment = false,
   reqHeaders = {},
   officialClient,
   sessionId: sessionIdOverride,
+  accountId = '',
+  boundSessionId = '',
+  boundAccountId = '',
+  boundVmId = '',
+  vmId = '',
+  epoch,
+  mode,
+  routing,
+  clientDiscriminator = undefined,
+  clientIp = '',
+  userAgent = '',
+  apiKeyId = '',
+  firstUserText = '',
+  firstUserIdentity = '',
   authScheme,
   credentialMode,
 } = {}) {
-  const inferenceOnly = isSetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)
+  const inferenceOnly = isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)
   const keepCallerSession = officialClient === true || (officialClient == null && !unofficial)
+  const sessionContext = {
+    officialClient: keepCallerSession,
+    accountId,
+    boundSessionId,
+    boundAccountId,
+    boundVmId,
+    vmId,
+    epoch,
+    mode,
+    routing,
+    clientDiscriminator,
+    clientIp,
+    userAgent: userAgent || reqHeaders?.['user-agent'] || '',
+    apiKeyId,
+    firstUserIdentity,
+  }
   const sessionId =
     String(sessionIdOverride || '').trim() ||
-    resolveOutboundSessionId(extractCallerSession({ inbound, body: canonicalBody, headers: reqHeaders }), {
-      officialClient: keepCallerSession,
-    })
+    resolveOutboundSessionId(
+      extractCallerSession({ inbound, body: canonicalBody, headers: reqHeaders }),
+      sessionContext,
+    )
   let identified = applyCrsIdentityReplace(
     officialMessagesBody(canonicalBody, { stream }),
     identity,
     inbound,
     reqHeaders,
-    { officialClient: keepCallerSession, sessionId },
+    { officialClient: keepCallerSession, sessionId, ...sessionContext },
   )
   const callerSessionId = sessionIdFromOutboundBody(identified)
   if (identity && callerSessionId) identity.callerSessionId = callerSessionId
-  if (identity) {
+  if (identity && !requestContext && !preserveCallerEnvironment) {
     identified = refreshOfficialSystemEnvironment(identified, identity, identified.model)
   }
+  const stampOwnedBilling = String(sessionIdOverride || '').trim() && (mode !== 'passthrough' || !keepCallerSession)
+  if (stampOwnedBilling) {
+    identified = stampBillingPromptId(identified, sessionId, firstUserText)
+  }
+  if (requestContext?.purpose === 'auto_mode_classifier')
+    return { body: prepareClassifierBody(identified, { stream }), toolNames: {} }
   // Official Claude Code places its own breakpoints; adding ours would shift the
   // prefix it already caches.
   let cleaned = prepareAnthropicRequest(identified, {
@@ -198,6 +323,7 @@ export function prepareOutboundAttempt({
     cacheBreakpoints: keepCallerSession ? null : cacheBreakpoints,
     cacheTtl: cacheTtl || undefined,
     inbound,
+    preserveThinkingBlocks,
   })
   cleaned = stripIllegalCacheControlFields(cleaned)
   if (cacheTtl) cleaned = applyCacheTtlToBody(cleaned, cacheTtl)
@@ -207,7 +333,7 @@ export function prepareOutboundAttempt({
 }
 
 export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m } = {}) {
-  if (isSetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)) {
+  if (isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)) {
     return {
       'user-agent': INFERENCE_UA,
       'anthropic-version': '2023-06-01',
@@ -219,6 +345,7 @@ export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { c
 
 /** Body + headers after the context_management ↔ context-management beta gate. */
 export function prepareOutboundEnvelope({
+  requestContext = null,
   canonicalBody,
   inbound = {},
   identity,
@@ -228,15 +355,32 @@ export function prepareOutboundEnvelope({
   toolNameRewrite = true,
   cacheTtl = null,
   cacheBreakpoints = null,
+  preserveThinkingBlocks = false,
+  preserveCallerEnvironment = false,
   reqHeaders = {},
   homeDir = '',
   officialClient,
   sessionId,
+  accountId = '',
+  boundSessionId = '',
+  boundAccountId = '',
+  boundVmId = '',
+  vmId = '',
+  epoch,
+  mode,
+  routing,
+  clientDiscriminator,
+  clientIp = '',
+  userAgent = '',
+  apiKeyId = '',
+  firstUserText = '',
+  firstUserIdentity = '',
   authScheme,
   credentialMode,
   want1m,
 } = {}) {
   const prepared = prepareOutboundAttempt({
+    requestContext,
     canonicalBody,
     inbound,
     identity,
@@ -246,9 +390,25 @@ export function prepareOutboundEnvelope({
     toolNameRewrite,
     cacheTtl,
     cacheBreakpoints,
+    preserveThinkingBlocks,
+    preserveCallerEnvironment,
     reqHeaders,
     officialClient,
     sessionId,
+    accountId,
+    boundSessionId,
+    boundAccountId,
+    boundVmId,
+    vmId,
+    epoch,
+    mode,
+    routing,
+    clientDiscriminator,
+    clientIp,
+    userAgent,
+    apiKeyId,
+    firstUserText,
+    firstUserIdentity,
     authScheme,
     credentialMode,
   })
@@ -270,6 +430,20 @@ export function prepareOutboundEnvelope({
     delete headers.Authorization
   }
   if (stream) headers.accept = 'text/event-stream'
-  const body = sanitizeAnthropicBodyForBetaTokens(prepared.body, headers?.['anthropic-beta'] || '')
+  if (!isAnySetupTokenMode(credentialMode)) {
+    const beta = ensureFastModeBeta(headers['anthropic-beta'] || '', prepared.body)
+    if (beta) headers['anthropic-beta'] = beta
+  }
+  const displayed =
+    requestContext?.purpose === 'auto_mode_classifier'
+      ? prepared.body
+      : applyThinkingDisplay(prepared.body, thinkingDisplayMode(routing))
+  headers['anthropic-beta'] = withRequestProtocolBetas(
+    String(headers['anthropic-beta'] || '').split(','),
+    displayed,
+  ).join(',')
+  const body = sealClaudeCodeCch(sanitizeAnthropicBodyForBetaTokens(displayed, headers?.['anthropic-beta'] || ''), {
+    enabled: routing?.compatibility?.cch_enabled !== false,
+  })
   return { body, headers, toolNames: prepared.toolNames }
 }

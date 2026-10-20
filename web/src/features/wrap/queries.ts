@@ -6,8 +6,16 @@ export type WrapSampleMeta = {
   source_vm?: string
   captured_at?: string
   kernel?: string
+  release_tag?: string
   glibc_shim?: boolean
   files?: string[]
+}
+
+export type WrapKernelPayload = {
+  source?: 'configured' | 'sample' | 'missing' | string
+  path?: string
+  size?: number
+  mtime?: string
 }
 
 export type WrapSample = {
@@ -19,6 +27,13 @@ export type WrapSample = {
   code?: string
   error?: string
   meta?: WrapSampleMeta | null
+  kernel?: WrapKernelPayload | null
+  cli_node?: WrapKernelPayload | null
+  cc_node?: WrapKernelPayload | null
+  crag?: (WrapKernelPayload & { ok?: boolean }) | null
+  dataplane?: 'wrap' | 'cc' | 'crag'
+  written?: string[]
+  sample_ok?: boolean
 }
 
 export type WrapSyncReport = {
@@ -77,5 +92,63 @@ export function repairWrapSample(id: string) {
   return api<WrapRepairReport>(
     `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/repair`,
     { method: 'POST', body: JSON.stringify({}) }
+  )
+}
+
+export type WrapReleaseUpdate = {
+  release?: {
+    tag?: string
+    version?: string
+    asset?: string
+    size?: number
+    cli_node?: string
+    cli_node_size?: number
+    cc_node?: string
+    cc_node_size?: number
+    crag?: string | null
+    crag_size?: number
+    crag_skipped?: boolean
+  }
+  kernel?: WrapSample
+  sync?: WrapSyncReport
+}
+
+export function installReleaseKernel(
+  body: { ids?: string[]; restart?: boolean } = {}
+) {
+  return api<WrapReleaseUpdate>('/api/panel/wrap-cli/kernel/release', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function uploadKernelBinary(file: Blob) {
+  return api<WrapSample>('/api/panel/wrap-cli/kernel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: file,
+  })
+}
+
+export function uploadCragKernelBinary(file: Blob) {
+  return api<WrapSample>('/api/panel/wrap-cli/crag-kernel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: file,
+  })
+}
+
+export function setKernelDataplane(body: {
+  dataplane: 'wrap' | 'cc' | 'crag'
+  ids?: string[]
+  all?: boolean
+  restart?: boolean
+}) {
+  return api<WrapSyncReport & { dataplane?: 'wrap' | 'cc' | 'crag' }>(
+    '/api/panel/dataplane',
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }
   )
 }

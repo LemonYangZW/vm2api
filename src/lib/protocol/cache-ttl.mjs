@@ -1,12 +1,12 @@
 /**
  * Anthropic cache_control ttl for unofficial OAuth.
- * Default 5m (1.25× input). Customers may request 1h (2× input);
- * billing must use the 1h bucket so the difference is charged.
+ * Default 1h (2× input). Customers may request 5m (1.25× input);
+ * billing must use the TTL we actually sent.
  */
 import fs from 'node:fs'
 import { isAnthropicServerTool } from './web-search.mjs'
 
-export const DEFAULT_CACHE_TTL = '5m'
+export const DEFAULT_CACHE_TTL = '1h'
 export const CACHE_TTL_HEADER = 'x-kin-cache-ttl'
 
 export function normalizeCacheTtl(value) {
@@ -14,8 +14,17 @@ export function normalizeCacheTtl(value) {
     .trim()
     .toLowerCase()
   if (!raw) return DEFAULT_CACHE_TTL
-  if (raw === '1h' || raw === '1hr' || raw === '60m' || raw === '3600' || raw === 'hour' || raw === '1hour') return '1h'
-  if (raw === '5m' || raw === '5min' || raw === '300' || raw === 'default') return '5m'
+  if (
+    raw === '1h' ||
+    raw === '1hr' ||
+    raw === '60m' ||
+    raw === '3600' ||
+    raw === 'hour' ||
+    raw === '1hour' ||
+    raw === 'default'
+  )
+    return '1h'
+  if (raw === '5m' || raw === '5min' || raw === '300') return '5m'
   return DEFAULT_CACHE_TTL
 }
 
@@ -32,30 +41,114 @@ export function cacheTtlFromRoutingFile(filePath) {
   }
 }
 
-/** True when the caller already asked for a 1h breakpoint. */
-export function bodyRequestsHourCache(body) {
-  if (!body || typeof body !== 'object') return false
-  const hour = (control) => ephemeralCacheTtl(control) === '1h'
-  if (hour(body.cache_control)) return true
-  if (Array.isArray(body.tools) && body.tools.some((tool) => hour(tool?.cache_control))) return true
-  if (Array.isArray(body.system) && body.system.some((block) => hour(block?.cache_control))) return true
+/** Highest explicit inbound TTL. Mixed requests use 1h, then every marker is normalized to it. */
+export function bodyCacheTtl(body) {
+  if (!body || typeof body !== 'object') return null
+  const ttls = []
+  const collect = (control) => {
+    if (!control || typeof control !== 'object') return
+    const raw = String(control.ttl || '').trim()
+    if (raw) ttls.push(normalizeCacheTtl(raw))
+  }
+  collect(body.cache_control)
+  if (Array.isArray(body.tools)) for (const tool of body.tools) collect(tool?.cache_control)
+  if (Array.isArray(body.system)) for (const block of body.system) collect(block?.cache_control)
   if (Array.isArray(body.messages)) {
     for (const message of body.messages) {
       if (!Array.isArray(message?.content)) continue
-      if (message.content.some((block) => hour(block?.cache_control))) return true
+      for (const block of message.content) collect(block?.cache_control)
     }
   }
-  return false
+  if (ttls.includes('1h')) return '1h'
+  return ttls.includes('5m') ? '5m' : null
 }
 
-/** Header, then inbound 1h, then routing.json, then 5m. Official traffic owns its breakpoints. */
-export function resolveCacheTtl({ headers = {}, body, routing, routingFile, officialTraffic = false } = {}) {
-  if (officialTraffic) return null
+export function bodyRequestsHourCache(body) {
+  return bodyCacheTtl(body) === '1h'
+}
+
+/**
+ * Header, then an explicit 5m/1h on any inbound marker, then the settings menu.
+ * Official Claude Code is included: its ttl-less markers mean "not chosen", so
+ * they take the menu value instead of Anthropic's implicit 5m.
+ */
+export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {}) {
   const hdr = headers[CACHE_TTL_HEADER] || headers['X-Kin-Cache-Ttl']
   if (hdr != null && String(hdr).trim()) return normalizeCacheTtl(hdr)
-  if (bodyRequestsHourCache(body)) return '1h'
+  const requested = bodyCacheTtl(body)
+  if (requested) return requested
   if (routing) return cacheTtlFromRouting(routing)
   return cacheTtlFromRoutingFile(routingFile)
+}
+
+/** Native passthrough validates caller markers; it never repairs their budget or TTL. */
+export function validateCacheBreakpoints(body) {
+  let count = 0
+  let short = false
+  const invalid = (message) => {
+    const error = new Error(message)
+    error.status = 400
+    error.body = { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_cache_control', message } }
+    throw error
+  }
+  const check = (node) => {
+    const control = node?.cache_control
+    if (control == null) return
+    if (node.type === 'thinking' || node.type === 'redacted_thinking') {
+      invalid('Cache breakpoints are not allowed on thinking blocks.')
+    }
+    if (control.type !== 'ephemeral' || (control.ttl != null && !['5m', '1h'].includes(control.ttl))) {
+      invalid('Cache control must be ephemeral with an optional 5m or 1h TTL.')
+    }
+    if (short && control.ttl === '1h') invalid('Cache TTL must place 1h before 5m (including missing TTL).')
+    if (control.ttl !== '1h') short = true
+    if (++count > 4) invalid('Cache control exceeds four breakpoints.')
+  }
+  for (const tool of body?.tools || []) check(tool)
+  for (const block of Array.isArray(body?.system) ? body.system : []) check(block)
+  for (const message of body?.messages || []) {
+    if (Array.isArray(message?.content)) for (const block of message.content) check(block)
+  }
+  // Automatic caching applies at the message tail, after explicit block markers.
+  check(body)
+}
+
+/** Only call for a rewritten native body: every surviving marker is Node-owned. */
+export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
+  const target = normalizeCacheTtl(ttl)
+  return walkCacheNodes(body, (node) => {
+    const control = node?.cache_control
+    if (!control || control.type !== 'ephemeral' || control.ttl != null) return node
+    return { ...node, cache_control: { ...control, ttl: target } }
+  })
+}
+
+const CACHE_TTL_MS = Object.freeze({ '5m': 5 * 60_000, '1h': 60 * 60_000 })
+const CONVERSATION_TTL_LIMIT = 10_000
+const conversationTtls = new Map()
+
+/**
+ * One conversation writes one TTL. Switching mid-conversation re-prices the
+ * whole prefix and Anthropic rejects 1h after 5m, so the first resolved value
+ * wins until the conversation is idle past that TTL; by then its cache is gone
+ * and nothing is lost by re-resolving.
+ */
+export function pinConversationCacheTtl(conversationKey, ttl, now = Date.now()) {
+  const wanted = normalizeCacheTtl(ttl)
+  const key = String(conversationKey || '').trim()
+  if (!key) return wanted
+  const hit = conversationTtls.get(key)
+  const pinned = hit && now - hit.at < CACHE_TTL_MS[hit.ttl] ? hit.ttl : wanted
+  conversationTtls.delete(key)
+  conversationTtls.set(key, { ttl: pinned, at: now })
+  if (conversationTtls.size > CONVERSATION_TTL_LIMIT) {
+    conversationTtls.delete(conversationTtls.keys().next().value)
+  }
+  return pinned
+}
+
+export function clearConversationCacheTtls() {
+  conversationTtls.clear()
 }
 
 /**
@@ -115,6 +208,27 @@ export function stripIllegalCacheControlFields(body) {
   }
   return out
 }
+/** Drop caller cache_control so Node can restamp last + penultimate user. */
+export function removeCacheControlFields(body) {
+  if (!body || typeof body !== 'object') return body
+  const out = { ...body }
+  delete out.cache_control
+  const clearNode = (node) => {
+    if (!node || typeof node !== 'object') return node
+    const next = { ...node }
+    delete next.cache_control
+    return next
+  }
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(clearNode)
+  if (Array.isArray(out.system)) out.system = out.system.map(clearNode)
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message
+      return { ...message, content: message.content.map(clearNode) }
+    })
+  }
+  return out
+}
 
 function dropScopeOnNode(node) {
   if (!node || typeof node !== 'object' || !node.cache_control) return node
@@ -168,10 +282,6 @@ function downgradePinnedHourToFive() {
   return { type: 'ephemeral', ttl: '5m' }
 }
 
-function upgradeFiveToHour() {
-  return { type: 'ephemeral', ttl: '1h' }
-}
-
 function walkCacheNodes(body, mapFn) {
   const out = { ...body }
   if (out.cache_control) {
@@ -191,99 +301,55 @@ function walkCacheNodes(body, mapFn) {
 }
 
 /**
- * Anthropic processes breakpoints in order: tools → system → messages.
- * A ttl=1h block must not appear after a ttl=5m block.
- * Caller last-tool 5m + KIN expansion 1h is the live 400.
- * honorHour: keep caller 1h and upgrade earlier 5m instead of wiping the 1h.
+ * One TTL per request. Anthropic reads a missing ttl as 5m and rejects a later
+ * 1h. If any breakpoint is 5m, every 1h is rewritten to 5m. Never upgrade 5m
+ * to 1h: wrap re-adds ttl-less tools after that upgrade and the 1h 400s.
  */
-export function enforceCacheTtlOrder(body, { honorHour = false } = {}) {
+export function enforceCacheTtlOrder(body) {
   if (!body || typeof body !== 'object') return body
-  if (honorHour) return honorHourCacheTtlOrder(body)
-  let seen5m = false
+  let has5m = false
+  walkCacheNodes(body, (node) => {
+    if (node?.cache_control && ephemeralCacheTtl(node.cache_control) === '5m') has5m = true
+    return node
+  })
+  if (!has5m) return body
   let changed = false
   const fix = (node) => {
-    if (!node || typeof node !== 'object' || !node.cache_control) return node
-    const ttl = ephemeralCacheTtl(node.cache_control)
-    if (ttl === '1h' && seen5m) {
-      changed = true
-      return { ...node, cache_control: downgradePinnedHourToFive() }
-    }
-    if (ttl === '5m') seen5m = true
-    return node
+    if (!node?.cache_control || ephemeralCacheTtl(node.cache_control) !== '1h') return node
+    changed = true
+    return { ...node, cache_control: downgradePinnedHourToFive() }
   }
   const out = walkCacheNodes(body, fix)
   return changed ? out : body
 }
 
-function honorHourCacheTtlOrder(body) {
-  const ttls = []
-  const record = (node) => {
-    if (!node || typeof node !== 'object' || !node.cache_control) return node
-    ttls.push(ephemeralCacheTtl(node.cache_control))
-    return node
-  }
-  walkCacheNodes(body, record)
-  let last1h = -1
-  for (let i = 0; i < ttls.length; i++) if (ttls[i] === '1h') last1h = i
-  if (last1h < 0) return body
-  let need = false
-  for (let i = 0; i < last1h; i++) {
-    if (ttls[i] === '5m') {
-      need = true
-      break
-    }
-  }
-  if (!need) return body
-  let idx = 0
+/** Retarget every Node marker to one TTL. Default matches DEFAULT_CACHE_TTL. */
+export function forceEphemeralCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
+  const target = normalizeCacheTtl(ttl)
+  if (!body || typeof body !== 'object') return body
+  let changed = false
   const fix = (node) => {
-    if (!node || typeof node !== 'object' || !node.cache_control) return node
-    const at = idx++
-    if (at < last1h && ephemeralCacheTtl(node.cache_control) === '5m') {
-      return { ...node, cache_control: upgradeFiveToHour() }
-    }
-    return node
+    if (!node?.cache_control) return node
+    const control = node.cache_control
+    if (control.type && control.type !== 'ephemeral') return node
+    if (control.type === 'ephemeral' && control.ttl === target) return node
+    changed = true
+    return { ...node, cache_control: { ...control, type: 'ephemeral', ttl: target } }
   }
-  return walkCacheNodes(body, fix)
+  const out = walkCacheNodes(body, fix)
+  return changed ? out : body
 }
 
-/**
- * System is gateway-rebuilt: stamp the resolved ttl.
- * Tools/messages keep a caller ttl; fill only when missing.
- * Mixed 5m-then-1h upgrades the earlier 5m so a caller 1h is not wiped.
- */
+/** Rewrite every outbound cache breakpoint to this request's resolved TTL. */
 export function applyCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
   const target = normalizeCacheTtl(ttl)
   if (!body || typeof body !== 'object') return body
-  const out = { ...body }
-  if (out.cache_control) out.cache_control = setEphemeralTtlUnlessPinned(out.cache_control, target)
-  if (Array.isArray(out.system)) {
-    out.system = out.system.map((block) =>
-      block?.cache_control ? { ...block, cache_control: setEphemeralTtl(block.cache_control, target) } : block,
-    )
-  }
-  if (Array.isArray(out.tools)) {
-    out.tools = out.tools.map((tool) =>
-      tool?.cache_control ? { ...tool, cache_control: setEphemeralTtlUnlessPinned(tool.cache_control, target) } : tool,
-    )
-  }
-  if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => {
-      if (!Array.isArray(message?.content)) return message
-      return {
-        ...message,
-        content: message.content.map((block) =>
-          block?.cache_control
-            ? { ...block, cache_control: setEphemeralTtlUnlessPinned(block.cache_control, target) }
-            : block,
-        ),
-      }
-    })
-  }
-  const honorHour = target === '1h' || bodyRequestsHourCache(out)
-  return enforceCacheTtlOrder(out, { honorHour })
+  return walkCacheNodes(body, (node) =>
+    node?.cache_control ? { ...node, cache_control: setEphemeralTtl(node.cache_control, target) } : node,
+  )
 }
 
-export const MESSAGES_BREAKPOINT_MODES = Object.freeze(['off', 'fill', 'rewrite'])
+export const MESSAGES_BREAKPOINT_MODES = Object.freeze(['off', 'fill', 'rewrite', 'tail', 'cli-hop'])
 
 /**
  * Anthropic only caches a prefix that ends at a breakpoint, so a body with no
@@ -295,8 +361,9 @@ export const DEFAULT_CACHE_BREAKPOINTS = Object.freeze({
   preserve_client: true,
   system_tail: true,
   tools_tail: true,
-  // rewrite: Claude Code stamps the current last user; fill would leave that
-  // wandering marker and freeze hits at the system prefix (~43.5k).
+  // rewrite removes caller-owned markers before rebuilding last + penultimate-user anchors.
+  // HTTP hop uses this default; cli-hop calls applyMessageBreakpoints(..., 'rewrite') after stripping.
+
   messages: 'rewrite',
 })
 
@@ -305,6 +372,8 @@ export function normalizeMessagesBreakpointMode(value) {
     .trim()
     .toLowerCase()
   if (raw === 'off' || raw === 'none' || raw === 'false' || raw === '0' || raw === 'disabled') return 'off'
+  if (raw === 'cli-hop' || raw === 'cli' || raw === 'leftover') return 'cli-hop'
+  if (raw === 'tail' || raw === 'current-tail' || raw === 'single') return 'tail'
   if (raw === 'rewrite' || raw === 'replace' || raw === 'restamp' || raw === 'auto') return 'rewrite'
   if (raw === 'fill' || raw === 'true' || raw === '1') return 'fill'
   return DEFAULT_CACHE_BREAKPOINTS.messages
@@ -528,7 +597,7 @@ function dropMessageBreakpoints(messages) {
   return changed ? next : messages
 }
 
-/** A string content block has no place to hang the marker, so promote it first. */
+/** Promote strings and stamp the last non-thinking content block. */
 function stampMessageTail(messages, idx, ttl) {
   const message = messages[idx]
   if (!message || typeof message !== 'object') return messages
@@ -539,23 +608,26 @@ function stampMessageTail(messages, idx, ttl) {
     return next
   }
   if (!Array.isArray(content) || content.length === 0) return messages
-  const last = content.length - 1
-  const stamped = stampNode(content[last], ttl)
-  if (stamped === content[last]) return messages
+  let target = -1
+  for (let i = content.length - 1; i >= 0; i--) {
+    if (content[i]?.type === 'thinking' || content[i]?.type === 'redacted_thinking') continue
+    target = i
+    break
+  }
+  if (target < 0) return messages
+  const stamped = stampNode(content[target], ttl)
+  if (stamped === content[target]) return messages
   const nextContent = content.slice()
-  nextContent[last] = stamped
+  nextContent[target] = stamped
   const next = messages.slice()
   next[idx] = { ...message, content: nextContent }
   return next
 }
 
 /**
- * Last message plus, when messages.length >= 4, the second-to-last user
- * (sub2api/Parrot addMessageCacheBreakpoints). CLI hop then drops the last
- * marker because wrap CLI restamps the current last user.
- *
- * `fill` leaves a body that already carries caller breakpoints alone.
- * `rewrite` drops everything, then re-mark.
+ * `tail` matches current Claude Code: exactly one message-level marker on the
+ * current tail. `rewrite` retains the generic Messages two-anchor policy.
+ * `fill` preserves caller markers and uses that policy only when none exist.
  */
 function penultimateUserIndex(messages) {
   if (!Array.isArray(messages) || messages.length < 4) return -1
@@ -568,17 +640,74 @@ function penultimateUserIndex(messages) {
   return -1
 }
 
+/** Empty control turns have no block to hang cache_control on. */
+function lastStampableMessageIndex(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const content = messages[i]?.content
+    if (typeof content === 'string' && content) return i
+    if (Array.isArray(content) && content.length > 0) return i
+  }
+  return -1
+}
+
 export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DEFAULT_CACHE_BREAKPOINTS.messages) {
   const resolved = normalizeMessagesBreakpointMode(mode)
   if (resolved === 'off') return body
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || body.messages.length === 0) return body
   if (resolved === 'fill' && hasMessageBreakpoint(body.messages)) return body
   const target = normalizeCacheTtl(ttl)
-  let messages = resolved === 'rewrite' ? dropMessageBreakpoints(body.messages) : body.messages
-  messages = stampMessageTail(messages, messages.length - 1, target)
-  const prevUser = penultimateUserIndex(messages)
-  if (prevUser >= 0) messages = stampMessageTail(messages, prevUser, target)
+  let messages = resolved === 'fill' ? body.messages : dropMessageBreakpoints(body.messages)
+  if (resolved === 'cli-hop') {
+    return messages === body.messages ? body : { ...body, messages }
+  }
+  const tail = lastStampableMessageIndex(messages)
+  if (tail >= 0) messages = stampMessageTail(messages, tail, target)
+  if (resolved !== 'tail') {
+    const prevUser = penultimateUserIndex(messages)
+    if (prevUser >= 0) messages = stampMessageTail(messages, prevUser, target)
+  }
   return messages === body.messages ? body : { ...body, messages }
+}
+
+/** Bounded marker inventory for diagnostics. No prompt or image bytes. */
+export function listCacheMarkers(body) {
+  const hits = []
+  const ttlOf = (control) => {
+    if (!control || typeof control !== 'object') return null
+    return control.ttl ? normalizeCacheTtl(control.ttl) : null
+  }
+  if (body?.cache_control) hits.push({ section: 'body', index: 0, ttl: ttlOf(body.cache_control), type: 'body' })
+  if (Array.isArray(body?.system)) {
+    for (const [index, block] of body.system.entries()) {
+      if (block?.cache_control) {
+        hits.push({ section: 'system', index, ttl: ttlOf(block.cache_control), type: block.type || 'text' })
+      }
+    }
+  }
+  if (Array.isArray(body?.tools)) {
+    for (const [index, tool] of body.tools.entries()) {
+      if (tool?.cache_control) {
+        hits.push({ section: 'tools', index, ttl: ttlOf(tool.cache_control), type: tool.type || 'function' })
+      }
+    }
+  }
+  if (Array.isArray(body?.messages)) {
+    for (const [index, message] of body.messages.entries()) {
+      if (!Array.isArray(message?.content)) continue
+      for (const [blockIndex, block] of message.content.entries()) {
+        if (!block?.cache_control) continue
+        hits.push({
+          section: 'messages',
+          index,
+          blockIndex,
+          role: message.role || null,
+          ttl: ttlOf(block.cache_control),
+          type: block.type || 'text',
+        })
+      }
+    }
+  }
+  return hits
 }
 
 /**

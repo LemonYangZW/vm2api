@@ -10,6 +10,7 @@ export const ERROR_CLASSES = {
   rate_limit: { id: 'rate_limit', owner: 'provider', label: '限流' },
   quota: { id: 'quota', owner: 'platform', label: '额度' },
   overloaded: { id: 'overloaded', owner: 'provider', label: '过载排队' },
+  unavailable: { id: 'unavailable', owner: 'platform', label: '无可用账号' },
   timeout: { id: 'timeout', owner: 'provider', label: '超时' },
   credential: { id: 'credential', owner: 'platform', label: '凭证' },
   proxy: { id: 'proxy', owner: 'platform', label: '代理' },
@@ -25,6 +26,9 @@ const CODE_MAP = {
   missing_api_key: 'auth',
   api_key_disabled: 'auth',
   api_key_expired: 'auth',
+  key_group_mismatch: 'request',
+  vm_pool_unavailable: 'request',
+  claude_code_only: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
   empty_body: 'request',
@@ -44,12 +48,28 @@ const CODE_MAP = {
   upstream_rate_limit: 'rate_limit',
   quota_5h_safety: 'quota',
   quota_7d_safety: 'quota',
+  quota_guard_request_too_large: 'quota',
   api_key_quota_exhausted: 'quota',
   concurrency_limit: 'quota',
   api_key_concurrency_limit: 'quota',
-  account_pool_exhausted: 'overloaded',
+  pool_overloaded: 'overloaded',
+  pool_wait_queue_full: 'overloaded',
+  pool_queue_timeout: 'overloaded',
+  pool_overload_cooldown: 'overloaded',
+  pool_rate_limited: 'rate_limit',
+  fable_requires_max: 'rate_limit',
+  user_concurrency_limit: 'quota',
+  account_pool_exhausted: 'unavailable',
+  api_pool_exhausted: 'unavailable',
+  no_eligible_accounts: 'unavailable',
+  pool_unavailable: 'unavailable',
   server_overloaded: 'overloaded',
   upstream_overloaded: 'overloaded',
+  slot_busy: 'overloaded',
+  // Kernel restarting / slot restore: platform side, not provider overload.
+  kernel_unavailable: 'other',
+  restore_in_progress: 'other',
+  wrap_connection_error: 'other',
   upstream_timeout: 'timeout',
   stream_incomplete: 'timeout',
   client_cancelled: 'timeout',
@@ -65,6 +85,7 @@ const CODE_MAP = {
   distill_blocked: 'distill',
   refusal_guard: 'refusal',
   content_filter_refusal: 'refusal',
+  policy_blocked: 'refusal',
 }
 
 export const IGNORED_ERROR_CODES = new Set([
@@ -72,8 +93,6 @@ export const IGNORED_ERROR_CODES = new Set([
   'request_cancelled',
   'client_aborted',
   'selection_cancelled',
-  'ECONNRESET',
-  'aborted',
 ])
 
 /**
@@ -97,12 +116,22 @@ export const SLA_OK_ERROR_CODES = new Set([
   'api_key_rate_limit',
   'quota_5h_safety',
   'quota_7d_safety',
+  'quota_guard_request_too_large',
   'api_key_quota_exhausted',
   'concurrency_limit',
   'api_key_concurrency_limit',
   'distill_blocked',
   'refusal_guard',
   'content_filter_refusal',
+  'policy_blocked',
+  'key_group_mismatch',
+  'vm_pool_unavailable',
+  'claude_code_only',
+  // Pool queue full / timeout moved from 429 to 529; SLA keeps counting them as it did at 429.
+  'pool_overloaded',
+  'pool_wait_queue_full',
+  'pool_queue_timeout',
+  'pool_overload_cooldown',
 ])
 
 export function ignoredErrorSqlList() {
@@ -141,6 +170,19 @@ export function ingressAuthSql() {
   )`
 }
 
+/**
+ * The muted `auth` class, matching `classifyRequestError`: a slotless 401/403 is ingress auth
+ * unless its code already names another class. Policy refusals (claude_code_only,
+ * key_group_mismatch, distill_blocked…) are 403s too and must stay visible.
+ */
+function mutedAuthSql() {
+  const classified = Object.keys(CODE_MAP)
+    .filter((code) => CODE_MAP[code] !== 'auth')
+    .map((code) => `'${code}'`)
+    .join(',')
+  return `(${ingressAuthSql()} AND IFNULL(error_code, '') NOT IN (${classified}))`
+}
+
 export function excludeErrorClassSql(classes) {
   const list = Array.isArray(classes)
     ? classes
@@ -150,7 +192,7 @@ export function excludeErrorClassSql(classes) {
         .filter(Boolean)
   const parts = []
   for (const id of list) {
-    if (id === 'auth') parts.push(`NOT (${ingressAuthSql()})`)
+    if (id === 'auth') parts.push(`NOT ${mutedAuthSql()}`)
   }
   return parts.length ? `(${parts.join(' AND ')})` : ''
 }
@@ -172,7 +214,7 @@ export function isIgnoredClientCancel(row = {}) {
   const code = String(row?.error_code || '').trim()
   if (status >= 400 && status !== 499) return false
   if (IGNORED_ERROR_CODES.has(code)) return true
-  return /econnreset|client.?abort|request_cancelled|context canceled/i.test(hay(row))
+  return /client_aborted|request_cancelled|selection_cancelled|context canceled/i.test(hay(row))
 }
 
 export function isErrorRow(row) {
@@ -192,7 +234,8 @@ export function classifyRequestError(row = {}) {
   let id = CODE_MAP[code] || null
 
   if (/signature|thinking block|skip_thought_signature|must contain thinking/.test(text)) id = 'signature'
-  else if ((id === 'upstream' || status === 503) && /overload|no eligible|负载过高/.test(text)) id = 'overloaded'
+  else if ((id === 'upstream' || (!id && status === 503)) && /overload|负载过高/.test(text)) id = 'overloaded'
+  else if (!id && /no eligible|无可用账号|没有可用账号/.test(text)) id = 'unavailable'
   if (!id) {
     if (/extra usage|entitlement|quota|5h|7d/.test(text) && (status === 429 || /quota|usage/.test(text))) id = 'quota'
     else if (/socks|proxy|cloudflare|just a moment/.test(text)) id = 'proxy'
@@ -205,7 +248,8 @@ export function classifyRequestError(row = {}) {
     } else if (status === 401 || status === 403 || /oauth|reimport|revoked/.test(text)) {
       id = isOauthCredentialFailure(row, text, code) ? 'credential' : 'auth'
     } else if (status === 429) id = 'rate_limit'
-    else if (status === 529 || status === 503 || /overload|no eligible|负载过高/.test(text)) id = 'overloaded'
+    else if (status === 529 || /overload|负载过高/.test(text)) id = 'overloaded'
+    else if (status === 503 || /no eligible/.test(text)) id = 'unavailable'
     else if (status === 400 || status === 422) id = 'request'
     else if (status >= 500) id = 'upstream'
     else id = 'other'

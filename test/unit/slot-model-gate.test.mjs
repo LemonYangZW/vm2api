@@ -43,6 +43,28 @@ test('fable requires max even if the allowlist includes it', () => {
   assert.equal(max.ok, true)
 })
 
+test('explicit Pro tier and recent model denial override stale Max usage', () => {
+  const vm = { claude: { account_tier: 'pro' }, policy: {} }
+  const account = { unified: { account_tier: 'max', usage_has_fable: true } }
+  assert.deepEqual(slotAllowsModel({ vm, account, model: 'claude-fable-5' }), {
+    ok: false,
+    reason: 'fable_requires_max',
+  })
+
+  const maxVm = { claude: { account_tier: 'max' }, policy: {} }
+  const denied = {
+    unified: {
+      account_tier: 'max',
+      model_denied_until: { 'claude-fable-5': Date.now() + 60_000 },
+    },
+  }
+  assert.deepEqual(slotAllowsModel({ vm: maxVm, account: denied, model: 'claude-fable-5' }), {
+    ok: false,
+    reason: 'model_not_supported',
+  })
+  assert.deepEqual(slotAllowsModel({ vm: maxVm, account: denied, model: 'claude-sonnet-5' }), { ok: true })
+})
+
 test('legacy Fable 5.1 allowlists accept the corrected id without allowing Fable 5', () => {
   assert.equal(modelMatchesAllowlist('claude-fable-5-1', ['claude-fable-5.1']), true)
   assert.equal(modelMatchesAllowlist('claude-fable-5.1', ['claude-fable-5-1']), true)
@@ -58,6 +80,13 @@ test('legacy Fable 5.1 allowlists accept the corrected id without allowing Fable
     ok: false,
     reason: 'fable_requires_max',
   })
+})
+
+test('Opus 5.5 does not match an Opus 5 allowlist', () => {
+  assert.equal(modelMatchesAllowlist('claude-opus-5-5', ['claude-opus-5']), false)
+  assert.equal(modelMatchesAllowlist('claude-opus-5', ['claude-opus-5-5']), false)
+  assert.equal(modelMatchesAllowlist('claude-opus-5.5', ['claude-opus-5-5']), true)
+  assert.deepEqual(parseAllowedModelsPatch(['claude-opus-5.5']), { ok: true, value: ['claude-opus-5-5'] })
 })
 
 test('parseAllowedModelsPatch rejects unknown ids', () => {

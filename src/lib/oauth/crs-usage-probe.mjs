@@ -6,12 +6,16 @@ import { isCrsMock } from '../transport/crs-mock.mjs'
 import { callGoWorker, callWorkerGet } from '../transport/go-worker-client.mjs'
 import {
   compareUsageInterpretations,
+  fableScopeText,
   interpretOfficialUsage,
   normLegacyMixed,
   normUsagePercent,
+  usageFablePresence,
 } from './usage-interpret.mjs'
 
-export const FABLE_PROBE_MODEL = 'claude-fable-5'
+/** Current Max model first; the previous id is only a fallback when this one is missing. */
+export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-1', 'claude-fable-5'])
+export const FABLE_PROBE_MODEL = FABLE_TIER_MODELS[0]
 export const OAUTH_USAGE_PATH = '/api/oauth/usage'
 /** sub2api Extra / Messages 响应头被动采样，不打 GET /api/oauth/usage。 */
 export const PASSIVE_HEADER_SOURCE = 'messages-headers'
@@ -58,11 +62,11 @@ function windowOf(w, scale = 'percent') {
   if (!w || typeof w !== 'object') return null
   const utilization =
     scale === 'header' ? normLegacyMixed(w.utilization ?? w.percent) : normUsagePercent(w.utilization ?? w.percent)
-  if (utilization == null && !w.resets_at && !w.resetsAt && !w.status) return null
+  if (utilization == null && !w.resets_at && !w.resetsAt && !w.reset && !w.reset_at && !w.status) return null
   return {
     utilization,
     utilization_pct: utilization == null ? null : Math.round(utilization * 1000) / 10,
-    resets_at: w.resets_at || w.resetsAt || null,
+    resets_at: w.resets_at || w.resetsAt || w.reset || w.reset_at || null,
     status: w.status || statusFromUtilization(utilization),
   }
 }
@@ -77,19 +81,20 @@ export function parseFableScopedWindow(data = {}) {
   if (direct) return direct
   for (const item of Array.isArray(data.limits) ? data.limits : []) {
     if (!item || typeof item !== 'object') continue
-    const kind = String(item.kind || '').toLowerCase()
-    const name = item.scope?.model?.display_name || item.scope?.display_name || item.display_name || item.model || ''
+    const kind = String(item.kind || item.type || '').toLowerCase()
     const scoped = kind === 'weekly_scoped' || kind === 'seven_day_overage_included' || kind === '7d_oi'
-    if (!scoped || !fableScopeName(name)) continue
+    if (!scoped || !fableScopeName(fableScopeText(item))) continue
     return windowOf(item, 'percent')
   }
   for (const item of Array.isArray(data.model_scoped) ? data.model_scoped : []) {
     if (!item || typeof item !== 'object') continue
-    if (!fableScopeName(item.display_name || item.name)) continue
+    if (!fableScopeName(fableScopeText(item))) continue
     return windowOf(item, 'percent')
   }
   return null
 }
+
+export { usageFablePresence, usageHasFableModel } from './usage-interpret.mjs'
 
 export function windowFromRateLimitHeaders(headers = {}, prefix = '7d_oi') {
   const h = {}
@@ -110,18 +115,50 @@ export function parseOAuthUsage(data = {}) {
     five_hour: windowOf(data.five_hour),
     seven_day: windowOf(data.seven_day),
     seven_day_sonnet: windowOf(data.seven_day_sonnet),
-    seven_day_opus: windowOf(data.seven_day_opus || data.seven_day_sonnet),
+    seven_day_opus: windowOf(data.seven_day_opus),
+    seven_day_oauth_apps: windowOf(data.seven_day_oauth_apps),
     seven_day_oi: parseFableScopedWindow(data),
+    usage_has_fable: usageFablePresence(data),
     extra_usage:
       extra && typeof extra === 'object'
         ? {
             is_enabled: !!(extra.is_enabled ?? extra.enabled),
+            monthly_limit: extra.monthly_limit ?? extra.monthlyLimit ?? null,
+            used_credits: extra.used_credits ?? extra.usedCredits ?? null,
             utilization: normUsagePercent(extra.utilization),
             resets_at: extra.resets_at || extra.resetsAt || null,
             status: extra.status || extra.overage_status || extra.overageStatus || null,
           }
         : null,
   }
+}
+
+export function isCompleteOAuthUsage(data = {}, parsed = null) {
+  const p = parsed || parseOAuthUsage(data)
+  if (!p.five_hour || !p.seven_day) return false
+  if (p.usage_has_fable !== null) return true
+  // 2.1.293 GET /api/oauth/usage is a Utilization object: named windows, no limits[] catalog.
+  if (
+    data.seven_day_sonnet !== undefined ||
+    data.seven_day_opus !== undefined ||
+    data.seven_day_oauth_apps !== undefined ||
+    data.extra_usage !== undefined ||
+    data.extraUsage !== undefined
+  ) {
+    return true
+  }
+  return (
+    data.seven_day_fable === null ||
+    data.seven_day_oi === null ||
+    data.seven_day_overage_included === null ||
+    Array.isArray(data.limits) ||
+    Array.isArray(data.model_scoped)
+  )
+}
+
+function usageScopeMissing(res = {}) {
+  const msg = String(res.body?.error?.message || res.body?.error || '')
+  return Number(res.status || 0) === 403 && /scope requirement|does not meet scope|user:profile/i.test(msg)
 }
 
 export function parseFableProbe({ status, body, transportError, headers } = {}) {
@@ -168,10 +205,10 @@ export function parseFableProbe({ status, body, transportError, headers } = {}) 
 /** Fable 403/permission = 套餐没有 Fable（Pro），不是账号吊销。 */
 export function isFablePlanDenied(fb = {}) {
   if (!fb || typeof fb !== 'object') return false
-  if (fb.plan_denied) return true
   const st = Number(fb.status || 0)
   const err = String(fb.error || fb.type || '')
-  if (st === 401 || /oauth|authentication/i.test(err)) return false
+  if (st === 401 || st === 429 || /oauth|authentication/i.test(err)) return false
+  if (fb.plan_denied) return true
   return st === 403 || /permission/i.test(err)
 }
 
@@ -193,23 +230,31 @@ export function isInventedFableWindow(fb = {}, quota = {}) {
   return oi != null && oi >= 1 && !reset
 }
 
-/** Pro：套餐没有 Fable。含 403、plan_denied、以及无真实 7d_oi 窗的 429。 */
+/** Only an explicit Fable permission denial proves a Pro entitlement. */
 export function isFableUnavailablePro(fb = {}, quota = {}) {
-  if (isFablePlanDenied(fb)) return true
-  return isInventedFableWindow(fb, quota)
+  return isFablePlanDenied(fb)
 }
 
-/** Already-Pro slots skip the Fable model hop. Usage 5h/7d still probes. */
-export function shouldProbeFable({ fable = {}, quota = {}, storedTier = null } = {}) {
+export function shouldProbeFable({ fable = {}, quota = {}, storedTier = null, now = Date.now() } = {}) {
+  if (quota.usage_has_fable === true) return false
+  if (
+    !isInventedFableWindow(fable, quota) &&
+    (quota.utilization_7d_oi != null || quota.reset_7d_oi || quota.status_7d_oi || quota['7d_oi']?.reset)
+  ) {
+    return false
+  }
   const stored = String(storedTier || quota.account_tier || '').toLowerCase()
-  if (stored === 'pro') return false
-  return !isFableUnavailablePro(fable, quota)
+  if (stored === 'pro' || isFableUnavailablePro(fable, quota)) {
+    const probedAt = Date.parse(fable.probed_at || '')
+    return !Number.isFinite(probedAt) || now - probedAt >= 60 * 60_000
+  }
+  return true
 }
 
 export function usageErrorText(probe = {}) {
   const raw = probe.usage_error || probe.error || probe.message || ''
-  if (raw && typeof raw === 'object') return String(raw.message || raw.type || raw.code || '')
-  return String(raw || '')
+  const candidates = raw && typeof raw === 'object' ? [raw.message, raw.type, raw.code] : [raw]
+  return candidates.find((value) => typeof value === 'string' && value.trim()) || ''
 }
 
 export function parseUsageRetryAfterMs(headers = {}, body = {}) {
@@ -219,6 +264,56 @@ export function parseUsageRetryAfterMs(headers = {}, body = {}) {
   const n = Number(raw)
   if (!Number.isFinite(n) || n < 0) return null
   return n > 180 ? n : n * 1000
+}
+
+/**
+ * Fable hop results, in attempt order.
+ * 200 is Max. 403 on every tried model is Pro.
+ * 429 is not Pro and not Max: a Pro hop can be rate-limited too.
+ * A transport error or a revoked grant does not classify the plan.
+ */
+export function tierFromFableAttempts(attempts = []) {
+  let denied = null
+  let limited = null
+  for (const fable of attempts) {
+    if (!fable) continue
+    if (fable.transport) return { tier: null, fable }
+    if (fable.ok) return { tier: 'max', fable }
+    if (fable.banned) return { tier: null, fable }
+    if (fable.limited) {
+      limited = fable
+      continue
+    }
+    if (fable.plan_denied) denied = fable
+  }
+  if (denied && !limited) return { tier: 'pro', fable: denied }
+  return { tier: null, fable: limited || denied || attempts.filter(Boolean).at(-1) || null }
+}
+
+/** Messages hop that Setup Token can run. Official /usage is not required. */
+export async function probeFableEntitlement({
+  exec,
+  timeoutMs = 20000,
+  identity = null,
+  models = FABLE_TIER_MODELS,
+} = {}) {
+  const attempts = []
+  for (const model of models) {
+    const fableRes = await callGoWorker({
+      exec,
+      timeoutMs,
+      identity,
+      body: {
+        model,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    })
+    const fable = { ...parseFableProbe(fableRes), model }
+    attempts.push(fable)
+    if (fable.transport || fable.ok || fable.banned) break
+  }
+  return tierFromFableAttempts(attempts)
 }
 
 /** Official /usage 429 is quota-API throttling, not a dead grant. */
@@ -237,9 +332,10 @@ export function usageProbeBackoffRemainingMs(unified = {}, now = Date.now()) {
   return 0
 }
 
-/** List/batch never hop. Single hop still waits out the 429 window. */
-export function shouldHopOfficialUsage(unified = {}, { now = Date.now(), hop = true } = {}) {
+/** Interval/list ticks pass hop=false. Manual 额度探测 pass hop=true; force skips 429 backoff. */
+export function shouldHopOfficialUsage(unified = {}, { now = Date.now(), hop = true, force = false } = {}) {
   if (hop === false) return false
+  if (force) return true
   return usageProbeBackoffRemainingMs(unified, now) <= 0
 }
 
@@ -273,6 +369,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       source: 'official-cc-usage',
       via: 'crs-mock',
       interpretations: compareUsageInterpretations(raw),
+      limits_present: true,
       ...parsed,
       five_hour: official.five_hour || parsed.five_hour,
       seven_day: official.seven_day || parsed.seven_day,
@@ -300,6 +397,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       usage_error: usageRes.body?.error?.message || usageRes.body?.error,
       rate_limited: false,
     })
+  const usageMissingScope = usageScopeMissing(usageRes)
   const rawBody = usageRes.ok && usageRes.body && typeof usageRes.body === 'object' ? usageRes.body : {}
   const official = usageRes.ok ? interpretOfficialUsage(rawBody) : null
   const parsed = usageRes.ok
@@ -310,37 +408,23 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
         seven_day_sonnet: null,
         seven_day_opus: null,
         seven_day_oi: null,
+        usage_has_fable: null,
         extra_usage: null,
       }
 
   let fable = null
-  if (includeFable) {
-    const fableRes = await callGoWorker({
-      exec,
-      timeoutMs,
-      identity,
-      body: {
-        model: FABLE_PROBE_MODEL,
-        max_tokens: 1,
-        messages: [{ role: 'user', content: 'hi' }],
-      },
-      // Do not send inbound anthropic-beta — unofficial probes must replay
-      // the slot's stored Claude Code betas, not overwrite them.
-    })
-    fable = parseFableProbe(fableRes)
-    // Usage API succeeding means the slot grant is not revoked.
-    // A Fable-only 401 is Pro / format noise, not 整号吊销.
-    if (
-      usageRes.ok &&
-      fable &&
-      (fable.banned || fable.status === 401 || /revoked|oauth|authentication/i.test(String(fable.error || '')))
-    ) {
-      fable = {
-        ...fable,
-        banned: false,
-        plan_denied: true,
-        error: fable.plan_denied || fable.status === 403 ? fable.error : 'plan_denied',
-      }
+  if (includeFable && !usageMissingScope) {
+    // Do not send inbound anthropic-beta — unofficial probes must replay
+    // the slot's stored Claude Code betas, not overwrite them.
+    fable = (await probeFableEntitlement({ exec, timeoutMs, identity })).fable
+    const hasFableUsage = parsed.usage_has_fable === true || !!parsed.seven_day_oi
+    // Usage listing a Fable model is Max. Hop 401/403 is format noise, not Pro.
+    if (usageRes.ok && fable && hasFableUsage) {
+      fable = { ...fable, banned: false, plan_denied: false }
+    } else if (usageRes.ok && fable?.banned) {
+      // A successful official usage call means the probe's 401 is not proof
+      // of either a revoked credential or a Pro subscription.
+      fable = { ...fable, banned: false }
     }
   }
 
@@ -365,9 +449,14 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
     source: 'official-cc-usage',
     via: usageRes.via || 'go-worker',
     usage_status: usageRes.status,
+    limits_present: usageRes.ok ? isCompleteOAuthUsage(rawBody, parsed) : false,
+    usage_scope_missing: usageMissingScope,
+    credential_scope_required: usageMissingScope ? 'user:profile' : null,
     usage_error: usageRes.ok
       ? null
-      : usageRes.body?.error?.message || usageRes.body?.error || `http_${usageRes.status}`,
+      : usageMissingScope
+        ? '当前凭证缺少 user:profile scope，需导入完整 OAuth 后才能探测官方 /usage'
+        : usageRes.body?.error?.message || usageRes.body?.error || `http_${usageRes.status}`,
     ...parsed,
     five_hour: official?.five_hour || parsed.five_hour,
     seven_day: official?.seven_day || parsed.seven_day,

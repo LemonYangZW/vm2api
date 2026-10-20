@@ -1,4 +1,4 @@
-import test from 'node:test'
+import test, { mock } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import fs from 'node:fs'
@@ -9,25 +9,35 @@ import {
   dispatchStreamInference,
   dispatchCallInference,
   rustHealthTtlMs,
+  rustSlotWaitMs,
+  resolveHopSlotWaitMs,
+  rustShouldWaitForSlot,
+  waitForReadySlot,
   clearRustHealthCache,
   rememberRustHealth,
   peekRustHealth,
 } from '../../src/lib/transport/kernel-router.mjs'
+import { rustKernelBusy, rustKernelReachable } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
   ensureRustKernel,
   writeKernelConfig,
+  syncClaudeKernelConfigsFromFile,
   reconcileCliHopRuntime,
   wrapSlotCount,
   wrapNewerThanKernel,
-  credentialsNewerThanKernel,
   WRAP_SLOT_MAX,
   WRAP_IDLE_RECYCLE_MS,
   scheduleWrapRecycle,
   recycleWrapIfIdle,
   resetWrapRecycleState,
+  beginWrapHop,
+  endWrapHop,
+  requestKernelReloadWhenIdle,
 } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { rustKernelPaths, isNeedsRefreshResult } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
+import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
@@ -52,6 +62,42 @@ test('rustHealthTtlMs defaults to 2s and 0 disables cache', () => {
   assert.equal(rustHealthTtlMs({}), 2000)
   assert.equal(rustHealthTtlMs({ inference: { health_ttl_ms: 0 } }), 0)
   assert.equal(rustHealthTtlMs({ inference: { health_ttl_ms: 1500 } }), 1500)
+})
+
+test('busy CLI waits for a free slot and is not hop-ready', () => {
+  const busy = { ok: true, engine: 'rust', ready_slots: 0, cli_pid: 12 }
+  const ready = { ok: true, engine: 'rust', ready_slots: 2, cli_pid: 12 }
+  assert.equal(rustKernelBusy(busy), true)
+  assert.equal(rustKernelReachable(busy), false)
+  assert.equal(rustShouldWaitForSlot(busy, 0), true)
+  assert.equal(rustShouldWaitForSlot(ready, 0), false)
+  assert.equal(rustShouldWaitForSlot(ready, 1), true)
+  assert.equal(rustSlotWaitMs({}), 30_000)
+  assert.equal(rustSlotWaitMs({ inference: { slot_wait_ms: 1500 } }), 1500)
+})
+
+test('waitForReadySlot times out instead of hopping into a full kernel', async () => {
+  const result = await waitForReadySlot({ vmId: 'vm-missing-slot' }, 250, 50)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'slot_busy')
+})
+
+test('hop slot wait uses remaining wait-plan budget instead of a second 30s', () => {
+  assert.equal(resolveHopSlotWaitMs({ remainingBudgetMs: 0 }), 0)
+  assert.equal(resolveHopSlotWaitMs({ remainingBudgetMs: 5000 }), 5000)
+  assert.equal(
+    resolveHopSlotWaitMs({ remainingBudgetMs: 45_000, routing: { inference: { slot_wait_ms: 8000 } } }),
+    8000,
+  )
+  assert.equal(resolveHopSlotWaitMs({}), 30_000)
+})
+
+test('waitForReadySlot with zero budget does an immediate check only', async () => {
+  const started = Date.now()
+  const result = await waitForReadySlot({ vmId: 'vm-zero-budget' }, 0, 50)
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'slot_busy')
+  assert.ok(Date.now() - started < 80)
 })
 
 test('rust health cache hits within TTL and misses when disabled', () => {
@@ -156,24 +202,29 @@ unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   const prev = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
   const fx = await kernelFixture((req, res) => {
+    assert.equal(req.headers['x-internal-token'], 'internal-test')
     assert.equal(req.headers['x-kin-internal-token'], 'internal-test')
     res.writeHead(200, {
       'content-type': 'text/event-stream',
-      trailer: 'x-kin-usage, x-kin-stop-reason',
-      'x-kin-terminal-state': 'verified',
-      'x-kin-model': 'claude-haiku-4-5-20251001',
+      trailer: 'x-usage, x-stop-reason',
+      'x-terminal-state': 'verified',
+      'x-model': 'claude-haiku-4-5-20251001',
     })
+    res.write('event: message_start\n')
+    res.write('data: {"type":"message_start","message":{"type":"message","role":"assistant","content":[]}}\n\n')
+    res.write('event: content_block_start\n')
+    res.write('data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}\n\n')
     res.write('event: message_stop\n')
     res.write('data: {"type":"message_stop"}\n\n')
     res.addTrailers({
-      'x-kin-usage': JSON.stringify({
+      'x-usage': JSON.stringify({
         input_tokens: 12,
         output_tokens: 4,
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 5,
         cache_creation: { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 3 },
       }),
-      'x-kin-stop-reason': 'end_turn',
+      'x-stop-reason': 'end_turn',
     })
     res.end()
   })
@@ -210,6 +261,7 @@ unixTest('needs_refresh retries once via Go ensure', async () => {
   process.env.KIN_KERNEL_BIN = '/bin/true'
   let hits = 0
   let ensures = 0
+  let recycles = 0
   const fx = await kernelFixture((_req, res) => {
     hits += 1
     if (hits === 1) {
@@ -222,7 +274,7 @@ unixTest('needs_refresh retries once via Go ensure', async () => {
       )
       return
     }
-    res.writeHead(200, { 'content-type': 'application/json', 'x-kin-terminal-state': 'verified' })
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
     res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }))
   })
   try {
@@ -231,7 +283,9 @@ unixTest('needs_refresh retries once via Go ensure', async () => {
       body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] },
       routing: { inference: { engine: 'rust' } },
       ensureRust: async () => ({ ok: true }),
-      recycleWrap: () => {},
+      recycleWrap: () => {
+        recycles += 1
+      },
       ensureCredential: async (_exec, opts = {}) => {
         ensures += 1
         assert.equal(opts.force, true)
@@ -240,6 +294,7 @@ unixTest('needs_refresh retries once via Go ensure', async () => {
     })
     assert.equal(hits, 2)
     assert.equal(ensures, 1)
+    assert.equal(recycles, 0, 'the CLI reads refreshed credentials without recycling sibling requests')
     assert.equal(result.credential_retried, true)
     assert.equal(result.engine, 'rust')
   } finally {
@@ -304,7 +359,7 @@ unixTest('unhealthy rust does not fall back to go', async () => {
   const server = http.createServer((_req, res) => {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
-      'x-kin-terminal-state': 'verified',
+      'x-terminal-state': 'verified',
     })
     res.write('event: message_stop\n')
     res.write('data: {"type":"message_stop"}\n\n')
@@ -382,6 +437,64 @@ unixTest('pinned rust does not fall back to Go HTTP', async () => {
   assert.match(String(result.via), /rust-kernel/)
 })
 
+unixTest('streamed plan-limit error is a response, not a dead slot: no recycle', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-limit-'))
+  const runDir = path.join(root, 'vm-01', 'run')
+  const homeDir = path.join(root, 'vm-01', 'cli-home')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.mkdirSync(homeDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'internal-test\n', { mode: 0o600 })
+  const kernelSocket = path.join(runDir, 'kernel.sock')
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end(
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"provider error: You\'ve hit your limit · resets 11am (UTC)"}}\n\n',
+    )
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(kernelSocket, resolve)
+  })
+  const exec = {
+    vmId: 'vm-01',
+    homeDir,
+    vm: {
+      id: 'vm-01',
+      inference_engine: 'rust',
+      runtime: {
+        kernel_socket: kernelSocket,
+        worker_socket: path.join(runDir, 'worker.sock'),
+        worker_run_dir: runDir,
+        worker_token_file: path.join(runDir, 'internal.token'),
+      },
+    },
+  }
+  try {
+    const recycled = []
+    const result = await dispatchStreamInference({
+      exec,
+      body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] },
+      routing: { inference: { engine: 'rust' } },
+      ensureRust: async () => ({ ok: true, reason: 'already_up' }),
+      recycleWrap: (target) => {
+        recycled.push(target?.vmId)
+        return { ok: true, skipped: false }
+      },
+      timeoutMs: 3000,
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.committed, false)
+    assert.deepEqual(recycled, [])
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
 unixTest('committed Rust stream transport failure is not replayed on Go', async () => {
   const previous = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
@@ -430,11 +543,71 @@ unixTest('committed Rust stream transport failure is not replayed on Go', async 
     })
     assert.equal(result.engine, 'rust')
     assert.equal(result.wanted_engine, 'rust')
-    assert.equal(result.committed, true)
+    assert.equal(result.committed, false)
     assert.equal(result.transportError, true)
-    assert.equal(result.terminalState, 'incomplete')
-    assert.deepEqual(recycled, [])
+    assert.deepEqual(recycled, [], 'request failures leave recovery to the bounded watchdog')
   } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
+unixTest('a failed sibling hop cannot bypass watchdog recovery after other hops finish', async () => {
+  resetWrapRecycleState()
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-sibling-'))
+  const runDir = path.join(root, 'vm-02', 'run')
+  const homeDir = path.join(root, 'vm-02', 'cli-home')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.mkdirSync(homeDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'internal-test\n', { mode: 0o600 })
+  const kernelSocket = path.join(runDir, 'kernel.sock')
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.flushHeaders()
+    res.write('data: {"type":"message_start","message":{}}\n\n', () => res.destroy())
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(kernelSocket, resolve)
+  })
+  const exec = {
+    vmId: 'vm-02',
+    homeDir,
+    vm: {
+      id: 'vm-02',
+      inference_engine: 'rust',
+      runtime: {
+        kernel_socket: kernelSocket,
+        worker_socket: path.join(runDir, 'worker.sock'),
+        worker_run_dir: runDir,
+        worker_token_file: path.join(runDir, 'internal.token'),
+      },
+    },
+  }
+  beginWrapHop(exec)
+  const recycled = []
+  try {
+    await dispatchStreamInference({
+      exec,
+      body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] },
+      routing: { inference: { engine: 'rust' } },
+      ensureRust: async () => ({ ok: true, reason: 'already_up' }),
+      recycleWrap: (target) => {
+        recycled.push(target?.vmId)
+        return { ok: true, skipped: false }
+      },
+      timeoutMs: 3000,
+    })
+    assert.deepEqual(recycled, [])
+    endWrapHop(exec)
+    assert.deepEqual(recycled, [], 'ending the sibling does not trigger a request-side restart')
+  } finally {
+    endWrapHop(exec)
+    resetWrapRecycleState()
     await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
     if (previous == null) delete process.env.KIN_KERNEL_BIN
@@ -457,11 +630,55 @@ test('writeKernelConfig separates container paths from host socket paths', () =>
   assert.equal(doc.claude_bin, '/home/kincli/.kin/cli-node')
   assert.equal(doc.https_proxy, undefined)
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
+  assert.equal(doc.default_cache_ttl, '1h')
+  assert.equal(doc.auto_compact_window, null)
   assert.match(written.socketPath.replace(/\\/g, '/'), /vms\/vm-09\/run\/kernel\.sock$/)
   assert.equal(fs.readFileSync(written.tokenPath, 'utf8').trim(), 'tok')
   const exec = { vmId: 'vm-09', homeDir: path.join(root, 'vms', 'vm-09', 'cli-home'), vm: { id: 'vm-09' } }
   assert.equal(rustKernelPaths(exec).socketPath, written.socketPath)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig idle timeout follows the panel stream idle timeout', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-idle-cfg-'))
+  const prev = process.env.KIN_STREAM_IDLE_TIMEOUT
+  const idleOf = (opts) =>
+    JSON.parse(fs.readFileSync(writeKernelConfig(root, { id: 'vm-09' }, { token: 'tok', ...opts }).configPath, 'utf8'))
+      .idle_timeout_seconds
+  try {
+    delete process.env.KIN_STREAM_IDLE_TIMEOUT
+    // Default stays 180s; the panel raises it when needed.
+    assert.equal(idleOf({ routing: {} }), 180)
+    process.env.KIN_STREAM_IDLE_TIMEOUT = '900000'
+    assert.equal(idleOf({ routing: {} }), 900)
+    // Panel value wins over env and is clamped to 30s..60min.
+    assert.equal(idleOf({ routing: { failover: { stream_idle_timeout_ms: 1_200_000 } } }), 1200)
+    assert.equal(idleOf({ routing: { failover: { stream_idle_timeout_ms: 5000 } } }), 30)
+    assert.equal(idleOf({ routing: { failover: { stream_idle_timeout_ms: 99_999_999 } } }), 3600)
+    // Partial callers without routing keep the last written value.
+    idleOf({ routing: { failover: { stream_idle_timeout_ms: 1_200_000 } } })
+    assert.equal(idleOf({}), 1200)
+  } finally {
+    if (prev === undefined) delete process.env.KIN_STREAM_IDLE_TIMEOUT
+    else process.env.KIN_STREAM_IDLE_TIMEOUT = prev
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('writeKernelConfig request bytes follow the panel body limit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-body-cfg-'))
+  const bytesOf = (opts) =>
+    JSON.parse(fs.readFileSync(writeKernelConfig(root, { id: 'vm-09' }, { token: 'tok', ...opts }).configPath, 'utf8'))
+      .max_request_bytes
+  try {
+    assert.equal(bytesOf({ routing: {} }), 32 * 1024 * 1024)
+    assert.equal(bytesOf({ routing: { failover: { max_request_mib: 64 } } }), 64 * 1024 * 1024)
+    assert.equal(bytesOf({ routing: { failover: { max_request_mib: 1 } } }), 8 * 1024 * 1024)
+    bytesOf({ routing: { failover: { max_request_mib: 64 } } })
+    assert.equal(bytesOf({}), 64 * 1024 * 1024)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
@@ -474,6 +691,7 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
       proxyUrl: 'socks5h://127.0.0.1:1080',
       proxyRequired: true,
       timezone: 'America/New_York',
+      routing: { compatibility: { cache_ttl: '5m' } },
     },
   )
   const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
@@ -482,13 +700,29 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   assert.equal(doc.claude_bin, '/home/kincli/.kin/cli-node')
   assert.equal(doc.https_proxy, undefined)
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
-  assert.equal(doc.system_layout, 'zero')
+  assert.equal(doc.system_layout, 'identity')
   assert.equal(doc.cli_version, OFFICIAL_CLI_VERSION)
+  assert.equal(doc.default_cache_ttl, '5m')
+  assert.equal(doc.auto_compact_window, null)
   assert.equal(doc.timezone, 'America/New_York')
   assert.equal(doc.proxy_url, '')
   assert.equal(doc.proxy_required, false)
   assert.doesNotMatch(raw, /sk-ant-|oat01|password=/i)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig points cc and crag at cc-node', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cc-cfg-'))
+  try {
+    for (const dataplane of ['cc', 'crag']) {
+      const written = writeKernelConfig(root, { id: 'vm-09', dataplane }, { token: 'tok' })
+      const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
+      assert.equal(doc.dataplane, dataplane)
+      assert.equal(doc.claude_bin, '/home/kincli/.kin/cc-node')
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('writeKernelConfig uses identity layout when persona_inject is rewrite', () => {
@@ -503,7 +737,117 @@ test('writeKernelConfig uses identity layout when persona_inject is rewrite', ()
   )
   const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
   assert.equal(doc.system_layout, 'identity')
+  assert.equal(doc.persona_preset, 'official_full')
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig uses identity when official_full has no persona_inject', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-preset-identity-'))
+  const written = writeKernelConfig(
+    root,
+    { id: 'vm-05', inference_engine: 'rust' },
+    { token: 'tok', routing: { compatibility: { persona_preset: 'official_full' } } },
+  )
+  const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
+  assert.equal(doc.system_layout, 'identity')
+  assert.equal(doc.persona_preset, 'official_full')
+  const before = fs.statSync(written.configPath).mtimeMs
+  const again = writeKernelConfig(
+    root,
+    { id: 'vm-05', inference_engine: 'rust' },
+    { token: 'tok', routing: { compatibility: { persona_preset: 'official_full' } } },
+  )
+  assert.equal(again.changed, false)
+  assert.equal(fs.statSync(written.configPath).mtimeMs, before)
+  const zero = writeKernelConfig(
+    root,
+    { id: 'vm-05', inference_engine: 'rust', persona_preset: 'zero' },
+    { token: 'tok', routing: { compatibility: { persona_preset: 'official_full' } } },
+  )
+  assert.equal(zero.changed, true)
+  const overridden = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
+  assert.equal(overridden.persona_preset, 'zero')
+  assert.equal(overridden.system_layout, 'zero')
+})
+
+test('kernel.json rename chowns the new inode to the slot uid before publish', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-owner-'))
+  const vm = { id: 'vm-01', inference_engine: 'rust' }
+  const owner = slotRuntimeOwner(vm)
+  const calls = []
+  const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
+    calls.push({ file, uid, gid })
+  })
+  const kernelOwned = () => calls.filter((call) => String(call.file).includes(`${path.sep}kernel.json`))
+  try {
+    assert.equal(owner.uid, Number(process.env.KIN_VM_UID_BASE || 10000) + 1)
+    assert.equal(owner.gid, Number(process.env.KIN_VM_GID || 987))
+    assert.equal(String(owner.uid), socksUidFor(vm))
+    const zero = { compatibility: { persona_preset: 'zero', cache_ttl: '5m' } }
+    const full = { compatibility: { persona_preset: 'official_full', cache_ttl: '5m' } }
+    const first = writeKernelConfig(root, vm, { token: 'tok', routing: zero })
+    assert.ok(
+      calls.some((call) => call.file === first.tokenPath || String(call.file).startsWith(`${first.tokenPath}.`)),
+    )
+    calls.length = 0
+    const changed = writeKernelConfig(root, vm, { token: 'tok', routing: full })
+    assert.equal(changed.changed, true)
+    const published = kernelOwned()
+    assert.ok(published.length >= 1)
+    assert.ok(
+      published.every((call) => call.uid === owner.uid && call.gid === owner.gid),
+      JSON.stringify(published),
+    )
+    assert.ok(
+      published.some(
+        (call) => call.file !== changed.configPath && String(call.file).startsWith(`${changed.configPath}.`),
+      ),
+    )
+    calls.length = 0
+    const again = writeKernelConfig(root, vm, { token: 'tok', routing: full })
+    assert.equal(again.changed, false)
+    assert.equal(fs.readFileSync(again.configPath, 'utf8').includes('"persona_preset": "official_full'), true)
+    assert.ok(
+      kernelOwned().some((call) => call.file === again.configPath && call.uid === owner.uid && call.gid === owner.gid),
+    )
+  } finally {
+    chown.mock.restore()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('routing.json mtime projects persona_preset into Claude kernel.json only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-persona-file-'))
+  const vms = path.join(root, 'vms')
+  fs.mkdirSync(vms, { recursive: true })
+  fs.writeFileSync(path.join(vms, 'vm-claude.json'), JSON.stringify({ id: 'vm-claude', persona_preset: 'zero' }))
+  fs.writeFileSync(
+    path.join(vms, 'vm-codex.json'),
+    JSON.stringify({ id: 'vm-codex', platform: 'openai', family: 'codex' }),
+  )
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { persona_preset: 'official_full', cache_ttl: '1h' } }))
+  try {
+    const first = syncClaudeKernelConfigsFromFile(root, routingFile)
+    assert.equal(first.updated, 1)
+    const kernelPath = path.join(vms, 'vm-claude', 'run', 'kernel.json')
+    const kernel = JSON.parse(fs.readFileSync(kernelPath, 'utf8'))
+    assert.equal(kernel.persona_preset, 'zero')
+    assert.equal(kernel.system_layout, 'zero')
+    assert.equal(fs.existsSync(path.join(vms, 'vm-codex', 'run', 'kernel.json')), false)
+    const repeat = syncClaudeKernelConfigsFromFile(root, routingFile)
+    assert.equal(repeat.skipped, true)
+    fs.writeFileSync(path.join(vms, 'vm-claude.json'), JSON.stringify({ id: 'vm-claude' }))
+    fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { persona_preset: 'official', cache_ttl: '1h' } }))
+    fs.utimesSync(routingFile, new Date(Date.now() + 5000), new Date(Date.now() + 5000))
+    const next = syncClaudeKernelConfigsFromFile(root, routingFile)
+    assert.equal(next.updated, 1)
+    const followed = JSON.parse(fs.readFileSync(kernelPath, 'utf8'))
+    assert.equal(followed.persona_preset, 'official')
+    assert.equal(followed.system_layout, 'identity')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('writeKernelConfig strips leftover CONNECT https_proxy', () => {
@@ -613,35 +957,52 @@ test('recycleWrapIfIdle bounces unknown and stale hops, skips fresh', async () =
   resetWrapRecycleState()
 })
 
+test('requestKernelReloadWhenIdle restarts only once no job runs', async () => {
+  resetWrapRecycleState()
+  const exec = { vmId: 'vm-07', vm: { id: 'vm-07' } }
+  const restarts = []
+  const restart = async (target) => {
+    restarts.push(target.vmId)
+    return { ok: true }
+  }
+  const idle = { ok: true, ready_slots: WRAP_SLOT_MAX, closed_slots: 0 }
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
+  try {
+    // Idle kernel: restart right away.
+    let req = requestKernelReloadWhenIdle(exec, { restart, health: async () => idle })
+    assert.deepEqual(await req.done, { ok: true })
+    assert.deepEqual(restarts, ['vm-07'])
+
+    // A job from another caller holds a slot: poll until it frees up.
+    let status = { ok: true, ready_slots: WRAP_SLOT_MAX - 1, closed_slots: 0 }
+    req = requestKernelReloadWhenIdle(exec, { restart, health: async () => status, pollMs: 10 })
+    await tick()
+    assert.deepEqual(restarts, ['vm-07'])
+    status = idle
+    // The poll timer is unref'd so a pending reload never holds the server open;
+    // ref'd ticks keep this test's loop alive until it fires.
+    for (let i = 0; i < 200 && restarts.length < 2; i++) await tick()
+    await req.done
+    assert.deepEqual(restarts, ['vm-07', 'vm-07'])
+
+    // A hop in this process: wait for its end even if the kernel looks idle.
+    beginWrapHop(exec)
+    req = requestKernelReloadWhenIdle(exec, { restart, health: async () => idle, pollMs: 60_000 })
+    await tick()
+    assert.deepEqual(restarts, ['vm-07', 'vm-07'])
+    endWrapHop(exec)
+    await req.done
+    assert.deepEqual(restarts, ['vm-07', 'vm-07', 'vm-07'])
+  } finally {
+    resetWrapRecycleState()
+  }
+})
+
 test('wrapSlotCount always pre-opens max native slots', () => {
   assert.equal(wrapSlotCount({}), WRAP_SLOT_MAX)
   assert.equal(wrapSlotCount({ policy: { maxConcurrency: 5 } }), WRAP_SLOT_MAX)
   assert.equal(wrapSlotCount({ policy: { maxConcurrency: 32 } }), WRAP_SLOT_MAX)
   assert.equal(wrapSlotCount({ policy: { maxConcurrency: 0 } }), WRAP_SLOT_MAX)
-})
-
-test('credentialsNewerThanKernel is true after host rotates the ticket', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cred-stale-'))
-  const home = path.join(root, 'vms', 'vm-13', 'cli-home')
-  const claude = path.join(home, '.claude')
-  const run = path.join(root, 'vms', 'vm-13', 'run')
-  fs.mkdirSync(claude, { recursive: true })
-  fs.mkdirSync(run, { recursive: true })
-  const sock = path.join(run, 'kernel.sock')
-  const cred = path.join(claude, 'credentials.json')
-  fs.writeFileSync(sock, '')
-  fs.writeFileSync(cred, '{}')
-  const past = new Date(Date.now() - 60_000)
-  fs.utimesSync(sock, past, past)
-  const exec = {
-    homeDir: home,
-    vm: { id: 'vm-13', runtime: { kernel_socket: sock } },
-  }
-  assert.equal(credentialsNewerThanKernel(exec), true)
-  fs.utimesSync(cred, past, past)
-  fs.utimesSync(sock, new Date(), new Date())
-  assert.equal(credentialsNewerThanKernel(exec), false)
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('wrapNewerThanKernel is true after wrap files replace a stale sock', () => {
@@ -729,6 +1090,127 @@ unixTest('Rust supervisor recycles when ready_slots stay at 0', async () => {
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-busy-'))
+  const written = writeKernelConfig(root, { id: 'vm-busy' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
+  const exec = {
+    vmId: 'vm-busy',
+    homeDir: path.join(root, 'vms', 'vm-busy', 'cli-home'),
+    vm: {
+      id: 'vm-busy',
+      runtime: { container: 'kin-busy', kernel_socket: written.socketPath },
+    },
+  }
+  let restarts = 0
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 4412, worker_version: 'fixture' }))
+  })
+  const runDockerExec = async (args) => {
+    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'restart') restarts += 1
+    return { ok: true }
+  }
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(written.socketPath, resolve)
+  })
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 8000, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    assert.equal(ready.reason, 'busy')
+    assert.equal(restarts, 0)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+for (const state of ['idle', 'partly occupied', 'full']) {
+  unixTest(`credential rotation does not restart the ${state} PID-1 kernel`, async () => {
+    resetWrapRecycleState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ticket-live-'))
+    const written = writeKernelConfig(root, { id: 'vm-ticket' }, { token: 'tok' })
+    const homeDir = path.join(root, 'vms', 'vm-ticket', 'cli-home')
+    const exec = {
+      vmId: 'vm-ticket',
+      homeDir,
+      vm: { id: 'vm-ticket', runtime: { container: 'kin-ticket', kernel_socket: written.socketPath } },
+    }
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({ ok: true, engine: 'rust', ready_slots: state === 'full' ? 0 : WRAP_SLOT_MAX, cli_pid: 4412 }),
+      )
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(written.socketPath, resolve)
+    })
+    const past = new Date(Date.now() - 60_000)
+    fs.utimesSync(written.socketPath, past, past)
+    const socketMtime = fs.statSync(written.socketPath).mtimeMs
+    fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true })
+    fs.writeFileSync(path.join(homeDir, '.claude', 'credentials.json'), '{}')
+    if (state === 'partly occupied') beginWrapHop(exec)
+    const commands = []
+    const runDockerExec = async (args) => {
+      commands.push(args)
+      if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+      if (args[0] === 'restart') return { ok: false, error: 'unexpected restart' }
+      return { ok: true }
+    }
+    try {
+      const ready = await ensureRustKernel(exec, { timeoutMs: 1000, runDockerExec })
+      assert.equal(ready.ok, true, JSON.stringify(ready))
+      assert.equal(ready.reason, state === 'idle' ? 'already_up' : 'busy')
+      assert.equal(
+        commands.some((args) => args[0] === 'restart' || args.some((arg) => arg.includes('kill -KILL'))),
+        false,
+      )
+      assert.equal(fs.statSync(written.socketPath).mtimeMs, socketMtime)
+    } finally {
+      if (state === 'partly occupied') endWrapHop(exec)
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(root, { recursive: true, force: true })
+      resetWrapRecycleState()
+    }
+  })
+}
+
+unixTest('supervisor repairs a Max subscription from a VM summary without restarting the live kernel', async () => {
+  const fx = await kernelFixture((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: WRAP_SLOT_MAX, cli_pid: 4412 }))
+  })
+  try {
+    fx.exec.vm.account_tier = 'max'
+    const file = path.join(fx.exec.homeDir, '.claude', 'credentials.json')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-ticket', subscriptionType: 'pro' } }),
+    )
+    fs.writeFileSync(rustKernelPaths(fx.exec).configPath, JSON.stringify({ slots_per_worker: WRAP_SLOT_MAX }))
+    const commands = []
+    const ready = await ensureRustKernel(fx.exec, {
+      runDockerExec: async (args) => {
+        commands.push(args)
+        return { ok: true }
+      },
+    })
+    assert.equal(ready.ok, true)
+    assert.equal(ready.reason, 'already_up')
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claudeAiOauth.subscriptionType, 'max')
+    assert.equal(
+      commands.some((args) => args[0] === 'restart'),
+      false,
+    )
+  } finally {
+    await fx.close()
   }
 })
 

@@ -2,11 +2,18 @@
  * Slot seed policy + inbound body sanitation.
  * The forwarding layer must never honor client-local settings/identity.
  *
- * Telemetry contract (one switch):
- *   telemetry_disabled === false  → delete kill-switch keys; sidecar enabled
- *   otherwise                     → write kill-switch keys = "1"; sidecar off
- * Official init (~/.claude.json userID/machineID) is the sidecar identity.
- * Sidecar stays off until those official IDs exist — never invent a device.
+ * Telemetry has one read: `telemetry_disabled === false` means on
+ * (`isTelemetryEnabled`). Everything else is a mirror of that bit.
+ *   on  → delete kill-switch keys; sidecar on
+ *         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+ *         do_not_track = false
+ *   off → kill-switch keys = "1"; sidecar off
+ *         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "0"
+ *         do_not_track = true (DO_NOT_TRACK=1)
+ * grove_enabled is always false (Help improve Claude off).
+ * Official CLI treats any set NONESSENTIAL value, including "0", as
+ * essential-traffic (GitHub #84631). The seed still writes the requested
+ * literal. Other kill switches must be absent when telemetry is on.
  */
 
 export function isTelemetryEnabled(pol = {}) {
@@ -16,12 +23,30 @@ export function isTelemetryEnabled(pol = {}) {
 /**
  * Official CLI kill switches. When telemetry is ON these keys must be
  * absent — GitHub #84631: the value "0" still disables.
+ * NONESSENTIAL is not in this map; it is always written by the contract.
+ * Bedrock and Vertex are not telemetry switches. A value of "1" makes the
+ * official CLI fetch AWS credentials from 169.254.169.254 instead of
+ * calling Anthropic. They are forced to "0" below.
  */
+export const NONESSENTIAL_TRAFFIC_ENV_KEY = 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'
+
+// Keep a visible, editable copy of the Claude opt-out setting next to the
+// generated settings.json. The file is intentionally plain text so operators
+// can inspect or replace it without having to edit JSON.
+export const DEFAULT_CLAUDE_SETTING = `${NONESSENTIAL_TRAFFIC_ENV_KEY}=1`
+
+export function normalizeClaudeSetting(value) {
+  if (typeof value !== 'string') return DEFAULT_CLAUDE_SETTING
+  return value.replace(/\r\n?/g, '\n').replace(/\n+$/g, '')
+}
+
 export const TELEMETRY_KILL_ENV = Object.freeze({
   DISABLE_TELEMETRY: '1',
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_USE_BEDROCK: '1',
-  CLAUDE_CODE_USE_VERTEX: '1',
+})
+
+export const CLOUD_PROVIDER_OFF_ENV = Object.freeze({
+  CLAUDE_CODE_USE_BEDROCK: '0',
+  CLAUDE_CODE_USE_VERTEX: '0',
 })
 
 export const TELEMETRY_KILL_ENV_KEYS = Object.freeze([...Object.keys(TELEMETRY_KILL_ENV), 'DO_NOT_TRACK'])
@@ -30,9 +55,13 @@ export const TELEMETRY_KILL_ENV_KEYS = Object.freeze([...Object.keys(TELEMETRY_K
  * Leftover keys from older seed / init scripts. They must never survive
  * into settings.env — even as "0" (GitHub #84631) or a local Anthropic
  * hop URL that fights the Go worker + slot SOCKS5 path.
+ * Bedrock and Vertex are stripped here so a caller "1" cannot win, then
+ * rewritten as "0".
  */
 export const LEGACY_SCRIPT_ENV_KEYS = Object.freeze([
   ...TELEMETRY_KILL_ENV_KEYS,
+  ...Object.keys(CLOUD_PROVIDER_OFF_ENV),
+  NONESSENTIAL_TRAFFIC_ENV_KEY,
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
@@ -48,13 +77,21 @@ export function stripLegacyScriptEnv(env = {}) {
   return next
 }
 
+export function nonessentialTrafficValue(pol = {}) {
+  return isTelemetryEnabled(pol) ? '1' : '0'
+}
+
 export function applyRequiredSeedEnv(env = {}, pol = {}) {
   const next = { ...env }
   if (isTelemetryEnabled(pol)) {
     for (const key of TELEMETRY_KILL_ENV_KEYS) delete next[key]
-    return next
+  } else {
+    Object.assign(next, TELEMETRY_KILL_ENV)
   }
-  return { ...next, ...TELEMETRY_KILL_ENV }
+  next[NONESSENTIAL_TRAFFIC_ENV_KEY] = nonessentialTrafficValue(pol)
+  for (const key of Object.keys(CLOUD_PROVIDER_OFF_ENV)) delete next[key]
+  Object.assign(next, CLOUD_PROVIDER_OFF_ENV)
+  return next
 }
 
 /**
@@ -72,9 +109,23 @@ export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra } = {})
     env.LANG = String(locale)
     env.LC_ALL = String(locale)
   }
-  if (!isTelemetryEnabled(pol) && pol.do_not_track !== false) env.DO_NOT_TRACK = '1'
+  if (!isTelemetryEnabled(pol)) env.DO_NOT_TRACK = '1'
   else delete env.DO_NOT_TRACK
-  return applyRequiredSeedEnv(env, pol)
+  const out = applyRequiredSeedEnv(env, pol)
+  // 2.1.283+ sends x-claude-code-prompt-id only when this is set. Default on.
+  out.CLAUDE_CODE_GATEWAY_HINT_HEADERS = '1'
+  if (out.CLAUDE_CODE_ATTRIBUTION_HEADER == null) out.CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
+  return out
+}
+
+export function callerAutoCompactWindow(body = {}) {
+  const sources = [body?.settings?.env, body?.claude_settings?.env, body?.env]
+  for (const source of sources) {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) continue
+    const value = Number(source.CLAUDE_CODE_AUTO_COMPACT_WINDOW)
+    if (Number.isInteger(value) && value >= 100_000 && value <= 1_000_000) return value
+  }
+  return null
 }
 
 export function buildSeedSettingsEnv(pol = {}, extra = {}) {
@@ -87,23 +138,31 @@ export function seedTelemetryContract(pol = {}) {
     telemetry_enabled: enabled,
     telemetry_disabled: !enabled,
     kill_keys: [...TELEMETRY_KILL_ENV_KEYS],
-    required_env: enabled ? {} : { ...TELEMETRY_KILL_ENV },
+    required_env: {
+      ...(enabled ? {} : TELEMETRY_KILL_ENV),
+      [NONESSENTIAL_TRAFFIC_ENV_KEY]: enabled ? '1' : '0',
+      ...CLOUD_PROVIDER_OFF_ENV,
+    },
+    grove_enabled: false,
     note: enabled
-      ? 'telemetry on: kill-switch keys deleted from settings.env'
-      : 'telemetry off: kill-switch keys written as 1',
+      ? 'telemetry on: kill-switch keys deleted; NONESSENTIAL=1; Bedrock and Vertex forced off; grove_enabled false'
+      : 'telemetry off: DISABLE_TELEMETRY=1; NONESSENTIAL=0; Bedrock and Vertex forced off; grove_enabled false',
   }
 }
 
 export function defaultSeedPolicy(partial = {}) {
-  const telemetryDisabled = partial.telemetry_disabled !== false
+  const telemetryDisabled = !isTelemetryEnabled(partial)
   return {
     telemetry_disabled: telemetryDisabled,
-    disable_nonessential_traffic: telemetryDisabled ? partial.disable_nonessential_traffic !== false : false,
-    do_not_track: telemetryDisabled ? partial.do_not_track !== false : false,
+    // Mirrors. Callers must not read these to decide if telemetry is on.
+    disable_nonessential_traffic: !telemetryDisabled,
+    grove_enabled: false,
+    do_not_track: telemetryDisabled,
     reject_client_settings: partial.reject_client_settings !== false,
     reject_client_metadata_identity: partial.reject_client_metadata_identity !== false,
     theme: partial.theme || 'dark',
     extra_env: partial.extra_env && typeof partial.extra_env === 'object' ? partial.extra_env : {},
+    claude_setting: normalizeClaudeSetting(partial.claude_setting),
     settings_json_override:
       partial.settings_json_override && typeof partial.settings_json_override === 'object'
         ? partial.settings_json_override
@@ -112,15 +171,11 @@ export function defaultSeedPolicy(partial = {}) {
 }
 
 /**
- * Latest create / official-init default. Telemetry is ON (console「标准」).
- * Do not use this to normalize existing slots that omit the field —
- * those still mean telemetry off via defaultSeedPolicy().
+ * New slots default to telemetry off. Only an explicit override enables uploads.
  */
 export function standardSeedPolicy(partial = {}) {
   return defaultSeedPolicy({
-    telemetry_disabled: false,
-    disable_nonessential_traffic: false,
-    do_not_track: false,
+    telemetry_disabled: true,
     ...partial,
   })
 }

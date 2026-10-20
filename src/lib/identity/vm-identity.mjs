@@ -19,8 +19,8 @@ export function readJsonSafe(p, fallback = null) {
   }
 }
 
-/** Official CLI 2.1.263 capture (vm-10, 2026-09-06). Outbound UA/billing stay on this. */
-export const OFFICIAL_CLI_VERSION = '2.1.263'
+/** Official Claude Code version. 2.1.295 and older are below the 2.1.296 minimum. */
+export const OFFICIAL_CLI_VERSION = '2.1.296'
 export const OFFICIAL_CLAUDE_CLI_UA = `claude-cli/${OFFICIAL_CLI_VERSION} (external, sdk-cli)`
 export const OFFICIAL_STAINLESS = Object.freeze({
   stainless_lang: 'js',
@@ -28,7 +28,7 @@ export const OFFICIAL_STAINLESS = Object.freeze({
   stainless_arch: 'x64',
   stainless_runtime: 'node',
   stainless_runtime_version: 'v26.3.0',
-  stainless_package_version: '0.112.1',
+  stainless_package_version: '0.128.0',
 })
 
 export function officialClaudeCliUa(version = OFFICIAL_CLI_VERSION) {
@@ -104,6 +104,7 @@ export function loadVmIdentity(exec = {}) {
     env,
     theme: seed.theme || settings.theme || 'dark',
     autoUpdates: false,
+    grove_enabled: false,
   }
 
   return {

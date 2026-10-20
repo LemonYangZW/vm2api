@@ -3,25 +3,31 @@
  * 公开仓只走 rust cli-hop（kernel → Claude Code）。Go HTTP 转发不再启用。
  * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
+import { clientCancelledResult, isClientCancelledResult } from '../core/errors.mjs'
 import { ensureWorkerCredential } from './go-worker-client.mjs'
 import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
 import {
   streamRustKernel,
   callRustKernel,
   rustKernelHealth,
   rustKernelReachable,
+  rustKernelBusy,
   isNeedsRefreshResult,
+  kernelFaults,
 } from './rust-kernel-client.mjs'
 import {
-  ensureRustKernel,
   kernelBinPath,
-  scheduleWrapRecycle,
   awaitWrapRecycle,
   noteWrapHop,
-  credentialsNewerThanKernel,
+  beginWrapHop,
+  endWrapHop,
+  wrapHopInflight,
 } from './rust-kernel-supervisor.mjs'
 
 const rustHealthCache = new Map()
+const DEFAULT_SLOT_WAIT_MS = 30_000
+const DEFAULT_SLOT_POLL_MS = 200
 
 export function rustHealthTtlMs(routing = {}) {
   const raw = routing?.inference?.health_ttl_ms
@@ -29,6 +35,48 @@ export function rustHealthTtlMs(routing = {}) {
   const n = Number(raw)
   if (!Number.isFinite(n) || n < 0) return 2000
   return n
+}
+
+export function rustSlotWaitMs(routing = {}) {
+  const raw = routing?.inference?.slot_wait_ms
+  if (raw == null || raw === '') return DEFAULT_SLOT_WAIT_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_SLOT_WAIT_MS
+  return n
+}
+
+/** Hop slot poll uses leftover wait-plan budget; never stacks a second independent 30s. */
+export function resolveHopSlotWaitMs({ remainingBudgetMs, routing } = {}) {
+  const configuredRaw = routing?.inference?.slot_wait_ms
+  const hasConfigured = configuredRaw != null && configuredRaw !== ''
+  const configured = hasConfigured ? rustSlotWaitMs(routing) : null
+  const budget = Number(remainingBudgetMs)
+  const hasBudget = remainingBudgetMs != null && remainingBudgetMs !== '' && Number.isFinite(budget)
+  if (hasBudget) {
+    if (budget <= 0) return 0
+    if (configured != null) return Math.min(budget, configured)
+    return budget
+  }
+  return rustSlotWaitMs(routing)
+}
+
+export function rustShouldWaitForSlot(health, inflight = 0) {
+  return rustKernelBusy(health) || Number(inflight) > 0
+}
+
+export async function waitForReadySlot(exec, timeoutMs = DEFAULT_SLOT_WAIT_MS, pollMs = DEFAULT_SLOT_POLL_MS) {
+  const parsed = Number(timeoutMs)
+  const waitMs = Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_SLOT_WAIT_MS
+  const deadline = Date.now() + waitMs
+  const gap = Math.max(40, Number(pollMs) || DEFAULT_SLOT_POLL_MS)
+  let last = await rustKernelHealth(exec, { timeoutMs: 400 })
+  if (rustKernelReachable(last)) return { ok: true, reason: 'already_up', health: last }
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, gap))
+    last = await rustKernelHealth(exec, { timeoutMs: 400 })
+    if (rustKernelReachable(last)) return { ok: true, reason: 'slot_ready', health: last }
+  }
+  return { ok: false, reason: 'slot_busy', health: last, error: 'rust kernel has no free slot' }
 }
 
 export function clearRustHealthCache(vmId = null) {
@@ -56,9 +104,10 @@ export function peekRustHealth(exec, ttlMs, now = Date.now()) {
   return hit
 }
 
-export function resolveHopEngine(_vm, _routing = {}, { rustReady = null, binPath = null } = {}) {
+export function resolveHopEngine(vm, _routing = {}, { rustReady = null, binPath = null } = {}) {
   const wanted = 'rust'
-  const bin = binPath != null ? String(binPath).trim() : kernelBinPath()
+  // A baked slot image carries its own kernel; the host binary only matters for local mounts.
+  const bin = slotHost(vm).bakedKernel ? 'image' : binPath != null ? String(binPath).trim() : kernelBinPath()
   if (rustReady === true) {
     return { engine: 'rust', wanted, reason: 'configured_rust', fallback: false }
   }
@@ -75,9 +124,11 @@ export function resolveHopEngine(_vm, _routing = {}, { rustReady = null, binPath
 }
 
 function rustUnavailableResult(ready) {
+  // Both mean "try another VM": the kernel answered and said so.
+  const answered = ready?.reason === 'slot_busy' || ready?.reason === 'kernel_unavailable'
   return {
     ok: false,
-    status: 0,
+    status: answered ? 503 : 0,
     via: 'rust-kernel',
     engine: 'rust',
     body: {
@@ -89,8 +140,8 @@ function rustUnavailableResult(ready) {
       },
     },
     headers: {},
-    terminalState: 'transport_error',
-    transportError: true,
+    terminalState: answered ? 'rejected' : 'transport_error',
+    transportError: !answered,
   }
 }
 
@@ -132,28 +183,15 @@ async function prepareSlotCredentials(exec) {
   ensureOfficialCredentialLink(exec.homeDir, ids || {})
 }
 
-async function bounceRustForFreshTicket(exec) {
-  await prepareSlotCredentials(exec)
-  await ensureWorkerCredential(exec)
-  const rec = scheduleWrapRecycle(exec, { cooldownMs: 0 })
-  if (rec.pending) await rec.pending
-  clearRustHealthCache(cacheKey(exec))
-  const started = await ensureRustKernel(exec)
-  if (started?.ok) rememberRustHealth(exec, started)
-  else clearRustHealthCache(cacheKey(exec))
-  return started
-}
-
-async function prepareRust(exec, { ensure, routing } = {}) {
+async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
   await awaitWrapRecycle(exec)
+  const fault = kernelFaults.get(cacheKey(exec))
+  if (fault) return { ok: false, reason: 'kernel_unavailable', error: fault }
   if (typeof ensure === 'function') return ensure(exec)
   await prepareSlotCredentials(exec)
-  if (credentialsNewerThanKernel(exec)) {
-    return bounceRustForFreshTicket(exec)
-  }
   const ttl = rustHealthTtlMs(routing)
   const cached = peekRustHealth(exec, ttl)
-  if (cached) {
+  if (cached && rustKernelReachable(cached.health)) {
     return { ok: true, reason: 'health_cache', health: cached.health }
   }
   const health = await rustKernelHealth(exec, { timeoutMs: 800 })
@@ -162,11 +200,25 @@ async function prepareRust(exec, { ensure, routing } = {}) {
     rememberRustHealth(exec, ready)
     return ready
   }
-  if (exec?.homeDir) await ensureWorkerCredential(exec)
-  const started = await ensureRustKernel(exec)
-  if (started?.ok) rememberRustHealth(exec, started)
-  else clearRustHealthCache(cacheKey(exec))
-  return started
+  // The kernel spent its own CLI restarts, or the watchdog spent its container
+  // restarts. Only the watchdog restarts it, bounded; a request must not.
+  if (health?.healthy === false) {
+    return {
+      ok: false,
+      reason: 'kernel_unavailable',
+      error: health?.unhealthy_reason || 'rust kernel unhealthy',
+    }
+  }
+  if (rustShouldWaitForSlot(health, wrapHopInflight(exec))) {
+    const waited = await waitForReadySlot(exec, resolveHopSlotWaitMs({ remainingBudgetMs: slotWaitMs, routing }))
+    if (waited?.ok) {
+      rememberRustHealth(exec, waited)
+      return waited
+    }
+    return waited
+  }
+  clearRustHealthCache(cacheKey(exec))
+  return { ok: false, reason: 'kernel_unavailable', error: 'rust kernel is down; watchdog recovery pending' }
 }
 
 async function runHop({ mode, opts }) {
@@ -175,8 +227,28 @@ async function runHop({ mode, opts }) {
   let engine = 'rust'
   let reason = decision.reason
   if (!decision.blocked) {
-    const ready = await prepareRust(opts.exec, { ensure: opts.ensureRust, routing })
+    const ready = await prepareRust(opts.exec, {
+      ensure: opts.ensureRust,
+      routing,
+      slotWaitMs: opts.slotWaitMs,
+    })
     if (ready?.ok) {
+      if (opts.requestContext && opts.cliHop && ready.health?.classifier_request_context !== true) {
+        return {
+          ok: false,
+          status: 400,
+          terminalState: 'rejected',
+          upstreamExecutions: 0,
+          body: {
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              code: 'classifier_runtime_unsupported',
+              message: 'The kernel/CLI runtime does not support classifier request context.',
+            },
+          },
+        }
+      }
       reason = ready.reason || 'configured_rust'
     } else {
       return {
@@ -193,34 +265,43 @@ async function runHop({ mode, opts }) {
     }
   }
   const send = mode === 'stream' ? streamRustKernel : callRustKernel
-  let result = await send(opts)
-  noteWrapHop(opts.exec)
-  if (result.transportError === true && result.committed !== true) {
+  beginWrapHop(opts.exec)
+  let result
+  try {
     result = await send(opts)
-    result = { ...result, rust_transport_retried: true }
     noteWrapHop(opts.exec)
-  }
-  if (isNeedsRefreshResult(result)) {
-    const ensure = opts.ensureCredential || ensureWorkerCredential
-    const ensured = await ensure(opts.exec, { force: true })
-    if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
-    else {
-      const recycle = opts.recycleWrap || scheduleWrapRecycle
-      recycle(opts.exec)
-      await awaitWrapRecycle(opts.exec)
+    if (opts.signal?.aborted || isClientCancelledResult(result)) {
+      result = clientCancelledResult(result)
+    } else if (result.transportError === true && result.committed !== true) {
       result = await send(opts)
-      result = { ...result, credential_retried: true }
+      result = { ...result, rust_transport_retried: true }
       noteWrapHop(opts.exec)
     }
-  }
-  if (result.terminalState === 'incomplete' || (result.committed && result.transportError)) {
-    clearRustHealthCache(cacheKey(opts.exec))
-  }
-  return {
-    ...result,
-    engine,
-    wanted_engine: decision.wanted,
-    engine_reason: reason,
+    if (!isClientCancelledResult(result) && isNeedsRefreshResult(result)) {
+      const ensure = opts.ensureCredential || ensureWorkerCredential
+      const ensured = await ensure(opts.exec, { force: true })
+      if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
+      else {
+        // The CLI invalidates its OAuth cache from the shared credential file
+        // before creating each API client. Recycling here kills sibling hops.
+        result = await send(opts)
+        result = { ...result, credential_retried: true }
+        noteWrapHop(opts.exec)
+      }
+    }
+    return {
+      ...result,
+      engine,
+      wanted_engine: decision.wanted,
+      engine_reason: reason,
+    }
+  } finally {
+    endWrapHop(opts.exec)
+    // Inference failures only invalidate health. The watchdog owns container
+    // recovery, so concurrent requests cannot bypass its restart budget.
+    if (result?.transportError || result?.body?.error?.code === 'kernel_unavailable') {
+      clearRustHealthCache(cacheKey(opts.exec))
+    }
   }
 }
 

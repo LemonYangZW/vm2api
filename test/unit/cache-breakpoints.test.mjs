@@ -13,6 +13,7 @@ import path from 'node:path'
 
 import {
   DEFAULT_CACHE_BREAKPOINTS,
+  DEFAULT_CACHE_TTL,
   DEFAULT_MIN_CACHEABLE_TOKENS,
   applyCacheBreakpoints,
   applyMessageBreakpoints,
@@ -132,7 +133,7 @@ test('a system long enough to be cached gets the tail breakpoint', () => {
     hits.map((h) => h.where),
     ['system[1]', 'messages[0][0]'],
   )
-  assert.ok(hits.every((h) => h.type === 'ephemeral' && h.ttl === '5m'))
+  assert.ok(hits.every((h) => h.type === 'ephemeral' && h.ttl === DEFAULT_CACHE_TTL))
 })
 
 test('the official four-block system keeps its own boundary on the agent slot', () => {
@@ -165,7 +166,7 @@ test('the tail block is chosen so the caller system stays inside the cached pref
   })
   assert.equal(out.system[0].cache_control, undefined)
   assert.equal(out.system[1].cache_control, undefined)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
 })
 
 test('an existing ttl is never overwritten', () => {
@@ -184,7 +185,7 @@ test('a cache_control without ttl is filled in place', () => {
   const out = injectSystemTailBreakpoint({
     system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }],
   })
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
 })
 
 test('tools tail skips server tools and deferred tools', () => {
@@ -196,7 +197,7 @@ test('tools tail skips server tools and deferred tools', () => {
     ],
   })
   assert.equal(out.tools[0].cache_control, undefined)
-  assert.deepEqual(out.tools[1].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.tools[1].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
   assert.equal(out.tools[2].cache_control, undefined)
 })
 
@@ -207,7 +208,7 @@ test('a deferred tool loses the marker Anthropic rejects', () => {
       { name: 'Lazy', input_schema: {}, defer_loading: true, cache_control: { type: 'ephemeral', ttl: '5m' } },
     ],
   })
-  assert.deepEqual(out.tools[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.tools[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
   assert.equal(out.tools[1].cache_control, undefined)
 })
 
@@ -272,12 +273,51 @@ test('off leaves messages untouched', () => {
   const body = { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }
   assert.equal(applyMessageBreakpoints(body, '5m', 'off'), body)
 })
+test('tail mode marks only the current message', () => {
+  const out = applyMessageBreakpoints(
+    {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'u1' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'u2' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a2' }] },
+        { role: 'user', content: [{ type: 'text', text: 'u3' }] },
+      ],
+    },
+    '1h',
+    'tail',
+  )
+  assert.equal(out.messages[2].content[0].cache_control, undefined)
+  assert.deepEqual(out.messages[4].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
 
 test('a string content block is promoted so the marker has somewhere to live', () => {
   const out = applyMessageBreakpoints({ messages: [{ role: 'user', content: 'plain' }] }, '5m', 'fill')
   assert.deepEqual(out.messages[0].content, [
     { type: 'text', text: 'plain', cache_control: { type: 'ephemeral', ttl: '5m' } },
   ])
+})
+
+test('rewrite stamps the last non-thinking content block', () => {
+  const out = applyMessageBreakpoints(
+    {
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'answer' },
+            { type: 'thinking', thinking: 'hidden', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'redacted' },
+          ],
+        },
+      ],
+    },
+    '1h',
+    'rewrite',
+  )
+  assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(out.messages[0].content[1].cache_control, undefined)
+  assert.equal(out.messages[0].content[2].cache_control, undefined)
 })
 
 test('an inbound 1h request is injected at 1h so enforceCacheTtlOrder cannot downgrade it', () => {
@@ -335,15 +375,12 @@ test('a thinking block never keeps cache_control', () => {
   assert.equal(breakpoints(out).length, 0)
 })
 
-test('over the four-breakpoint budget, tools are sacrificed and system is kept', () => {
+test('over the four-breakpoint budget, message anchors are kept over system extras', () => {
   const mark = { type: 'ephemeral', ttl: '5m' }
   const out = prepareAnthropicRequest({
     model: 'claude-opus-4-6',
     max_tokens: 4096,
-    tools: [
-      { name: 'a', input_schema: {}, cache_control: { ...mark } },
-      { name: 'b', input_schema: {}, cache_control: { ...mark } },
-    ],
+    tools: [{ name: 'a', input_schema: {}, cache_control: { ...mark } }],
     system: [
       { type: 'text', text: 's1', cache_control: { ...mark } },
       { type: 'text', text: 's2', cache_control: { ...mark } },
@@ -362,7 +399,8 @@ test('over the four-breakpoint budget, tools are sacrificed and system is kept',
 /** The live regression: persona rebuilds system from a template, so a caller's own
     breakpoint used to vanish and every turn re-created the cache. */
 test('a caller breakpoint on system reaches the wire through the official persona preset', () => {
-  withRoutingFile({ persona_preset: 'official', overlay_preset: 'off' }, (routingFile) => {
+  const compat = { persona_preset: 'official', overlay_preset: 'off' }
+  withRoutingFile(compat, (routingFile) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-bp-home-'))
     const inbound = {
       model: 'claude-opus-4-6',
@@ -377,7 +415,12 @@ test('a caller breakpoint on system reaches the wire through the official person
       identity: IDENTITY,
       model: inbound.model,
     })
-    assert.equal(breakpoints(persona).length, 0, 'persona still drops the caller marker')
+    const personaHits = breakpoints(persona)
+    assert.ok(personaHits.length >= 1, 'official persona must keep a cache boundary on the agent prefix')
+    assert.ok(
+      personaHits.some((h) => h.where.startsWith('system[') && h.ttl === '1h'),
+      'agent slot carries 1h global cache instead of dropping caller breakpoints',
+    )
     const envelope = prepareOutboundEnvelope({
       canonicalBody: persona,
       inbound,
@@ -390,7 +433,6 @@ test('a caller breakpoint on system reaches the wire through the official person
       homeDir: dir,
     })
     const hits = breakpoints(envelope.body)
-    assert.ok(hits.length >= 1, 'outbound body must carry at least one breakpoint')
     assert.ok(
       hits.some((h) => h.where.startsWith('system[')),
       'the system prefix must be cacheable',
@@ -447,6 +489,27 @@ test('a real Claude Code body behind a rewritten UA is claimed', () => {
   )
 })
 
+test('a relay that keeps the billing block is claimed even without user_id', () => {
+  assert.equal(
+    isProxiedOfficialClaudeCode(
+      {
+        model: 'claude-opus-5-5',
+        system: [
+          {
+            type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1.280.096; cc_entrypoint=cli; cch=58481;',
+          },
+          { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: 'text', text: '<project-context>\n<workstation>\n- OS: linux\n' },
+        ],
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+      { 'user-agent': 'Go-http-client/1.1', 'anthropic-beta': 'claude-code-20250219' },
+    ),
+    true,
+  )
+})
+
 /** The shape 95% of live third-party traffic actually has: a fictional-chat
     system prompt as a bare string, and no metadata at all. */
 test('a fictional-chat third-party body is never claimed', () => {
@@ -468,6 +531,48 @@ test('a body that only borrows the identity line is not enough', () => {
       metadata: { user_id: OFFICIAL_USER_ID },
       messages: [{ role: 'user', content: 'hi' }],
     }),
+    false,
+  )
+})
+
+const RELAYED_CC_BETA = {
+  'user-agent': 'Go-http-client/1.1',
+  'anthropic-beta':
+    'claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07',
+}
+
+test('a relay that drops the billing block is still claimed when the client beta survives', () => {
+  assert.equal(
+    isProxiedOfficialClaudeCode(
+      {
+        model: 'claude-opus-5-5',
+        system: [
+          { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: 'text', text: 'You are an interactive agent that helps users with software engineering tasks.' },
+        ],
+        metadata: { user_id: OFFICIAL_USER_ID },
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'system', content: '<total_tokens>15000000 tokens left</total_tokens>' },
+        ],
+      },
+      RELAYED_CC_BETA,
+    ),
+    true,
+  )
+})
+
+test('the client beta does not claim a body that is not Claude Code', () => {
+  assert.equal(
+    isProxiedOfficialClaudeCode(
+      {
+        model: 'claude-fable-5',
+        system: "Write X's next reply in a fictional chat between X and the user.",
+        metadata: { user_id: OFFICIAL_USER_ID },
+        messages: [{ role: 'user', content: 'continue' }],
+      },
+      RELAYED_CC_BETA,
+    ),
     false,
   )
 })

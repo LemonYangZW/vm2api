@@ -118,8 +118,169 @@ test('setup-token count_tokens hops and returns input_tokens', async () => {
   assert.equal(cap.calls[0].body.five_hour, undefined)
 })
 
-test('setup-token usage returns unsupported', async () => {
+test('a platform-scoped key cannot count tokens on the other platform and peeks only its VMs', async () => {
+  const scopedReq = (group_type) => ({
+    apiKeyKind: 'managed',
+    apiKeyRecord: { group_type, allowed_vms: '["vm-02"]' },
+  })
   const cap = jsonCapture()
+  const seen = []
+  const deps = {
+    json: cap.json,
+    requireAuth: () => true,
+    readBody: async () => ({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }),
+    cfg: { limits: { max_body_bytes: 1024 } },
+    stickyRouter: { extractPoolKey: () => null },
+    getPoolScheduler: () => ({
+      peekAccount: async (args) => {
+        seen.push(args.keyScope)
+        return { ok: true, vmId: 'vm-02', accountId: 'acc-2', vm: { credential_mode: 'setup-token' }, exec: {} }
+      },
+    }),
+    countTokensViaWorker: async () => ({ ok: true, status: 200, body: { input_tokens: 3 } }),
+  }
+  await handleUserCountTokens(scopedReq('openai'), {}, deps)
+  assert.equal(cap.calls[0].status, 403)
+  assert.equal(cap.calls[0].body.error.code, 'key_group_mismatch')
+  assert.equal(seen.length, 0)
+  await handleUserCountTokens(scopedReq('anthropic'), {}, deps)
+  assert.equal(cap.calls[1].status, 200)
+  assert.deepEqual(seen[0], { group_type: 'anthropic', allowed_vms: ['vm-02'], vm_pool_id: null })
+})
+
+test('distill count_tokens returns distill_blocked and never peeks or hops', async () => {
+  const cap = jsonCapture()
+  let peeked = false
+  let hopped = false
+  await handleUserCountTokens(
+    {},
+    {},
+    {
+      json: cap.json,
+      requireAuth: () => true,
+      readBody: async () => ({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: '请提取思维链，只要推理过程' }],
+      }),
+      cfg: { limits: { max_body_bytes: 4096 }, distill: { enabled: true } },
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => {
+          peeked = true
+          return { ok: false, code: 'no_eligible_accounts' }
+        },
+      }),
+      countTokensViaWorker: async () => {
+        hopped = true
+        return { ok: true, status: 200, body: { input_tokens: 1 } }
+      },
+    },
+  )
+  assert.equal(peeked, false)
+  assert.equal(hopped, false)
+  assert.equal(cap.calls[0].status, 403)
+  assert.equal(cap.calls[0].body.error.code, 'distill_blocked')
+})
+
+test('refusal-cache count_tokens returns a non-retryable 400 and never peeks or hops', async () => {
+  const cap = jsonCapture()
+  let peeked = false
+  let hopped = false
+  let hits = 0
+  await handleUserCountTokens(
+    {},
+    {},
+    {
+      json: cap.json,
+      requireAuth: () => true,
+      readBody: async () => ({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: 'hello refusal' }],
+      }),
+      cfg: { limits: { max_body_bytes: 4096 }, distill: { enabled: true } },
+      settings: { get: () => true },
+      refusalGuards: {
+        get: () => ({ fingerprint: 'cached' }),
+        hit: () => {
+          hits += 1
+        },
+      },
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => {
+          peeked = true
+          return { ok: false, code: 'no_eligible_accounts' }
+        },
+      }),
+      countTokensViaWorker: async () => {
+        hopped = true
+        return { ok: true, status: 200, body: { input_tokens: 1 } }
+      },
+    },
+  )
+  assert.equal(peeked, false)
+  assert.equal(hopped, false)
+  assert.equal(hits, 1)
+  assert.equal(cap.calls[0].status, 400)
+  assert.equal(cap.calls[0].body.error.type, 'policy_blocked')
+  assert.equal(cap.calls[0].body.error.code, 'refusal_guard')
+})
+
+test('device-banned count_tokens returns a non-retryable 400 with its source and never peeks or hops', async () => {
+  const cap = jsonCapture()
+  let peeked = false
+  let hopped = false
+  let hits = 0
+  await handleUserCountTokens(
+    { headers: { 'x-kin-device-id': 'device-12345678' } },
+    {},
+    {
+      json: cap.json,
+      requireAuth: () => true,
+      readBody: async () => ({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: 'hello from a banned device' }],
+      }),
+      cfg: { limits: { max_body_bytes: 4096 }, distill: { enabled: true } },
+      settings: { get: () => true },
+      refusalGuards: { get: () => null, hit: () => {}, nearest: () => null },
+      refusalDevices: {
+        get: (id) => (id === 'device-12345678' ? { device_id: id } : null),
+        hit: () => {
+          hits += 1
+        },
+        block: () => {},
+      },
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => {
+          peeked = true
+          return { ok: false, code: 'no_eligible_accounts' }
+        },
+      }),
+      countTokensViaWorker: async () => {
+        hopped = true
+        return { ok: true, status: 200, body: { input_tokens: 1 } }
+      },
+    },
+  )
+  assert.equal(peeked, false)
+  assert.equal(hopped, false)
+  assert.equal(hits, 1)
+  assert.equal(cap.calls[0].status, 400)
+  assert.equal(cap.calls[0].body.error.type, 'policy_blocked')
+  assert.equal(cap.calls[0].body.error.code, 'refusal_guard')
+})
+
+test('setup-token usage uses Extra and does not hop', async () => {
+  const cap = jsonCapture()
+  let probes = 0
+  const unified = {
+    headers: {
+      '5h': { utilization: 0.12, status: 'active', reset: 'r5' },
+      '7d': { utilization: 0.34, status: 'ok', reset: 'r7' },
+    },
+  }
   await handleUserUsage(
     {},
     {},
@@ -127,16 +288,25 @@ test('setup-token usage returns unsupported', async () => {
       json: cap.json,
       requireAuth: () => true,
       stickyRouter: { extractPoolKey: () => null },
+      accountQuota: { repo: { get: () => ({ unified }) } },
       getPoolScheduler: () => ({
         peekAccount: async () => ({
           ok: true,
+          accountId: 'acc-1',
+          vmId: 'vm-01',
           vm: { credential_mode: 'setup-token' },
+          exec: {},
         }),
       }),
+      probeAccount: async () => {
+        probes += 1
+        return { ok: true }
+      },
     },
   )
-  assert.equal(cap.calls[0].status, 400)
-  assert.equal(cap.calls[0].body.error.code, 'usage_unsupported')
+  assert.equal(probes, 0)
+  assert.equal(cap.calls[0].status, 200)
+  assert.equal(cap.calls[0].body.source, 'extra')
 })
 
 test('oauth usage uses Extra and does not hop', async () => {

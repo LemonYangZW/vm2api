@@ -24,6 +24,7 @@ import {
   HAIKU_BETA_HEADER,
   joinBetas,
 } from './claude-code-betas.mjs'
+import { reasoningEffortOf } from './log-fields.mjs'
 
 function isCatalogModelId(id) {
   const s = String(id || '')
@@ -38,6 +39,12 @@ const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
 const FABLE_51_ID = 'claude-fable-5-1'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
+const OPUS_55_ID = 'claude-opus-5-5'
+const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
+const SONNET_55_ID = 'claude-sonnet-5-5'
+const HAIKU_55_ID = 'claude-haiku-5-5'
+const OPUS_55_COMPUTER_FROM = 'computer_20251124'
+const OPUS_55_COMPUTER_TO = 'computer_toolset_20260801'
 
 const CAP_HAIKU = {
   context_window: 200000,
@@ -48,6 +55,17 @@ const CAP_HAIKU = {
   supports_interleaved: false,
   supports_effort: false,
   supports_context_management: false,
+}
+
+const CAP_HAIKU_55 = {
+  context_window: 100000,
+  supports_1m: false,
+  thinking_mode: 'adaptive_or_enabled',
+  supports_adaptive: true,
+  requires_adaptive: false,
+  supports_interleaved: true,
+  supports_effort: true,
+  supports_context_management: true,
 }
 
 const CAP_SONNET45 = {
@@ -115,6 +133,7 @@ function entry(partial) {
       thinking_fallback_budget: partial.params?.thinking_fallback_budget ?? 4096,
       on_adaptive: partial.params?.on_adaptive || 'passthrough',
       on_enabled: partial.params?.on_enabled || 'passthrough',
+      ...(partial.params?.default_effort ? { default_effort: partial.params.default_effort } : {}),
     },
     aliases: partial.aliases || [],
   }
@@ -166,6 +185,28 @@ export function seedDefaultPolicy() {
     aliases: [],
   })
 
+  // Claude Code 2.1.293. Native 1M; no context-1m beta and no gateway id.
+  // budget_tokens is rejected. disabled thinking stays only at high or below.
+  add(HAIKU_55_ID, {
+    display_name: 'Haiku 5.5',
+    family: 'haiku',
+    sort: 12,
+    capabilities: CAP_HAIKU_55,
+    betas: {
+      required: ['claude-code-20250219', 'oauth-2025-04-20', 'interleaved-thinking-2025-05-14'],
+      drop: [CONTEXT_1M],
+      pass_context_1m: false,
+    },
+    params: {
+      max_tokens_default: 100000,
+      max_tokens_cap: 100000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'passthrough',
+      default_effort: 'medium',
+    },
+    aliases: [],
+  })
+
   add('claude-sonnet-4-5-20250929', {
     display_name: 'Sonnet 4.5',
     family: 'sonnet',
@@ -186,8 +227,12 @@ export function seedDefaultPolicy() {
       drop: [CONTEXT_1M],
       pass_context_1m: false,
     },
-    params: { max_tokens_default: 16384, max_tokens_cap: 64000, on_adaptive: 'passthrough' },
-    aliases: ['sonnet'],
+    params: {
+      max_tokens_default: 16384,
+      max_tokens_cap: 64000,
+      on_adaptive: 'passthrough',
+    },
+    aliases: [],
   })
 
   add('claude-opus-4-6', {
@@ -200,7 +245,11 @@ export function seedDefaultPolicy() {
       drop: [CONTEXT_1M],
       pass_context_1m: false,
     },
-    params: { max_tokens_default: 32000, max_tokens_cap: 128000, on_adaptive: 'passthrough' },
+    params: {
+      max_tokens_default: 32000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+    },
     aliases: [],
   })
 
@@ -239,12 +288,30 @@ export function seedDefaultPolicy() {
     capabilities: CAP_ADAPTIVE_ONLY,
     betas: { pass_context_1m: true },
     params: {
-      max_tokens_default: 16384,
+      max_tokens_default: 64000,
       max_tokens_cap: 128000,
       on_adaptive: 'passthrough',
       on_enabled: 'passthrough',
     },
     aliases: [],
+  })
+
+  // Claude Code 2.1.284 default Sonnet. Same tier_2_10 price as Sonnet 5.
+  // disabled thinking 400s; default effort is medium; max output default is the cap.
+  add(SONNET_55_ID, {
+    display_name: 'Sonnet 5.5',
+    family: 'sonnet',
+    sort: 31,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: true },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'convert_to_adaptive',
+      default_effort: 'medium',
+    },
+    aliases: ['sonnet'],
   })
 
   add('claude-opus-5', {
@@ -260,6 +327,24 @@ export function seedDefaultPolicy() {
       on_enabled: 'passthrough',
     },
     aliases: ['opus'],
+  })
+
+  // Claude Code 2.1.280. ID is hyphenated. Dotted claude-opus-5.5 is only an alias.
+  // Thinking cannot be disabled and budget_tokens 400s; default effort is medium, not Opus 5's high.
+  add(OPUS_55_ID, {
+    display_name: 'Opus 5.5',
+    family: 'opus',
+    sort: 36,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: true },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'convert_to_adaptive',
+      default_effort: 'medium',
+    },
+    aliases: [OPUS_55_LEGACY_ID],
   })
 
   add('claude-fable-5', {
@@ -307,7 +392,7 @@ export function seedDefaultPolicy() {
     },
     models,
     aliases: {
-      sonnet: 'claude-sonnet-4-6',
+      sonnet: 'claude-sonnet-5-5',
       opus: 'claude-opus-5',
       haiku: 'claude-haiku-4-5-20251001',
       'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
@@ -315,6 +400,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
       [FABLE_51_LEGACY_ID]: FABLE_51_ID,
+      [OPUS_55_LEGACY_ID]: OPUS_55_ID,
     },
     catalog_mode: 'policy_only',
   }
@@ -349,8 +435,9 @@ export function normalizePolicy(raw) {
     // Old releases stored the unsupported dotted id. Preserve its overrides;
     // an explicitly configured canonical entry wins field-by-field below.
     models[FABLE_51_ID] = deepMergeEntry(models[FABLE_51_ID], raw.models[FABLE_51_LEGACY_ID])
+    models[OPUS_55_ID] = deepMergeEntry(models[OPUS_55_ID], raw.models[OPUS_55_LEGACY_ID])
     for (const [id, cfg] of Object.entries(raw.models)) {
-      if (!id || id === FABLE_51_LEGACY_ID) continue
+      if (!id || id === FABLE_51_LEGACY_ID || id === OPUS_55_LEGACY_ID) continue
       const base =
         models[id] ||
         entry({
@@ -378,8 +465,17 @@ export function normalizePolicy(raw) {
     ]),
   ]
   if ('id' in models[FABLE_51_ID]) models[FABLE_51_ID].id = FABLE_51_ID
+  models[OPUS_55_ID].aliases = [
+    ...new Set([
+      OPUS_55_LEGACY_ID,
+      ...[raw.models?.[OPUS_55_LEGACY_ID]?.aliases, raw.models?.[OPUS_55_ID]?.aliases].flatMap((aliases) =>
+        Array.isArray(aliases) ? aliases : [],
+      ),
+    ]),
+  ]
+  if ('id' in models[OPUS_55_ID]) models[OPUS_55_ID].id = OPUS_55_ID
   for (const [id, cfg] of Object.entries(models)) {
-    if (cfg.params?.on_enabled === 'convert_to_adaptive') {
+    if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID) {
       cfg.params = { ...cfg.params, on_enabled: 'passthrough' }
     }
     if (typeof cfg.betas?.pass_context_1m !== 'boolean') {
@@ -395,9 +491,12 @@ export function normalizePolicy(raw) {
   const hasWhitelist = Object.prototype.hasOwnProperty.call(rawDefaults, 'context_1m_whitelist')
   const aliases = { ...seed.aliases, ...(raw.aliases || {}) }
   for (const [alias, target] of Object.entries(aliases)) {
-    if (String(target).trim().toLowerCase() === FABLE_51_LEGACY_ID) aliases[alias] = FABLE_51_ID
+    const normalized = String(target).trim().toLowerCase()
+    if (normalized === FABLE_51_LEGACY_ID) aliases[alias] = FABLE_51_ID
+    if (normalized === OPUS_55_LEGACY_ID) aliases[alias] = OPUS_55_ID
   }
   aliases[FABLE_51_LEGACY_ID] = FABLE_51_ID
+  aliases[OPUS_55_LEGACY_ID] = OPUS_55_ID
   return {
     version: Number(raw.version) || 1,
     updated_at: raw.updated_at || new Date().toISOString(),
@@ -428,6 +527,7 @@ export function familyOfModelId(id = '') {
 function heuristicCapabilities(modelId = '') {
   const m = String(modelId).toLowerCase()
   if (/^(gpt-|codex-)/i.test(m)) return { ...CAP_CODEX }
+  if (/claude-haiku-5/.test(m)) return { ...CAP_HAIKU_55 }
   if (m.includes('haiku') || /claude-3[.-]/.test(m)) return { ...CAP_HAIKU }
   if (/claude-(sonnet|opus)-4-5/.test(m)) return { ...CAP_SONNET45 }
   if (/claude-(opus|sonnet|fable|mythos)-5/.test(m) || /claude-opus-4-[78]/.test(m)) {
@@ -443,7 +543,8 @@ export function loadModelPolicy({ force = false } = {}) {
     const repo = new SettingsRepo()
     const stored = repo.get(SETTINGS_KEY, null)
     if (stored) {
-      policy = normalizePolicy(stored)
+      const persisted = persistHaiku55Model(repo, persistOpus55Model(repo, stored))
+      policy = normalizePolicy(persisted)
       policy.source = policy.source || 'settings'
     } else {
       policy = seedDefaultPolicy()
@@ -454,6 +555,73 @@ export function loadModelPolicy({ force = false } = {}) {
   }
   loaded = true
   return policy
+}
+
+/** Append Opus 5.5 onto an existing settings row. Does not reset other models. */
+function persistOpus55Model(repo, stored) {
+  if (!stored || typeof stored !== 'object') return stored
+  const seed = seedDefaultPolicy()
+  const models = stored.models && typeof stored.models === 'object' ? { ...stored.models } : {}
+  let dirty = false
+  if (models[OPUS_55_LEGACY_ID]) {
+    const fromLegacy = deepMergeEntry(seed.models[OPUS_55_ID], models[OPUS_55_LEGACY_ID])
+    models[OPUS_55_ID] = deepMergeEntry(fromLegacy, models[OPUS_55_ID])
+    delete models[OPUS_55_LEGACY_ID]
+    dirty = true
+  } else if (!models[OPUS_55_ID]) {
+    models[OPUS_55_ID] = seed.models[OPUS_55_ID]
+    dirty = true
+  }
+  const aliases = { ...(stored.aliases || {}) }
+  if (aliases[OPUS_55_LEGACY_ID] !== OPUS_55_ID) {
+    aliases[OPUS_55_LEGACY_ID] = OPUS_55_ID
+    dirty = true
+  }
+  if (!dirty) return stored
+  const next = { ...stored, models, aliases }
+  try {
+    repo.set(SETTINGS_KEY, next)
+  } catch {
+    return next
+  }
+  return next
+}
+
+/** Append or migrate Haiku 5.5 onto an existing settings row. Does not reset other models. */
+function persistHaiku55Model(repo, stored) {
+  if (!stored || typeof stored !== 'object') return stored
+  const seed = seedDefaultPolicy()
+  const desired = seed.models[HAIKU_55_ID]
+  const models = stored.models && typeof stored.models === 'object' ? { ...stored.models } : {}
+  const current = models[HAIKU_55_ID]
+  let dirty = false
+  if (!current) {
+    models[HAIKU_55_ID] = desired
+    dirty = true
+  } else {
+    const wasOldSeed =
+      Number(current.capabilities?.context_window) === 1_000_000 &&
+      Number(current.params?.max_tokens_default) === 128_000 &&
+      Number(current.params?.max_tokens_cap) === 128_000
+    if (wasOldSeed) {
+      models[HAIKU_55_ID] = deepMergeEntry(current, {
+        capabilities: { context_window: desired.capabilities.context_window },
+        params: {
+          max_tokens_default: desired.params.max_tokens_default,
+          max_tokens_cap: desired.params.max_tokens_cap,
+        },
+      })
+      dirty = true
+    }
+  }
+  if (!dirty) return stored
+  const next = { ...stored, models }
+  try {
+    repo.set(SETTINGS_KEY, next)
+  } catch {
+    return next
+  }
+  return next
 }
 
 export function getModelPolicy() {
@@ -600,6 +768,12 @@ export function clampEnabledThinkingBudget(body = {}) {
   return body
 }
 
+function adaptiveOnlyThinking(thinking) {
+  const display = thinking && typeof thinking === 'object' ? thinking.display : undefined
+  if (display != null && String(display).trim() !== '') return { type: 'adaptive', display }
+  return { type: 'adaptive' }
+}
+
 export function normalizeThinkingByPolicy(body = {}) {
   if (!loaded) loadModelPolicy()
   if (!body || typeof body !== 'object') return body
@@ -612,6 +786,12 @@ export function normalizeThinkingByPolicy(body = {}) {
   const type = String(thinking.type || '').toLowerCase()
   const params = entry.params || {}
   const caps = entry.capabilities || {}
+  const adaptiveOnly = params.on_enabled === 'convert_to_adaptive'
+
+  if (adaptiveOnly && (type === 'disabled' || type === 'enabled' || type === 'adaptive')) {
+    body.thinking = adaptiveOnlyThinking(thinking)
+    return body
+  }
 
   if (type === 'adaptive') {
     const action = params.on_adaptive || (caps.supports_adaptive ? 'passthrough' : 'convert_to_enabled')
@@ -639,6 +819,83 @@ export function normalizeThinkingByPolicy(body = {}) {
   }
 
   return clampEnabledThinkingBudget(body)
+}
+
+export function isOpus55Model(model = '') {
+  const bare = String(model || '')
+    .split('[')[0]
+    .split('/')
+    .filter(Boolean)
+    .pop()
+  return /^claude-opus-5(?:-5|\.5)(?=-|$)/i.test(bare || '')
+}
+
+export function isHaiku55Model(model = '') {
+  const bare = String(model || '')
+    .split('[')[0]
+    .split('/')
+    .filter(Boolean)
+    .pop()
+  return /^claude-haiku-5(?:-5|\.5)(?=-|$)/i.test(bare || '')
+}
+
+function applyHaiku55Thinking(body) {
+  if (!body.thinking || typeof body.thinking !== 'object') return body
+  const type = String(body.thinking.type || '').toLowerCase()
+  const effort = String(reasoningEffortOf(body) || '').toLowerCase()
+  const disabledBlocked = type === 'disabled' && (effort === 'xhigh' || effort === 'max')
+  if (type === 'enabled' || body.thinking.budget_tokens != null || disabledBlocked) {
+    body.thinking = adaptiveOnlyThinking(body.thinking)
+  }
+  return body
+}
+
+/**
+ * Opus 5.5 and Sonnet 5.5 reject forced tool choice and legacy thinking.
+ * Keep the existing auto + strict compatibility policy; strict constrains
+ * arguments, not whether the model calls a tool. Computer migration is Opus-only.
+ * The patched CLI forwards caller fields, so this has to happen before the hop.
+ */
+export function applyModelRequestRules(body = {}) {
+  if (!body || typeof body !== 'object') return body
+  const canonical = resolvePolicyModelId(body.model)
+  if (isHaiku55Model(body.model) || canonical === HAIKU_55_ID) {
+    if (canonical === HAIKU_55_ID) body.model = canonical
+    return applyHaiku55Thinking(body)
+  }
+  const opus55 = isOpus55Model(body.model)
+  if (!opus55 && canonical !== SONNET_55_ID) return body
+  if (canonical === OPUS_55_ID || canonical === SONNET_55_ID) body.model = canonical
+  if (body.thinking && typeof body.thinking === 'object') {
+    const type = String(body.thinking.type || '').toLowerCase()
+    if (type === 'disabled' || type === 'enabled' || body.thinking.budget_tokens != null) {
+      body.thinking = adaptiveOnlyThinking(body.thinking)
+    }
+  }
+  if (opus55 && Array.isArray(body.tools)) {
+    body.tools = body.tools.map((tool) => {
+      if (!tool || typeof tool !== 'object') return tool
+      if (tool.type !== OPUS_55_COMPUTER_FROM) return tool
+      return { ...tool, type: OPUS_55_COMPUTER_TO }
+    })
+  }
+  const choice = body.tool_choice
+  const choiceType =
+    typeof choice === 'string'
+      ? choice.toLowerCase()
+      : choice && typeof choice === 'object'
+        ? String(choice.type || '').toLowerCase()
+        : ''
+  if (choiceType === 'any' || choiceType === 'tool' || choiceType === 'required') {
+    const name = choice && typeof choice === 'object' ? choice.name : ''
+    if (choiceType === 'tool' && name && Array.isArray(body.tools)) {
+      body.tools = body.tools.map((tool) =>
+        tool?.name === name && tool.input_schema ? { ...tool, strict: true } : tool,
+      )
+    }
+    body.tool_choice = { type: 'auto' }
+  }
+  return body
 }
 
 function stripTokens(header, tokens) {
@@ -678,7 +935,10 @@ export function applyBetaPolicyToHeader(
 
 export function unofficialMimicryBetaHeader(modelId = '') {
   const caps = getCapabilities(modelId)
-  if (caps?.supports_context_management === false || /haiku/i.test(String(modelId || ''))) {
+  if (
+    caps?.supports_context_management === false ||
+    (/haiku/i.test(String(modelId || '')) && !/haiku-5/i.test(String(modelId || '')))
+  ) {
     return HAIKU_BETA_HEADER
   }
   return joinBetas(fullClaudeCodeMimicryBetas().filter((t) => t !== CONTEXT_1M))
@@ -696,7 +956,13 @@ export function filterPublicModelIds(workerIds = []) {
   if (!loaded) loadModelPolicy()
   const mode = policy.catalog_mode || 'policy_only'
   const ids = [
-    ...new Set((workerIds || []).filter(Boolean).map((id) => (id === FABLE_51_LEGACY_ID ? FABLE_51_ID : id))),
+    ...new Set(
+      (workerIds || []).filter(Boolean).map((id) => {
+        if (id === FABLE_51_LEGACY_ID) return FABLE_51_ID
+        if (id === OPUS_55_LEGACY_ID) return OPUS_55_ID
+        return id
+      }),
+    ),
   ]
 
   if (mode === 'worker_only') return ids
@@ -712,11 +978,17 @@ export function listPolicyModels() {
     .sort((a, b) => (a.sort ?? 100) - (b.sort ?? 100) || a.id.localeCompare(b.id))
 }
 
-export function syncWorkerModelsIntoPolicy(workerIds = []) {
+/**
+ * Merge upstream catalog ids. Existing entries keep every admin edit. A new id is
+ * public only under worker_only; other modes add it disabled for the admin to enable.
+ * `displayNameOf(id)` may supply a display name (models.dev) for new entries.
+ */
+export function syncWorkerModelsIntoPolicy(workerIds = [], { displayNameOf = null } = {}) {
   if (!loaded) loadModelPolicy()
-  let changed = false
+  const added = []
+  const enabled = policy.catalog_mode === 'worker_only'
   for (const workerId of workerIds || []) {
-    const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId
+    const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId === OPUS_55_LEGACY_ID ? OPUS_55_ID : workerId
     if (!id || !isCatalogModelId(id)) continue
     if (/^gpt/i.test(id)) continue
     if (policy.models[id]) continue
@@ -724,7 +996,7 @@ export function syncWorkerModelsIntoPolicy(workerIds = []) {
     const caps = heuristicCapabilities(id)
     policy.models[id] = entry({
       id,
-      display_name: id,
+      display_name: displayNameOf?.(id) || id,
       family,
       capabilities: caps,
       betas: family === 'codex' ? { required: [], drop: [CONTEXT_1M], pass_context_1m: false } : undefined,
@@ -741,17 +1013,18 @@ export function syncWorkerModelsIntoPolicy(workerIds = []) {
               on_enabled: 'passthrough',
             },
     })
+    policy.models[id].enabled = enabled
     // pass_context_1m left unset → inherit defaults.context_1m_whitelist
-    changed = true
+    added.push(id)
   }
-  if (changed) {
+  if (added.length) {
     policy.updated_at = new Date().toISOString()
     policy.source = 'worker_merge'
     try {
       new SettingsRepo().set(SETTINGS_KEY, policy)
     } catch {}
   }
-  return policy
+  return { policy, added }
 }
 
 /** Last-resort fill when the model has no policy default. Probe / short tests use this. */

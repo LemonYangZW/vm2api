@@ -1,3 +1,5 @@
+import { BETA_THINKING_DISPLAY_UPDATES } from './claude-code-betas.mjs'
+
 import {
   normalizeThinkingByPolicy,
   getCapabilities,
@@ -5,8 +7,19 @@ import {
   clampEnabledThinkingBudget,
   MIN_THINKING_BUDGET,
 } from './model-policy.mjs'
+import { anthropicContentIsEmpty, mergeConsecutiveAnthropicMessages, messageHasTurnControls } from './sanitize.mjs'
 
 export { clampEnabledThinkingBudget, MIN_THINKING_BUDGET }
+
+/** `routing.compatibility.thinking_display`：缺省 summarized，显式 passthrough 才保留调用方的值。 */
+export const THINKING_DISPLAY_MODES = ['summarized', 'passthrough']
+
+export function thinkingDisplayMode(routing) {
+  const raw = String(routing?.compatibility?.thinking_display ?? '')
+    .trim()
+    .toLowerCase()
+  return raw === 'passthrough' ? 'passthrough' : 'summarized'
+}
 
 /**
  * OpenAI reasoning <-> Claude thinking mapping + model-aware normalize.
@@ -63,6 +76,7 @@ export function modelSupportsAdaptiveThinking(model = '') {
     .toLowerCase()
     .split('[')[0]
   if (!m) return false
+  if (/haiku-5/.test(m)) return true
   if (m.includes('haiku')) return false
   if (/claude-3[.-]/.test(m)) return false
   // 4.5 family
@@ -122,6 +136,81 @@ export function normalizeThinkingForModel(body = {}) {
 
 const OFFICIAL_THINKING_DISPLAY = 'omitted'
 
+function betaHeaderHas(header, token) {
+  if (!header || !token) return false
+  return String(header)
+    .split(',')
+    .map((part) => part.trim())
+    .includes(token)
+}
+
+/**
+ * `updates` requires thinking-display-updates-2026-08-18.
+ * Rebuilt setup-token and mimicry headers omit that token, and upstream then
+ * 400s unless display is summarized or omitted. Keep `updates` only when the
+ * outbound header still declares the beta.
+ */
+export function downgradeUngatedThinkingDisplay(body = {}, anthropicBetaHeader = '') {
+  if (!body || typeof body !== 'object') return body
+  const thinking = body.thinking
+  if (!thinking || typeof thinking !== 'object') return body
+  if (
+    String(thinking.display ?? '')
+      .trim()
+      .toLowerCase() !== 'updates'
+  )
+    return body
+  if (betaHeaderHas(anthropicBetaHeader, BETA_THINKING_DISPLAY_UPDATES)) return body
+  return { ...body, thinking: { ...thinking, display: OFFICIAL_THINKING_DISPLAY } }
+}
+
+const HIDDEN_THINKING_DISPLAYS = new Set(['omitted', 'updates'])
+
+function bareModel(model) {
+  return (
+    String(model || '')
+      .toLowerCase()
+      .split('[')[0]
+      .split('/')
+      .filter(Boolean)
+      .pop() || ''
+  )
+}
+
+/** Opus 4.7+, the 5 series, Haiku 5.5, Fable and Mythos return empty thinking unless asked. */
+export function modelHidesThinkingByDefault(model) {
+  const m = bareModel(model)
+  if (!m) return false
+  if (/^claude-haiku-5(?:[-.]|$)/.test(m)) return true
+  if (/^claude-opus-4[-.][7-9](?:[-.]|$)/.test(m)) return true
+  if (/^claude-(?:opus|sonnet|fable|mythos)-5(?:[-.]|$)/.test(m)) return true
+  return /(?:^|-)(?:fable|mythos)(?:-|$)/.test(m)
+}
+
+/**
+ * `summarized` (the default) asks for a readable summary whenever the caller
+ * turned thinking on but hid it: explicit `omitted` or `updates`, or no display
+ * on a model whose default is `omitted`. Other values, `disabled`, and requests
+ * without thinking stay untouched, so a later fill can still write `omitted`.
+ * `passthrough` sends the caller's choice. Never mutates the input.
+ */
+export function applyThinkingDisplay(body, mode) {
+  if (mode !== 'summarized' || !body || typeof body !== 'object') return body
+  const thinking = body.thinking
+  if (!thinking || typeof thinking !== 'object') return body
+  const type = String(thinking.type || '')
+    .trim()
+    .toLowerCase()
+  if (type !== 'adaptive' && type !== 'enabled') return body
+  const display = String(thinking.display ?? '')
+    .trim()
+    .toLowerCase()
+  const hidden = HIDDEN_THINKING_DISPLAYS.has(display)
+  const unset = !display && modelHidesThinkingByDefault(body.model)
+  if (!hidden && !unset) return body
+  return { ...body, thinking: { ...thinking, display: 'summarized' } }
+}
+
 function thinkingNeedsOfficialDisplay(thinking) {
   if (!thinking || typeof thinking !== 'object') return false
   const type = String(thinking.type || '').toLowerCase()
@@ -157,25 +246,59 @@ export function modelSupportsEffort(model = '') {
 export function stripUnsupportedEffort(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (modelSupportsEffort(body.model)) return body
-  if (!body.output_config || typeof body.output_config !== 'object') return body
-  if (!Object.prototype.hasOwnProperty.call(body.output_config, 'effort')) return body
-  const next = { ...body.output_config }
-  delete next.effort
-  if (Object.keys(next).length === 0) {
-    const out = { ...body }
-    delete out.output_config
-    return out
+  let out = body
+  if (
+    body.output_config &&
+    typeof body.output_config === 'object' &&
+    Object.prototype.hasOwnProperty.call(body.output_config, 'effort')
+  ) {
+    const next = { ...body.output_config }
+    delete next.effort
+    if (Object.keys(next).length === 0) {
+      out = { ...body }
+      delete out.output_config
+    } else {
+      out = { ...body, output_config: next }
+    }
   }
-  return { ...body, output_config: next }
+  if (!Array.isArray(out.messages)) return out
+  let messagesChanged = false
+  const messages = []
+  for (const message of out.messages) {
+    if (
+      !message?.output_config ||
+      typeof message.output_config !== 'object' ||
+      !Object.prototype.hasOwnProperty.call(message.output_config, 'effort')
+    ) {
+      messages.push(message)
+      continue
+    }
+    messagesChanged = true
+    const nextConfig = { ...message.output_config }
+    delete nextConfig.effort
+    const nextMessage = { ...message }
+    if (Object.keys(nextConfig).length === 0) delete nextMessage.output_config
+    else nextMessage.output_config = nextConfig
+    if (anthropicContentIsEmpty(nextMessage.content) && !messageHasTurnControls(nextMessage)) continue
+    messages.push(nextMessage)
+  }
+  if (!messagesChanged) return out
+  return { ...out, messages: mergeConsecutiveAnthropicMessages(messages) }
 }
 
-/** Official 2.1.241 unofficial fill: missing output_config.effort. Never overwrite. Skip models that reject effort. */
+/** Official fill: missing output_config.effort. Never overwrite. Opus 5.5 defaults to medium. */
 export function ensureUnofficialEffortHigh(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (!modelSupportsEffort(body.model)) return stripUnsupportedEffort(body)
+  let effort = 'high'
+  try {
+    effort = getModelParams(body.model)?.default_effort || 'high'
+  } catch {
+    effort = 'high'
+  }
   if (body.output_config && typeof body.output_config === 'object') {
     if (body.output_config.effort != null && body.output_config.effort !== '') return body
-    return { ...body, output_config: { ...body.output_config, effort: 'high' } }
+    return { ...body, output_config: { ...body.output_config, effort } }
   }
-  return { ...body, output_config: { effort: 'high' } }
+  return { ...body, output_config: { effort } }
 }

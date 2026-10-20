@@ -55,6 +55,8 @@ type TelemetryConfig struct {
 	Enabled  bool              `json:"enabled"`
 	Identity TelemetryIdentity `json:"identity"`
 	Headers  map[string]string `json:"headers"`
+	// Betas is kept so older worker.json still decodes. Events do not send it.
+	Betas string `json:"betas"`
 }
 
 type TelemetryIdentity struct {
@@ -74,11 +76,29 @@ type TelemetryIdentity struct {
 	CLIVersion         string           `json:"cli_version"`
 	Entrypoint         string           `json:"entrypoint"`
 	Terminal           string           `json:"terminal"`
+	Shell              string           `json:"shell"`
 	PackageManagers    string           `json:"package_managers"`
+	VCS                string           `json:"vcs"`
+	Runtimes           string           `json:"runtimes"`
+	BuildTime          string           `json:"build_time"`
 	LinuxDistroID      string           `json:"linux_distro_id"`
 	LinuxDistroVersion string           `json:"linux_distro_version"`
 	LinuxKernel        string           `json:"linux_kernel"`
+	CPUModel           string           `json:"cpu_model"`
+	CPUCores           int64            `json:"cpu_cores"`
+	MemoryBytes        int64            `json:"memory_bytes"`
+	RootDisk           string           `json:"root_disk"`
+	MAC                string           `json:"mac"`
+	DMIManufacturer    string           `json:"dmi_manufacturer"`
+	DMIProduct         string           `json:"dmi_product"`
+	DMIVersion         string           `json:"dmi_version"`
+	DMIFamily          string           `json:"dmi_family"`
+	DMISerial          string           `json:"dmi_serial"`
+	DMIUUID            string           `json:"dmi_uuid"`
 	Process            TelemetryProcess `json:"process"`
+	Source             string           `json:"source"`
+	Env                map[string]any   `json:"env"`
+	Betas              string           `json:"betas"`
 }
 
 type TelemetryProcess struct {
@@ -108,6 +128,26 @@ func Load(path string) (Config, error) {
 	}
 	cfg.ConfigPath = path
 	return cfg, nil
+}
+
+// LoadTelemetry reads only worker.json's telemetry block.
+// Proxy and endpoint validation stay out of this path so a hot reload can
+// apply identity, headers, env, and betas without bouncing the process.
+func LoadTelemetry(path string) (TelemetryConfig, error) {
+	if strings.TrimSpace(path) == "" {
+		return TelemetryConfig{}, errors.New("worker config path is required")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return TelemetryConfig{}, fmt.Errorf("read worker config: %w", err)
+	}
+	var wrap struct {
+		Telemetry TelemetryConfig `json:"telemetry"`
+	}
+	if err = json.Unmarshal(data, &wrap); err != nil {
+		return TelemetryConfig{}, fmt.Errorf("decode worker config: %w", err)
+	}
+	return wrap.Telemetry, nil
 }
 
 func (c *Config) applyDefaults() {

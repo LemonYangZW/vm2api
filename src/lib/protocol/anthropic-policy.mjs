@@ -1,8 +1,26 @@
 import crypto from 'node:crypto'
-import { liftMidConversationSystemMessages, stripIllegalContentFields } from './sanitize.mjs'
+import {
+  anthropicContentIsEmpty,
+  dropEmptySystemControlTurns,
+  liftMidConversationSystemMessages,
+  mergeConsecutiveAnthropicMessages,
+  messageHasTurnControls,
+  stripIllegalContentFields,
+} from './sanitize.mjs'
 import { isAnthropicServerTool } from './web-search.mjs'
-import { normalizeThinkingForModel, ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh } from './thinking.mjs'
-import { applyMaxTokensCap, getCapabilities } from './model-policy.mjs'
+import {
+  normalizeThinkingForModel,
+  ensureUnofficialAdaptiveThinking,
+  ensureUnofficialEffortHigh,
+  downgradeUngatedThinkingDisplay,
+} from './thinking.mjs'
+import {
+  applyMaxTokensCap,
+  applyModelRequestRules,
+  getCapabilities,
+  isHaiku55Model,
+  isOpus55Model,
+} from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
@@ -73,10 +91,11 @@ export function enforceCacheLimit(body, maximum = 4) {
   }
   const live = locations.filter((location) => location.block?.cache_control)
   if (live.length <= maximum) return
-  // Sacrifice tools first, then messages, and give up system breakpoints last:
-  // system covers the longest prefix shared across every request on the account.
+  // Keep the message anchors: they advance the cache prefix on every turn.
+  // Tools are the cheapest to sacrifice, while system breakpoints preserve the
+  // stable persona prefix shared by the whole session.
   const bySection = (name) => live.filter((location) => location.section === name)
-  const order = [...bySection('tools').reverse(), ...bySection('messages'), ...bySection('system').reverse()]
+  const order = [...bySection('tools').reverse(), ...bySection('system').reverse(), ...bySection('messages')]
   for (const location of order.slice(0, live.length - maximum)) {
     delete location.block.cache_control
   }
@@ -94,6 +113,43 @@ export function hasUsableThinkingSignature(signature) {
   // Truncated SSE signatures look present but fail Anthropic checksum (sub2api pre-filter).
   if (!value || value.length < 24) return false
   return !DUMMY_THINKING_SIGNATURES.has(value)
+}
+function signedThinkingModel(model = '') {
+  if (isOpus55Model(model) || isHaiku55Model(model)) return true
+  const bare = String(model || '')
+    .split('[')[0]
+    .split('/')
+    .filter(Boolean)
+    .pop()
+  return /^claude-sonnet-5(?:-5|\.5)(?=-|$)/i.test(bare || '')
+}
+
+/** 5.5 accepts any non-dummy signature. Length is not a checksum. */
+function hasNonDummyThinkingSignature(signature) {
+  const value = String(signature || '').trim()
+  return value.length > 0 && !DUMMY_THINKING_SIGNATURES.has(value)
+}
+
+function dropSignedThinkingChain(messages) {
+  return messages.map((message) => {
+    if (!Array.isArray(message?.content)) return message
+    let dropped = false
+    const content = []
+    for (const block of message.content) {
+      const type = block?.type
+      if (
+        type === 'thinking' ||
+        type === 'redacted_thinking' ||
+        (type == null && block && Object.hasOwn(block, 'thinking'))
+      ) {
+        dropped = true
+        continue
+      }
+      content.push(block)
+    }
+    if (!dropped) return message
+    return { ...message, content }
+  })
 }
 
 function thinkingModeEnabled(body) {
@@ -114,11 +170,23 @@ export function alignSamplingWithThinking(body = {}) {
   return out
 }
 
-/** Drop history thinking blocks Anthropic would reject (empty / unsigned / dummy). */
-export function stripInvalidThinkingBlocks(body = {}) {
+/**
+ * Drop history thinking blocks Anthropic would reject.
+ * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
+ * signed chain, including later valid thinking and redacted_thinking. Turns
+ * left with no content are dropped. redacted_thinking stays when it carries
+ * data on 5.5, otherwise when its signature is usable. The preserve path
+ * (cli-hop first hop, default HTTP hop) skips the chain rule and keeps a
+ * signed block as-is, empty text and redacted_thinking included. A thinking
+ * block without a usable signature (missing, empty, shorter than 24, dummy)
+ * is dropped instead of forwarded with an empty signature.
+ */
+export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
   const keepSigned = thinkingModeEnabled(body)
+  const chainModel = !preserveThinkingBlocks && signedThinkingModel(body.model)
   let changed = false
+  let chainBroken = false
   const messages = body.messages.map((message) => {
     if (!Array.isArray(message?.content)) return message
     const content = []
@@ -126,27 +194,55 @@ export function stripInvalidThinkingBlocks(body = {}) {
     for (const block of message.content) {
       const type = block?.type
       if (type === 'thinking' || type === 'redacted_thinking') {
-        if (keepSigned && message.role === 'assistant') {
-          if (type === 'thinking' && !String(block.thinking || '').trim()) {
+        if ((keepSigned || preserveThinkingBlocks) && message.role === 'assistant') {
+          // Omitted thinking keeps empty text; redacted thinking keeps encrypted data.
+          if (preserveThinkingBlocks) {
+            if (type === 'redacted_thinking' || hasUsableThinkingSignature(block.signature)) {
+              content.push(block)
+            } else {
+              changed = true
+              filteredThis = true
+            }
+            continue
+          }
+          if (chainModel && chainBroken) {
             changed = true
             filteredThis = true
             continue
           }
-          if (hasUsableThinkingSignature(block.signature)) {
+          if (type === 'redacted_thinking' && chainModel && String(block.data || '').trim()) {
             content.push(block)
             continue
           }
+          const signed = chainModel
+            ? hasNonDummyThinkingSignature(block.signature)
+            : hasUsableThinkingSignature(block.signature)
+          if (signed) {
+            content.push(block)
+            continue
+          }
+          if (chainModel) chainBroken = true
         }
         changed = true
         filteredThis = true
+        continue
+      }
+      if (type == null && block && Object.hasOwn(block, 'thinking')) {
+        changed = true
+        filteredThis = true
+        if (chainModel) chainBroken = true
         continue
       }
       content.push(block)
     }
     return filteredThis ? { ...message, content } : message
   })
-  if (!changed) return body
-  return { ...body, messages }
+  const stripped = chainBroken ? dropSignedThinkingChain(messages) : messages
+  if (!changed && !chainBroken) return dropEmptySystemControlTurns(body)
+  const withoutEmpty = stripped.filter(
+    (message) => !anthropicContentIsEmpty(message?.content) || messageHasTurnControls(message),
+  )
+  return dropEmptySystemControlTurns({ ...body, messages: mergeConsecutiveAnthropicMessages(withoutEmpty) })
 }
 
 export const CONTEXT_MANAGEMENT_BETA = 'context-management-2025-06-27'
@@ -156,13 +252,21 @@ export const MID_CONVERSATION_SYSTEM_BETA = 'mid-conversation-system-2026-04-07'
 export function modelSupportsContextManagement(modelId = '') {
   const caps = getCapabilities(modelId)
   if (caps?.supports_context_management === false) return false
-  if (/haiku/i.test(String(modelId || ''))) return false
+  const id = String(modelId || '')
+  if (/haiku/i.test(id) && !/haiku-5/i.test(id)) return false
   return true
 }
 
-/** Haiku 400s `role 'system' is not supported on this model`. */
+/**
+ * Docs list: Fable 5 / 5.1, Mythos 5 / 5.1, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
+ * Sonnet 5, Haiku 4.5 and other Claude 4.x reject mid-conversation `role=system` (400).
+ */
 export function modelSupportsMidConversationSystem(modelId = '') {
-  return !/haiku/i.test(String(modelId || ''))
+  const id = String(modelId || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\[1m\]$/i, '')
+  return /^claude-(?:(?:fable|mythos)-5(?:[-.]1)?|opus-(?:5(?:[-.]5)?|4[-.]8)|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
 }
 
 /**
@@ -173,18 +277,44 @@ export function modelSupportsMidConversationSystem(modelId = '') {
  * models drop the field; final beta sanitize may still strip it later.
  */
 export function ensureClearThinkingContextManagement(body = {}) {
-  if (!thinkingModeEnabled(body)) return body
+  // 不支持的模型（Haiku）即使没开 thinking 也要删掉调用方带的 context_management：
+  // cli-hop 会先把 Haiku 的 thinking 固定为 disabled，且跳过后面的 beta 清洗，
+  // 这里若提前返回，clear_thinking 就会漏到上游，导致槽内 CLI 被杀。
   if (!modelSupportsContextManagement(body.model)) {
     if (body.context_management == null) return body
     const out = { ...body }
     delete out.context_management
     return out
   }
+  if (!thinkingModeEnabled(body)) return body
   if (body.context_management != null) return body
   return {
     ...body,
     context_management: { edits: [{ ...CLEAR_THINKING_EDIT }] },
   }
+}
+
+export const FAST_MODE_BETA = 'fast-mode-2026-02-01'
+
+/** Opus 5.5 / Opus 5 / Opus 4.8 accept `speed: "fast"`; 4.7 errors, 4.6 silently runs standard. */
+export function modelSupportsFastMode(model = '') {
+  const m = String(model || '').toLowerCase()
+  if (!m.includes('opus')) return false
+  return /opus-5(?![0-9])/.test(m) || /opus-4[-.]8(?![0-9])/.test(m)
+}
+
+export function wantsFastMode(body = {}) {
+  return (
+    String(body?.speed ?? '')
+      .trim()
+      .toLowerCase() === 'fast' && modelSupportsFastMode(body?.model)
+  )
+}
+
+/** Add the fast-mode beta when the body asks for fast on a supported model (mimicry drops client betas). */
+export function ensureFastModeBeta(header = '', body = {}) {
+  if (!wantsFastMode(body) || anthropicBetaTokensContains(header, FAST_MODE_BETA)) return header
+  return header ? `${header},${FAST_MODE_BETA}` : FAST_MODE_BETA
 }
 
 export function anthropicBetaTokensContains(header, token) {
@@ -215,6 +345,14 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   if (!anthropicBetaTokensContains(anthropicBetaHeader, PROMPT_CACHING_SCOPE_BETA)) {
     out = stripCacheScopeFields(out)
   }
+  // `speed` needs the fast-mode beta; without it the request 400s instead of running standard.
+  if (
+    Object.prototype.hasOwnProperty.call(out, 'speed') &&
+    (!anthropicBetaTokensContains(anthropicBetaHeader, FAST_MODE_BETA) || !modelSupportsFastMode(out.model))
+  ) {
+    out = { ...out }
+    delete out.speed
+  }
   const allowMidSystem =
     modelSupportsMidConversationSystem(out.model) &&
     anthropicBetaTokensContains(anthropicBetaHeader, MID_CONVERSATION_SYSTEM_BETA)
@@ -230,7 +368,8 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   ) {
     out = liftMidConversationSystemMessages(out)
   }
-  return out
+  out = dropEmptySystemControlTurns(out)
+  return downgradeUngatedThinkingDisplay(out, anthropicBetaHeader)
 }
 
 /** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
@@ -255,11 +394,13 @@ export function prepareAnthropicRequest(
     cacheBreakpoints = null,
     cacheTtl = DEFAULT_CACHE_TTL,
     inbound = null,
+    preserveThinkingBlocks = false,
   } = {},
 ) {
   let out = clone(body)
   // Model-aware thinking normalize (adaptive ↔ enabled) before other policy
   normalizeThinkingForModel(out)
+  out = applyModelRequestRules(out)
   applyMaxTokensCap(out)
   if (unofficial) {
     out = ensureUnofficialAdaptiveThinking(out)
@@ -275,7 +416,7 @@ export function prepareAnthropicRequest(
       content: cleanContent(normalizeImageContentBlocks(message?.content)),
     }))
   }
-  const stripped = stripInvalidThinkingBlocks(out)
+  const stripped = stripInvalidThinkingBlocks(out, { preserveThinkingBlocks })
   if (stripped.messages) out.messages = stripped.messages
   out = ensureClearThinkingContextManagement(out)
   out = alignSamplingWithThinking(out)

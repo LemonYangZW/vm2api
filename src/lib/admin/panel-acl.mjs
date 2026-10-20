@@ -1,9 +1,9 @@
 /**
  * Panel RBAC.
  *
- *   admin  — full console（开源仓不含用户管理）
- *   super  — overview / cluster / usage / logs + VM page (schedule only)
- *   user   — tenant: vm / proxies / keys / billing / logs (owner-scoped)
+ *   admin  — full console + user management
+ *   super  — overview / cluster / logs / statistics + VM page (schedule only)
+ *   user   — tenant: vm / proxies / keys / billing / logs / statistics (owner-scoped)
  */
 
 export const PANEL_VIEWS = [
@@ -11,23 +11,26 @@ export const PANEL_VIEWS = [
   'cluster',
   'vm',
   'import',
-  'usage',
+  'specs',
   'proxies',
   'models',
-  'loadtest',
-  'protocol',
+  'risk',
+  'system',
   'keys',
   'api',
+  'anthropic',
   'logs',
+  'statistics',
   'database',
   'settings',
+  'users',
   'wrap',
   'billing',
 ]
 
 const ROLE_VIEWS = {
-  user: ['vm', 'proxies', 'keys', 'billing', 'logs'],
-  super: ['overview', 'cluster', 'usage', 'logs', 'vm'],
+  user: ['vm', 'proxies', 'keys', 'billing', 'logs', 'statistics'],
+  super: ['overview', 'cluster', 'logs', 'statistics', 'vm'],
   admin: PANEL_VIEWS.slice(),
 }
 
@@ -85,7 +88,10 @@ export function panelIdentity(req) {
 
 const USER_EXACT_GET = new Set([
   '/api/panel/me',
+  '/api/panel/onboarding',
   '/api/panel/vms',
+  '/api/panel/vms/create-options',
+  '/api/panel/pool/stream',
   '/api/panel/proxies',
   '/api/panel/proxies/config',
   '/api/panel/api-keys',
@@ -93,13 +99,21 @@ const USER_EXACT_GET = new Set([
   '/api/panel/request-logs/export',
   '/api/panel/request-logs/stats',
   '/api/panel/billing',
+  '/api/panel/test-schedule/default',
+  '/api/panel/test-models',
 ])
 
-const USER_EXACT_POST = new Set(['/api/panel/vms/create', '/api/panel/vms/import', '/api/panel/proxies/import'])
+const USER_EXACT_POST = new Set([
+  '/api/panel/vms/create',
+  '/api/panel/vms/import',
+  '/api/panel/proxies/import',
+  '/api/panel/test-schedule/sync',
+])
 
 const USER_VM_DENIED = new Set([
   'fleet-status',
   'fleet-update',
+  'create-options',
   'reconcile-fingerprints',
   'official-cc-bootstrap',
   'wrap-cli',
@@ -119,15 +133,29 @@ function isRequestLogPath(path) {
   )
 }
 
+/** Scrolling log page + statistics: read-only, owner-scoped server-side for `user`. */
+const LOG_STATS_GET = new Set([
+  '/api/panel/usage-logs',
+  '/api/panel/usage-logs/summary',
+  '/api/panel/usage-logs/filter-options',
+  '/api/panel/usage-logs/session-suggestions',
+  '/api/panel/usage-logs/active-sessions',
+  '/api/panel/usage-logs/overview',
+  '/api/panel/statistics',
+  '/api/panel/statistics/leaderboard',
+])
+
 function isSuperVmRead(path) {
-  if (path === '/api/panel/vms/fleet-status') return false
+  if (path === '/api/panel/vms/fleet-status' || path === '/api/panel/vms/create-options') return false
   return /^\/api\/panel\/vms\/[^/]+$/.test(path)
 }
 
 function isSuperSchedule(method, path) {
   if (method !== 'POST') return false
   return (
-    /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(path) || /^\/api\/panel\/vms\/[^/]+\/cooldown\/clear$/.test(path)
+    /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(path) ||
+    /^\/api\/panel\/vms\/[^/]+\/cooldown\/clear$/.test(path) ||
+    /^\/api\/panel\/vms\/[^/]+\/circuit\/reset$/.test(path)
   )
 }
 
@@ -140,33 +168,41 @@ function userVmPathAllowed(method, path) {
   if (USER_VM_DENIED.has(id) || USER_VM_DENIED.has(head) || rest.startsWith('wrap-cli')) return false
   if (method === 'GET') {
     if (!rest) return true
-    if (rest === 'oauth/credential') return false
+    if (rest === 'oauth/credential' || rest === 'package') return false
     return (
+      rest === 'test-schedule' ||
       rest.startsWith('oauth/') ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
       rest === 'test-chat' ||
+      rest === 'diagnose' ||
       rest === 'official-cc-bootstrap'
     )
   }
   if (method === 'POST') {
-    if (id === 'create' || id === 'import') return true
+    if (id === 'create' || id === 'import' || id === 'package') return true
     if (!rest) return false
     if (head === 'official-cc-bootstrap' || head === 'wrap-cli' || head === 'reset-fingerprint') return false
     if (head === 'owner') return false
     return (
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||
+      rest === 'circuit/reset' ||
       rest === 'probe' ||
       rest === 'test-chat' ||
       rest === 'count-tokens' ||
       rest === 'start' ||
       rest === 'stop' ||
+      rest === 'recover' ||
+      rest === 'openai-quota/refresh' ||
+      rest === 'openai-quota/reset' ||
+      rest === 'claude-reset/query' ||
+      rest === 'claude-reset/redeem' ||
       rest.startsWith('oauth/')
     )
   }
-  if (method === 'DELETE') return !rest
-  if (method === 'PUT' && rest === 'oauth/credential') return true
+  if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
+  if (method === 'DELETE') return !rest || rest === 'test-schedule'
   return false
 }
 
@@ -185,14 +221,18 @@ function userKeyPathAllowed(method, path) {
   if (path === '/api/panel/api-keys') return method === 'GET' || method === 'POST'
   if (/^\/api\/panel\/api-keys\/[^/]+$/.test(path)) return method === 'GET' || method === 'PATCH' || method === 'DELETE'
   if (/^\/api\/panel\/api-keys\/[^/]+\/reveal$/.test(path) && method === 'POST') return true
-  if (/^\/api\/panel\/api-keys\/[^/]+\/reset$/.test(path) && method === 'POST') return true
+  if (/^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(path) && method === 'GET') return true
+  if (/^\/api\/panel\/api-keys\/[^/]+\/reset-quota$/.test(path) && method === 'POST') return true
+  // The handler already 404s keys the tenant does not own (denyIfUserMissesKey).
+  if (/^\/api\/panel\/api-keys\/[^/]+\/rotate$/.test(path) && method === 'POST') return true
   return false
 }
 
 function isUserAllowed(method, path) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
-  if (m === 'GET' && (USER_EXACT_GET.has(p) || isRequestLogPath(p))) return true
+  if (m === 'GET' && (USER_EXACT_GET.has(p) || isRequestLogPath(p) || LOG_STATS_GET.has(p))) return true
+  if (m === 'PUT' && p === '/api/panel/onboarding') return true
   if (m === 'POST' && USER_EXACT_POST.has(p)) return true
   if (p.startsWith('/api/panel/vms')) return userVmPathAllowed(m, p)
   if (p.startsWith('/api/panel/proxies')) return userProxyPathAllowed(m, p)
@@ -206,11 +246,24 @@ export function authorizePanelRoute(method, path, role) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
 
+  if (p === '/api/panel/test-schedule/default' && m === 'PUT') {
+    return { ok: false, role: r, code: 'forbidden', message: '当前权限无法执行此操作' }
+  }
+
   if (r === 'user' && isUserAllowed(m, p)) return { ok: true, role: r }
+  if (p === '/api/panel/onboarding' && (m === 'GET' || m === 'PUT')) return { ok: true, role: r }
   if (
     r === 'super' &&
     m === 'GET' &&
-    (p === '/api/panel/dashboard' || p === '/api/panel/usage' || p === '/api/panel/vms' || isRequestLogPath(p))
+    (p === '/api/panel/dashboard' ||
+      p === '/api/panel/usage' ||
+      p === '/api/panel/vms' ||
+      p === '/api/panel/pool/stream' ||
+      p === '/api/panel/cluster/nodes' ||
+      p === '/api/panel/cluster/local' ||
+      p === '/api/panel/test-models' ||
+      isRequestLogPath(p) ||
+      LOG_STATS_GET.has(p))
   ) {
     return { ok: true, role: r }
   }

@@ -4,11 +4,65 @@ import {
   effectiveRateWindow,
   officialWindow,
   headerWindow,
+  headerHardBlocked,
   WINDOW_5H_MS,
   toPercentUsed,
   usageWindowsEmpty,
   publicUsageWindow,
+  parseLimitResetFromMessage,
+  isPlanLimitMessage,
+  isAccountQuotaExhausted,
+  limitWindowFromMessage,
+  hasOfficialUsageSample,
+  hasLiveExtraSample,
+  extraWindowSince,
+  wipeElapsedHeaderWindows,
+  parseResetMs,
+  listQuotaFromHeaders,
 } from '../../src/lib/pool/quota-window.mjs'
+
+test('wipeElapsedHeaderWindows clears unified 7d_oi when reset elapsed', () => {
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792206000'
+  assert.ok(parseResetMs(resetSec) <= now)
+  const { oi, changed } = wipeElapsedHeaderWindows(
+    { '7d_oi': { utilization: 1, reset: resetSec, status: 'rejected' } },
+    { now },
+  )
+  assert.equal(changed, true)
+  assert.equal(oi.utilization, 0)
+  assert.equal(oi.status, 'active')
+  assert.equal(oi.stale_reason, 'reset_elapsed')
+})
+
+test('wipeElapsedHeaderWindows keeps unified 7d_oi when reset is still future', () => {
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792810800'
+  assert.ok(parseResetMs(resetSec) > now)
+  const { oi, changed } = wipeElapsedHeaderWindows(
+    { '7d_oi': { utilization: 1, reset: resetSec, status: 'rejected' } },
+    { now },
+  )
+  assert.equal(changed, false)
+  assert.equal(oi, null)
+})
+
+test('listQuotaFromHeaders falls back to headers 7d_oi when unified has no window', () => {
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792810800'
+  const listed = listQuotaFromHeaders(
+    {
+      headers: {
+        '7d_oi': { utilization: 0.21, reset: resetSec, status: 'allowed' },
+        '5h': { utilization: 0.1, status: 'allowed', reset: '2099-01-01T00:00:00Z' },
+      },
+    },
+    { now },
+  )
+  assert.equal(listed.utilization_7d_oi, 0.21)
+  assert.equal(listed.status_7d_oi, 'allowed')
+  assert.equal(listed.reset_7d_oi, resetSec)
+})
 
 test('officialWindow prefers official over headers and leftover flat percent', () => {
   const u = {
@@ -122,4 +176,88 @@ test('toPercentUsed converts Extra 0-1 once and keeps 0-100', () => {
     true,
   )
   assert.equal(usageWindowsEmpty({ '5h': { utilization: 0.1, status: 'active' }, '7d': {} }), false)
+})
+
+test('26 percent with a rejected flag is not a hard block', () => {
+  const now = Date.parse('2026-08-24T12:00:00.000Z')
+  const reset = new Date(now + 3600_000).toISOString()
+  assert.equal(
+    headerHardBlocked({ headers: { '5h': { utilization: 26, status: 'rejected', reset } } }, '5h', now),
+    false,
+  )
+  assert.equal(
+    headerHardBlocked({ headers: { '5h': { utilization: 0.26, status: 'rejected', reset } } }, '5h', now),
+    true,
+  )
+  assert.equal(headerHardBlocked({ headers: { '5h': { utilization: 1, status: 'rejected', reset } } }, '5h', now), true)
+  const w = effectiveRateWindow(
+    { utilization: 26, status: 'rejected', reset },
+    { now, source: 'headers', durationMs: WINDOW_5H_MS },
+  )
+  assert.equal(w.utilization, 26)
+  assert.equal(w.stale, false)
+})
+
+test('parseLimitResetFromMessage reads CLI reset text in its timezone', () => {
+  const now = Date.parse('2026-09-23T12:37:10Z')
+  const at = (text) => parseLimitResetFromMessage(text, now)
+  assert.equal(at("You've hit your limit · resets 11am (America/New_York)"), Date.parse('2026-09-23T15:00:00Z'))
+  assert.equal(at("You've hit your session limit · resets 3:30pm (UTC)"), Date.parse('2026-09-23T15:30:00Z'))
+  // 8am ET already passed today → tomorrow.
+  assert.equal(at("You've hit your limit · resets 8am (America/New_York)"), Date.parse('2026-09-24T12:00:00Z'))
+  assert.equal(
+    at("You've hit your weekly limit · resets Sep 25, 3pm (America/New_York)"),
+    Date.parse('2026-09-25T19:00:00Z'),
+  )
+  assert.equal(at('provider error: api_error'), null)
+})
+
+test('parseLimitResetFromMessage follows DST in the named zone', () => {
+  // 2026-11-01: US leaves DST. 11am ET the next day is UTC-5.
+  const now = Date.parse('2026-11-01T20:00:00Z')
+  assert.equal(parseLimitResetFromMessage('resets 11am (America/New_York)', now), Date.parse('2026-11-02T16:00:00Z'))
+})
+
+test('extraWindowSince uses reset minus duration, elapsed reset, or null', () => {
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  assert.equal(extraWindowSince('2026-09-26T16:00:00.000Z', WINDOW_5H_MS, now), Date.parse('2026-09-26T11:00:00.000Z'))
+  assert.equal(extraWindowSince('2026-09-26T10:00:00.000Z', WINDOW_5H_MS, now), Date.parse('2026-09-26T10:00:00.000Z'))
+  assert.equal(extraWindowSince(null, WINDOW_5H_MS, now), null)
+})
+
+test('official /usage sample is detected without treating Extra as live', () => {
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  const unified = {
+    source: 'vm-oauth-usage',
+    official: {
+      '5h': { utilization: 0.22, status: 'allowed', reset: '2026-09-26T16:00:00.000Z' },
+    },
+  }
+  assert.equal(hasOfficialUsageSample(unified), true)
+  assert.equal(hasLiveExtraSample(unified, { now }), false)
+})
+
+test('isPlanLimitMessage matches CLI limit text but not the entitlement error', () => {
+  assert.equal(isPlanLimitMessage("You've hit your limit · resets 11am"), true)
+  assert.equal(isPlanLimitMessage("You've hit your weekly limit"), true)
+  assert.equal(isPlanLimitMessage("You're out of extra usage · resets 3pm"), true)
+  assert.equal(isPlanLimitMessage('Extra usage required for this model'), false)
+  assert.equal(limitWindowFromMessage("You've hit your weekly limit"), '7d')
+  assert.equal(limitWindowFromMessage("You've hit your limit"), '5h')
+})
+
+test('isAccountQuotaExhausted ignores 429s the pool synthesized itself', () => {
+  const fableGate = { ok: false, status: 429, via: 'pool-failover' }
+  assert.equal(isAccountQuotaExhausted(fableGate, 'Fable requires an available Max account'), false)
+  const poolRateLimited = { ok: false, status: 429, via: 'pool-failover' }
+  assert.equal(isAccountQuotaExhausted(poolRateLimited, 'rate limited'), false)
+})
+
+test('isAccountQuotaExhausted keeps provider 429s and plan-limit text', () => {
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream' }, ''), true)
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429 }, ''), true)
+  const planText = "You've hit your limit · resets 3pm"
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 400, via: 'pool-failover' }, planText), true)
+  assert.equal(isAccountQuotaExhausted({ ok: true, status: 200 }, planText), false)
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 503, via: 'go-worker' }, ''), false)
 })

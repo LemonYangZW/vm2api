@@ -1,27 +1,75 @@
 /**
- * Wrap inference CLI lives in the slot home, next to the Go worker.
- * Create/start copies a prebuilt patched dist (not `npm i` + in-slot patch).
- * Engine rust|go only chooses which process serves /v1; both stay on disk.
- * CLI always pre-opens 20 native_messages slots; Node maxConcurrency uses N.
+ * Wrap inference CLIs live in the slot home, next to the kernel.
+ * share/wrap-cli holds both cli-node and cc-node. The dataplane picks which
+ * one kernel.json.claude_bin runs:
+ *   wrap: cli-node + wrap kin-kernel
+ *   cc:   cc-node + wrap kin-kernel
+ *   crag: cc-node + share/crag/kin-kernel
+ * Engine rust only chooses which process serves /v1. Credentials stay out.
  *
- * Mother sample: share/wrap-cli (or KIN_WRAP_CLI_ROOT). Promote from a proven
- * slot, then one-click sync/reinstall. Never copies credentials or proxy URLs.
+ * On an ARM64 host, Docker slots take the native kin-kernel and cli-node from
+ * share/wrap-cli/linux-arm64 instead of running the amd64 pair under QEMU.
+ * KVM guests are x86 machines and keep the amd64 payload. KIN_NATIVE_SLOTS=0
+ * turns the native pair off.
  */
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
+import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
 
-export const WRAP_CLI_FILES = Object.freeze(['bun', 'cli-node'])
-export const WRAP_CLI_DIST = 'cli-dist'
+export const WRAP_CLI_BIN = 'cli-node'
+export const CC_NODE_BIN = 'cc-node'
+export const WRAP_CLI_FILES = Object.freeze([WRAP_CLI_BIN, CC_NODE_BIN])
 export const WRAP_KERNEL_BIN = 'kin-kernel.bin'
 export const WRAP_KERNEL_WRAPPER = 'kin-kernel'
 export const WRAP_GLIBC_DIR = 'glibc239'
 export const WRAP_GLIBC_LIBS = Object.freeze(['ld-linux-x86-64.so.2', 'libc.so.6', 'libm.so.6', 'libgcc_s.so.1'])
+export const WRAP_NATIVE_ARM64_DIR = 'linux-arm64'
+const ELF_MACHINES = Object.freeze({ amd64: 62, arm64: 183 })
 
 const SECRET_NAMES = new Set(['credentials.json', '.credentials.json', 'oauth.json', '.claude.json', 'internal.token'])
 
-export function wrapKernelWrapperScript() {
+/**
+ * The kernel job watchdog reads the unprefixed env JOB_IDLE_SECS (default 180s)
+ * only at start; KIN_JOB_IDLE_SECS is ignored by the kernel. Take it from
+ * kernel.json idle_timeout_seconds so it follows the panel stream idle setting.
+ * The native ARM64 kernel is static: its wrapper never goes through the x86
+ * glibc loader, even when an older glibc239 shim is still in the slot home.
+ */
+export function wrapKernelWrapperScript({ native = false } = {}) {
+  const loader = native
+    ? ''
+    : `LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
+if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
+  exec "$LOADER" --library-path "$DIR/${WRAP_GLIBC_DIR}" "$BIN" "$@"
+fi
+`
+  return `#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -z "$JOB_IDLE_SECS" ]; then
+  CONF=
+  PREV=
+  for ARG in "$@"; do
+    [ "$PREV" = "--config" ] && CONF=$ARG
+    PREV=$ARG
+  done
+  if [ -n "$CONF" ] && [ -r "$CONF" ]; then
+    IDLE=$(grep -o '"idle_timeout_seconds": *[0-9]*' "$CONF" | head -n 1 | tr -dc '0-9')
+    [ -n "$IDLE" ] && [ "$IDLE" -gt 0 ] && export JOB_IDLE_SECS="$IDLE"
+  fi
+fi
+BIN="$DIR/${WRAP_KERNEL_BIN}"
+${loader}if [ -x "$BIN" ]; then
+  exec "$BIN" "$@"
+fi
+exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
+`
+}
+
+export function cragKernelWrapperScript() {
   return `#!/bin/sh
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BIN="$DIR/${WRAP_KERNEL_BIN}"
@@ -34,6 +82,24 @@ if [ -x "$BIN" ]; then
 fi
 exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 `
+}
+
+export function cragTemplateDir(projectRoot) {
+  const env = String(process.env.KIN_CRAG_KERNEL_ROOT || '').trim()
+  if (env) return env
+  if (!projectRoot) return ''
+  return path.join(projectRoot, 'share', 'crag')
+}
+
+export function cragKernelPath(projectRoot) {
+  const env = String(process.env.KIN_CRAG_KERNEL_BIN || '').trim()
+  if (env && isFile(env)) return env
+  const dir = cragTemplateDir(projectRoot)
+  if (!dir) return ''
+  const bin = path.join(dir, 'kin-kernel')
+  if (isFile(bin)) return bin
+  const alt = path.join(dir, WRAP_KERNEL_BIN)
+  return isFile(alt) ? alt : ''
 }
 
 export function wrapCliTemplateDir(projectRoot) {
@@ -68,6 +134,145 @@ function hasKernelPayload(dir) {
   return isFile(path.join(dir, WRAP_KERNEL_BIN)) || isFile(path.join(dir, WRAP_KERNEL_WRAPPER))
 }
 
+function configuredKernelPath(projectRoot = '') {
+  const env = kernelBinPath()
+  if (isFile(env)) return env
+  if (projectRoot) {
+    const bundled = path.join(projectRoot, 'bin', 'kin-kernel')
+    if (isFile(bundled)) return bundled
+  }
+  return ''
+}
+
+function kernelPayloadPath(dir, projectRoot = '') {
+  const configured = configuredKernelPath(projectRoot)
+  if (configured) return configured
+  const bin = path.join(dir, WRAP_KERNEL_BIN)
+  if (isFile(bin)) return bin
+  return path.join(dir, WRAP_KERNEL_WRAPPER)
+}
+
+function fileInfo(p) {
+  if (!isFile(p)) return null
+  const st = fs.statSync(p)
+  return { path: p, size: st.size, mtime: st.mtime.toISOString() }
+}
+
+export function describeKernelPayload(projectRoot) {
+  const dir = wrapCliTemplateDir(projectRoot)
+  const configured = configuredKernelPath(projectRoot)
+  const sampleBin = path.join(dir, WRAP_KERNEL_BIN)
+  const sampleWrap = path.join(dir, WRAP_KERNEL_WRAPPER)
+  const chosen = configured || (isFile(sampleBin) ? sampleBin : isFile(sampleWrap) ? sampleWrap : '')
+  const info = fileInfo(chosen)
+  return {
+    source: configured ? 'configured' : chosen ? 'sample' : 'missing',
+    path: info?.path || '',
+    size: info?.size || 0,
+    mtime: info?.mtime || '',
+  }
+}
+export function describeCliPayload(projectRoot, name) {
+  const dir = wrapCliTemplateDir(projectRoot)
+  const chosen = path.join(dir, name)
+  const info = fileInfo(chosen)
+  return {
+    source: info ? 'sample' : 'missing',
+    path: info?.path || '',
+    size: info?.size || 0,
+    mtime: info?.mtime || '',
+  }
+}
+
+export function describeCliNodePayload(projectRoot) {
+  return describeCliPayload(projectRoot, WRAP_CLI_BIN)
+}
+
+export function describeCcNodePayload(projectRoot) {
+  return describeCliPayload(projectRoot, CC_NODE_BIN)
+}
+
+export function inspectLinuxAmd64Elf(buf) {
+  return inspectLinuxElf(buf, 'amd64')
+}
+
+export function inspectLinuxElf(buf, arch = 'amd64') {
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
+  if (bytes.length < 64) {
+    return { ok: false, code: 'kernel_too_small', error: 'kernel binary is too small to be an ELF' }
+  }
+  if (bytes[0] !== 0x7f || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) {
+    return { ok: false, code: 'kernel_not_elf', error: 'kernel binary is not ELF' }
+  }
+  if (bytes[4] !== 2) {
+    return { ok: false, code: 'kernel_not_elf64', error: 'kernel binary is not ELF64' }
+  }
+  if (bytes[5] !== 1) {
+    return { ok: false, code: 'kernel_not_le', error: 'kernel binary is not little-endian ELF' }
+  }
+  if (bytes.readUInt16LE(18) !== ELF_MACHINES[arch]) {
+    return { ok: false, code: `kernel_not_${arch}`, error: `kernel binary is not linux ${arch}` }
+  }
+  return { ok: true, size: bytes.length }
+}
+
+function readElfHead(file) {
+  let fd
+  try {
+    fd = fs.openSync(file, 'r')
+    const head = Buffer.alloc(64)
+    const n = fs.readSync(fd, head, 0, 64, 0)
+    return head.subarray(0, n)
+  } catch {
+    return Buffer.alloc(0)
+  } finally {
+    if (fd != null) fs.closeSync(fd)
+  }
+}
+
+function slotHostArch() {
+  const raw = String(process.env.KIN_SLOT_HOST_ARCH || process.arch)
+    .trim()
+    .toLowerCase()
+  if (raw === 'arm64' || raw === 'aarch64') return 'arm64'
+  if (raw === 'x64' || raw === 'amd64' || raw === 'x86_64') return 'amd64'
+  return raw
+}
+
+export function nativeArm64Dir(projectRoot) {
+  const dir = wrapCliTemplateDir(projectRoot)
+  return dir ? path.join(dir, WRAP_NATIVE_ARM64_DIR) : ''
+}
+
+/** Native ARM64 kin-kernel + cli-node pair; both must be aarch64 ELFs. */
+export function describeNativeArm64Payload(projectRoot) {
+  const dir = nativeArm64Dir(projectRoot)
+  const kernel = dir ? path.join(dir, WRAP_KERNEL_BIN) : ''
+  const cliNode = dir ? path.join(dir, WRAP_CLI_BIN) : ''
+  const out = { dir, kernel, cli_node: cliNode, host_arch: slotHostArch(), enabled: false }
+  for (const [file, name] of [
+    [kernel, 'kin-kernel'],
+    [cliNode, WRAP_CLI_BIN],
+  ]) {
+    if (!isFile(file)) return { ...out, ok: false, code: 'native_arm64_missing', error: `${name} missing: ${file}` }
+    const check = inspectLinuxElf(readElfHead(file), 'arm64')
+    if (!check.ok) return { ...out, ok: false, code: 'native_arm64_invalid', error: `${name} is not linux arm64` }
+  }
+  const enabled = out.host_arch === 'arm64' && String(process.env.KIN_NATIVE_SLOTS || '').trim() !== '0'
+  return { ...out, ok: true, enabled }
+}
+
+/**
+ * The native pair a slot should run, or null for the amd64 payload. Only local
+ * Docker slots qualify: a KVM guest is an x86 machine, and a node slot bakes the
+ * amd64 kernel into its image (vm.node_id; see cluster/slot-image.mjs).
+ */
+export function nativeSlotPayload(projectRoot, vm) {
+  if (isKvmRuntime(vm) || vm?.node_id) return null
+  const native = describeNativeArm64Payload(projectRoot)
+  return native.ok && native.enabled ? native : null
+}
+
 export function inspectWrapCliDir(dir) {
   if (!dir || !fs.existsSync(dir)) {
     return { ok: false, code: 'wrap_cli_template_missing', error: `wrap CLI template missing: ${dir || '(unset)'}` }
@@ -77,15 +282,6 @@ export function inspectWrapCliDir(dir) {
     if (!isFile(p)) {
       return { ok: false, code: 'wrap_cli_incomplete', error: `wrap CLI missing ${name}` }
     }
-  }
-  const dist = path.join(dir, WRAP_CLI_DIST)
-  const entry = path.join(dist, 'cli.js')
-  const entryNode = path.join(dist, 'cli-node.js')
-  if (!isDir(dist)) {
-    return { ok: false, code: 'wrap_cli_incomplete', error: 'wrap CLI missing cli-dist' }
-  }
-  if (!fs.existsSync(entry) && !fs.existsSync(entryNode)) {
-    return { ok: false, code: 'wrap_cli_incomplete', error: 'wrap CLI missing cli-dist/cli.js' }
   }
   if (!hasKernelPayload(dir)) {
     return { ok: false, code: 'wrap_cli_incomplete', error: 'wrap CLI missing kin-kernel' }
@@ -109,19 +305,37 @@ function sameFile(src, dest) {
   }
 }
 
-function destAlreadyCurrent(src, dest) {
+function filesEqual(src, dest) {
+  let a
+  let b
   try {
-    const a = fs.statSync(src)
-    const b = fs.statSync(dest)
-    return a.size === b.size && b.mtimeMs + 1 >= a.mtimeMs
+    a = fs.openSync(src, 'r')
+    b = fs.openSync(dest, 'r')
+    const aStat = fs.fstatSync(a)
+    const bStat = fs.fstatSync(b)
+    if (aStat.size !== bStat.size) return false
+    const aBuf = Buffer.allocUnsafe(64 * 1024)
+    const bBuf = Buffer.allocUnsafe(64 * 1024)
+    let offset = 0
+    while (offset < aStat.size) {
+      const length = Math.min(aBuf.length, aStat.size - offset)
+      const aRead = fs.readSync(a, aBuf, 0, length, offset)
+      const bRead = fs.readSync(b, bBuf, 0, length, offset)
+      if (aRead !== bRead || !aBuf.subarray(0, aRead).equals(bBuf.subarray(0, bRead))) return false
+      offset += aRead
+    }
+    return true
   } catch {
     return false
+  } finally {
+    if (a != null) fs.closeSync(a)
+    if (b != null) fs.closeSync(b)
   }
 }
 
 function replaceFile(src, dest) {
-  if (!src || src === dest || sameFile(src, dest)) return
-  if (destAlreadyCurrent(src, dest)) return
+  if (!src || src === dest || sameFile(src, dest)) return false
+  if (filesEqual(src, dest)) return false
   fs.mkdirSync(path.dirname(dest), { recursive: true })
   const tmp = path.join(path.dirname(dest), `.${path.basename(dest)}.${process.pid}.new`)
   fs.copyFileSync(src, tmp)
@@ -139,6 +353,7 @@ function replaceFile(src, dest) {
     }
   }
   fs.renameSync(tmp, dest)
+  return true
 }
 
 function copyFile(src, dest) {
@@ -190,9 +405,9 @@ function chownTree(root, uid, gid) {
   walk(root)
 }
 
-function writeWrapper(destDir) {
+function writeCragWrapper(destDir) {
   const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
-  const body = wrapKernelWrapperScript()
+  const body = cragKernelWrapperScript()
   try {
     if (fs.readFileSync(wrapper, 'utf8') === body) return
   } catch {}
@@ -211,18 +426,109 @@ function writeWrapper(destDir) {
   fs.renameSync(tmp, wrapper)
 }
 
-function installKernelPayload(src, dest) {
-  const binSrc = isFile(path.join(src, WRAP_KERNEL_BIN))
-    ? path.join(src, WRAP_KERNEL_BIN)
-    : isFile(path.join(src, WRAP_KERNEL_WRAPPER))
-      ? path.join(src, WRAP_KERNEL_WRAPPER)
-      : kernelBinPath()
-  if (binSrc && isFile(binSrc)) {
-    copyFile(binSrc, path.join(dest, WRAP_KERNEL_BIN))
+export function describeCragPayload(projectRoot) {
+  const chosen = cragKernelPath(projectRoot)
+  const info = fileInfo(chosen)
+  return {
+    source: info ? 'sample' : 'missing',
+    path: info?.path || '',
+    size: info?.size || 0,
+    mtime: info?.mtime || '',
+    ok: Boolean(info),
   }
+}
+
+export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null } = {}) {
+  if (!projectRoot || !vm?.id) {
+    return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
+  }
+  const src = cragKernelPath(projectRoot)
+  if (!src) {
+    return {
+      ok: false,
+      code: 'crag_kernel_missing',
+      error: 'Crag kernel ELF missing (share/crag/kin-kernel)',
+    }
+  }
+  const cliSrc = path.join(wrapCliTemplateDir(projectRoot) || '', CC_NODE_BIN)
+  if (!isFile(cliSrc)) {
+    return {
+      ok: false,
+      code: 'cc_node_missing',
+      error: 'cc-node missing (share/wrap-cli/cc-node)',
+    }
+  }
+  const dest = wrapCliHomeDir(projectRoot, vm.id)
+  fs.mkdirSync(dest, { recursive: true })
+  const kernelChanged = replaceFile(src, path.join(dest, WRAP_KERNEL_BIN))
+  copyFile(cliSrc, path.join(dest, CC_NODE_BIN))
+  writeCragWrapper(dest)
+  chownTree(dest, uid, gid)
+  return {
+    ok: true,
+    dest,
+    src,
+    dataplane: 'crag',
+    changed: kernelChanged,
+    kernel_changed: kernelChanged,
+    glibc_shim: false,
+    wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
+    kernel_bin: isFile(path.join(dest, WRAP_KERNEL_BIN)),
+  }
+}
+
+export function replaceCragKernelBinary(projectRoot, buf) {
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
+  const check = inspectLinuxAmd64Elf(bytes)
+  if (!check.ok) {
+    return { ok: false, code: check.code || 'kernel_not_elf', error: check.error }
+  }
+  const destDir = cragTemplateDir(projectRoot)
+  if (!destDir) return { ok: false, code: 'crag_template_missing', error: 'crag kernel dir unset' }
+  fs.mkdirSync(destDir, { recursive: true })
+  const dest = path.join(destDir, 'kin-kernel')
+  writeKernelBytes(dest, bytes)
+  return { ok: true, written: [dest], size: bytes.length, dataplane: 'crag' }
+}
+
+export function materializeSlotDataplane(projectRoot, vm, dataplane, opts = {}) {
+  if (dataplane === 'crag') return materializeCragKernel(projectRoot, vm, opts)
+  return materializeWrapCli(projectRoot, vm, opts)
+}
+
+function writeWrapper(destDir, { native = false } = {}) {
+  const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
+  const body = wrapKernelWrapperScript({ native })
+  try {
+    if (fs.readFileSync(wrapper, 'utf8') === body) return
+  } catch {}
+  const tmp = path.join(destDir, `.${WRAP_KERNEL_WRAPPER}.${process.pid}.new`)
+  fs.writeFileSync(tmp, body, { mode: 0o755 })
+  try {
+    fs.unlinkSync(wrapper)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      try {
+        fs.unlinkSync(tmp)
+      } catch {}
+      throw error
+    }
+  }
+  fs.renameSync(tmp, wrapper)
+}
+
+function installKernelPayload(src, dest, projectRoot = '', native = null) {
+  const binSrc = native ? native.kernel : kernelPayloadPath(src, projectRoot)
+  const kernelChanged = binSrc && isFile(binSrc) ? replaceFile(binSrc, path.join(dest, WRAP_KERNEL_BIN)) : false
+  // cc-node stays amd64 under QEMU, so the shim is still copied for native slots.
   const glibcSrc = path.join(src, WRAP_GLIBC_DIR)
   if (isDir(glibcSrc)) copyDir(glibcSrc, path.join(dest, WRAP_GLIBC_DIR))
-  writeWrapper(dest)
+  writeWrapper(dest, { native: Boolean(native) })
+  return kernelChanged
+}
+
+function slotKernelSource(projectRoot, vm, sampleDir) {
+  return nativeSlotPayload(projectRoot, vm)?.kernel || kernelPayloadPath(sampleDir, projectRoot)
 }
 
 export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null } = {}) {
@@ -232,18 +538,22 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null } =
   const src = wrapCliTemplateDir(projectRoot)
   const status = inspectWrapCliDir(src)
   if (!status.ok) return status
+  const native = nativeSlotPayload(projectRoot, vm)
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   for (const name of WRAP_CLI_FILES) {
-    copyFile(path.join(src, name), path.join(dest, name))
+    const from = native && name === WRAP_CLI_BIN ? native.cli_node : path.join(src, name)
+    copyFile(from, path.join(dest, name))
   }
-  copyDir(path.join(src, WRAP_CLI_DIST), path.join(dest, WRAP_CLI_DIST))
-  installKernelPayload(src, dest)
+  const kernelChanged = installKernelPayload(src, dest, projectRoot, native)
   chownTree(dest, uid, gid)
   return {
     ok: true,
     dest,
     src,
+    arch: native ? 'arm64' : 'amd64',
+    changed: kernelChanged,
+    kernel_changed: kernelChanged,
     glibc_shim: isDir(path.join(dest, WRAP_GLIBC_DIR)),
     wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
     kernel_bin: isFile(path.join(dest, WRAP_KERNEL_BIN)),
@@ -258,8 +568,6 @@ function copyWrapTree(src, dest) {
     if (SECRET_NAMES.has(name)) continue
     copyFile(from, path.join(dest, name))
   }
-  const dist = path.join(src, WRAP_CLI_DIST)
-  if (isDir(dist)) copyDir(dist, path.join(dest, WRAP_CLI_DIST))
   const glibc = path.join(src, WRAP_GLIBC_DIR)
   if (isDir(glibc)) copyDir(glibc, path.join(dest, WRAP_GLIBC_DIR))
   const bin = isFile(path.join(src, WRAP_KERNEL_BIN))
@@ -280,6 +588,16 @@ export function captureWrapSample(projectRoot, vm) {
       ok: false,
       code: status.code || 'wrap_cli_incomplete',
       error: `slot ${vm.id} is not a usable wrap sample: ${status.error}`,
+    }
+  }
+  // share/wrap-cli is the amd64 template; a native slot home would poison it.
+  for (const name of [WRAP_KERNEL_BIN, WRAP_CLI_BIN]) {
+    if (inspectLinuxElf(readElfHead(path.join(src, name)), 'arm64').ok) {
+      return {
+        ok: false,
+        code: 'wrap_sample_native',
+        error: `slot ${vm.id} runs the native ARM64 ${name}; sample an amd64 slot instead`,
+      }
     }
   }
   const dest = wrapCliTemplateDir(projectRoot)
@@ -323,7 +641,15 @@ export function describeWrapSample(projectRoot) {
   try {
     meta = JSON.parse(fs.readFileSync(path.join(dir, 'SAMPLE.json'), 'utf8'))
   } catch {}
-  return { ...inspect, meta }
+  return {
+    ...inspect,
+    dir,
+    meta,
+    kernel: describeKernelPayload(projectRoot),
+    cli_node: describeCliNodePayload(projectRoot),
+    cc_node: describeCcNodePayload(projectRoot),
+    native_arm64: describeNativeArm64Payload(projectRoot),
+  }
 }
 
 export function makeWrapSample(projectRoot, { glibcFromDir = '' } = {}) {
@@ -333,11 +659,7 @@ export function makeWrapSample(projectRoot, { glibcFromDir = '' } = {}) {
   }
   fs.mkdirSync(dest, { recursive: true })
   const kernelDest = path.join(dest, WRAP_KERNEL_BIN)
-  const kernelSrc = isFile(kernelDest)
-    ? kernelDest
-    : isFile(path.join(dest, WRAP_KERNEL_WRAPPER))
-      ? path.join(dest, WRAP_KERNEL_WRAPPER)
-      : kernelBinPath()
+  const kernelSrc = kernelPayloadPath(dest, projectRoot)
   if (kernelSrc && isFile(kernelSrc) && path.resolve(kernelSrc) !== path.resolve(kernelDest)) {
     replaceFile(kernelSrc, kernelDest)
   }
@@ -350,7 +672,7 @@ export function makeWrapSample(projectRoot, { glibcFromDir = '' } = {}) {
   if (!check.ok) {
     return {
       ...check,
-      error: `${check.error}。单独制作需要 share/wrap-cli 已有 bun、cli-node、cli-dist；kernel 可从主机 kin-kernel 补。不要从正在跑 wrap 的槽原地覆盖。`,
+      error: `${check.error}。单独制作需要 share/wrap-cli 已有 cli-node 和 cc-node；kernel 可从主机 kin-kernel 补。不要从正在跑 wrap 的槽原地覆盖。`,
     }
   }
   fs.writeFileSync(
@@ -371,27 +693,221 @@ export function makeWrapSample(projectRoot, { glibcFromDir = '' } = {}) {
   return inspectWrapCliDir(dest)
 }
 
-export function syncWrapSample(projectRoot, vms, { uidOf } = {}) {
+function isInsideProject(projectRoot, target) {
+  if (!projectRoot || !target) return false
+  const root = path.resolve(projectRoot)
+  const abs = path.resolve(target)
+  return abs === root || abs.startsWith(root + path.sep)
+}
+
+function writeKernelBytes(dest, bytes) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true })
+  const tmp = path.join(path.dirname(dest), `.${path.basename(dest)}.${process.pid}.new`)
+  fs.writeFileSync(tmp, bytes, { mode: 0o755 })
+  try {
+    fs.unlinkSync(dest)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      try {
+        fs.unlinkSync(tmp)
+      } catch {}
+      throw error
+    }
+  }
+  fs.renameSync(tmp, dest)
+}
+
+function kernelWriteTargets(projectRoot) {
+  const destDir = wrapCliTemplateDir(projectRoot)
+  const seen = new Set()
+  const targets = []
+  const add = (p) => {
+    if (!p) return
+    const abs = path.resolve(p)
+    if (seen.has(abs)) return
+    seen.add(abs)
+    targets.push(abs)
+  }
+  add(path.join(destDir, WRAP_KERNEL_BIN))
+  if (projectRoot) add(path.join(projectRoot, 'bin', 'kin-kernel'))
+  const env = kernelBinPath()
+  if (env && isInsideProject(projectRoot, env)) add(env)
+  return targets
+}
+
+function writeNativeArm64Binary(projectRoot, bytes, name) {
+  const dir = nativeArm64Dir(projectRoot)
+  if (!dir) return { ok: false, code: 'wrap_cli_template_missing', error: 'wrap CLI template dir unset' }
+  const dest = path.join(dir, name)
+  writeKernelBytes(dest, bytes)
+  return {
+    ok: true,
+    arch: 'arm64',
+    written: [dest],
+    size: bytes.length,
+    native_arm64: describeNativeArm64Payload(projectRoot),
+  }
+}
+
+export function replaceKernelBinary(projectRoot, buf, extra = {}) {
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
+  if (inspectLinuxElf(bytes, 'arm64').ok) return writeNativeArm64Binary(projectRoot, bytes, WRAP_KERNEL_BIN)
+  const check = inspectLinuxAmd64Elf(bytes)
+  if (!check.ok) return check
+  const metaExtra = extra && typeof extra === 'object' ? extra : {}
+  const source =
+    String(metaExtra.source || 'upload')
+      .trim()
+      .slice(0, 32) || 'upload'
+  const releaseTag = /^v\d+\.\d+\.\d+$/.test(String(metaExtra.release_tag || '').trim())
+    ? String(metaExtra.release_tag).trim()
+    : ''
+  const destDir = wrapCliTemplateDir(projectRoot)
+  if (!destDir) {
+    return { ok: false, code: 'wrap_cli_template_missing', error: 'wrap CLI template dir unset' }
+  }
+  fs.mkdirSync(destDir, { recursive: true })
+  const written = []
+  for (const dest of kernelWriteTargets(projectRoot)) {
+    writeKernelBytes(dest, bytes)
+    written.push(dest)
+  }
+  writeWrapper(destDir)
+  let meta = {}
+  try {
+    meta = JSON.parse(fs.readFileSync(path.join(destDir, 'SAMPLE.json'), 'utf8'))
+  } catch {}
+  fs.writeFileSync(
+    path.join(destDir, 'SAMPLE.json'),
+    JSON.stringify(
+      {
+        ...meta,
+        source,
+        captured_at: new Date().toISOString(),
+        files: WRAP_CLI_FILES.slice(),
+        kernel: WRAP_KERNEL_BIN,
+        glibc_shim: isDir(path.join(destDir, WRAP_GLIBC_DIR)),
+        ...(releaseTag ? { release_tag: releaseTag } : { release_tag: undefined }),
+      },
+      null,
+      2,
+    ) + '\n',
+  )
+  const described = describeWrapSample(projectRoot)
+  return { ...described, ok: true, sample_ok: described.ok, written }
+}
+function replaceNamedCliBinary(projectRoot, buf, name) {
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
+  // Only cli-node has a native build; cc-node stays amd64.
+  if (name === WRAP_CLI_BIN && inspectLinuxElf(bytes, 'arm64').ok) {
+    return writeNativeArm64Binary(projectRoot, bytes, WRAP_CLI_BIN)
+  }
+  const check = inspectLinuxAmd64Elf(bytes)
+  if (!check.ok) {
+    return {
+      ok: false,
+      code: `${name.replace('-', '_')}_not_elf`,
+      error: check.error || `${name} binary is not a linux amd64 ELF`,
+    }
+  }
+  const destDir = wrapCliTemplateDir(projectRoot)
+  if (!destDir) return { ok: false, code: 'wrap_cli_template_missing', error: 'wrap CLI template dir unset' }
+  fs.mkdirSync(destDir, { recursive: true })
+  const dest = path.join(destDir, name)
+  writeKernelBytes(dest, bytes)
+  return { ok: true, written: [dest], size: bytes.length }
+}
+
+export function replaceCliNodeBinary(projectRoot, buf) {
+  return replaceNamedCliBinary(projectRoot, buf, WRAP_CLI_BIN)
+}
+
+export function replaceCcNodeBinary(projectRoot, buf) {
+  return replaceNamedCliBinary(projectRoot, buf, CC_NODE_BIN)
+}
+
+function kernelWouldChange(src, dest) {
+  if (!src || !isFile(src)) return false
+  if (!isFile(dest)) return true
+  if (sameFile(src, dest)) return false
+  return !filesEqual(src, dest)
+}
+
+export function inspectKernelChanges(projectRoot, vms, { routing } = {}) {
   const sample = describeWrapSample(projectRoot)
-  if (!sample.ok) return { ok: false, ...sample, items: [] }
+  const crag = describeCragPayload(projectRoot)
   const items = []
   for (const vm of vms || []) {
-    const uid = typeof uidOf === 'function' ? uidOf(vm) : null
-    const gid = uid?.gid
-    const out = materializeWrapCli(projectRoot, vm, {
-      uid: uid?.uid ?? uid,
-      gid: gid ?? null,
-    })
-    items.push({ id: vm.id, ...out })
+    if (isCodexVm(vm)) continue
+    const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
+    const dest = path.join(wrapCliHomeDir(projectRoot, vm.id), WRAP_KERNEL_BIN)
+    const src = dataplane === 'crag' ? crag.path : slotKernelSource(projectRoot, vm, sample.dir)
+    if (dataplane === 'crag' && !crag.ok) {
+      items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
+      continue
+    }
+    if (dataplane !== 'crag' && !sample.ok) {
+      items.push({ id: vm.id, dataplane, ok: false, code: sample.code, kernel_changed: false })
+      continue
+    }
+    const kernelChanged = kernelWouldChange(src, dest) || Boolean(vm?.kernel_restart_pending)
+    items.push({ id: vm.id, dataplane, ok: true, kernel_changed: kernelChanged })
   }
   const failed = items.filter((item) => !item.ok)
+  const changed = items.filter((item) => item.kernel_changed === true)
   return {
     ok: failed.length === 0,
-    src: sample.dir,
-    meta: sample.meta,
+    changed: changed.length > 0,
     total: items.length,
     ok_count: items.length - failed.length,
     failed_count: failed.length,
+    changed_count: changed.length,
+    items,
+  }
+}
+
+export function syncWrapSample(projectRoot, vms, { uidOf, routing } = {}) {
+  const sample = describeWrapSample(projectRoot)
+  const crag = describeCragPayload(projectRoot)
+  const items = []
+  for (const vm of vms || []) {
+    if (isCodexVm(vm)) continue
+    const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
+    if ((dataplane === 'wrap' || dataplane === 'cc') && !sample.ok) {
+      items.push({ id: vm.id, dataplane, ok: false, code: sample.code, error: sample.error })
+      continue
+    }
+    if (dataplane === 'crag' && !crag.ok) {
+      items.push({
+        id: vm.id,
+        dataplane,
+        ok: false,
+        code: 'crag_kernel_missing',
+        error: crag.error || 'Crag kernel ELF missing (share/crag/kin-kernel)',
+      })
+      continue
+    }
+    const uid = typeof uidOf === 'function' ? uidOf(vm) : null
+    const gid = uid?.gid
+    const out = materializeSlotDataplane(projectRoot, vm, dataplane, {
+      uid: uid?.uid ?? uid,
+      gid: gid ?? null,
+    })
+    if (vm?.kernel_restart_pending) out.kernel_changed = true
+    items.push({ id: vm.id, dataplane, ...out })
+  }
+  const failed = items.filter((item) => !item.ok)
+  const changed = items.filter((item) => item.kernel_changed === true)
+  return {
+    ok: failed.length === 0,
+    changed: changed.length > 0,
+    src: sample.dir,
+    meta: sample.meta,
+    crag,
+    total: items.length,
+    ok_count: items.length - failed.length,
+    failed_count: failed.length,
+    changed_count: changed.length,
     items,
   }
 }

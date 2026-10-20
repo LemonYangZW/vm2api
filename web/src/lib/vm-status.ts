@@ -51,7 +51,7 @@ function probeOlderThanRefresh(vm: Vm): boolean {
  * 一次失败不能当成授权吊销或凭证作废。
  */
 const TEST_PROBE_SOURCES =
-  /^(test-chat|kin-console-test|kin-console-loadtest|health-probe|kin-health-probe)$/i
+  /^(test-chat|kin-console-test|health-probe|kin-health-probe)$/i
 
 const USAGE_PROBE_SOURCES = new Set([
   'vm-oauth-usage',
@@ -166,11 +166,12 @@ function parkedGrantDeath(vm: Vm | undefined): boolean {
 }
 
 function invalidCredTone(vm: Vm | undefined): StatusTone {
+  const revoked = vmRevoked(vm)
   return {
     cls: 'bad',
-    key: vmRevoked(vm) ? 'revoke' : 'bad',
-    text: '无效凭证',
-    label: '无效凭证',
+    key: revoked ? 'revoke' : 'bad',
+    text: revoked ? '已吊销' : '无效凭证',
+    label: revoked ? '已吊销' : '无效凭证',
   }
 }
 
@@ -197,6 +198,58 @@ export function credExpiry(vm: Vm): StatusTone & { ms: number | null } {
   return { cls: 'ok', key: 'ok', text: '有效', ms }
 }
 
+/**
+ * Claude 单元熔断的展示态。closed 返回 null。
+ * open 到期但还没人来探测时，后端 view 已折算成 half_open。
+ */
+export function vmCircuit(
+  vm: Vm | undefined,
+  now = Date.now()
+): {
+  state: 'open' | 'half_open'
+  failures: number
+  threshold: number
+  until: number | null
+  left: number
+} | null {
+  const c = vm?.circuit
+  if (!c || c.state === 'closed') return null
+  const until = c.state === 'open' ? Number(c.open_until || 0) || null : null
+  if (c.state === 'open' && until && until <= now) {
+    return {
+      state: 'half_open',
+      failures: c.failures,
+      threshold: c.threshold,
+      until: null,
+      left: 0,
+    }
+  }
+  return {
+    state: c.state,
+    failures: c.failures,
+    threshold: c.threshold,
+    until,
+    left: until ? until - now : 0,
+  }
+}
+
+export function vmCircuitTitle(vm: Vm | undefined, now = Date.now()): string {
+  const c = vmCircuit(vm, now)
+  if (!c) return '熔断关闭'
+  if (c.state === 'half_open')
+    return '熔断半开 · 下一个请求作为探测，成功即恢复'
+  const sec = Math.max(1, Math.ceil(c.left / 1000))
+  return `熔断中 · 连续 ${c.failures}/${c.threshold} 次 5xx · ${sec}s 后放行探测`
+}
+
+function circuitTone(vm: Vm | undefined): StatusTone | null {
+  const c = vmCircuit(vm)
+  if (!c) return null
+  return c.state === 'open'
+    ? { key: 'circuit', text: '熔断中', cls: 'bad' }
+    : { key: 'circuit', text: '熔断探测', cls: 'caution' }
+}
+
 export function vmCooldown(
   vm: Vm
 ): { until: number; reason: string; left: number } | null {
@@ -209,6 +262,18 @@ export function vmCooldown(
   }
 }
 
+/** Claude 席位悬浮说明：宽限与等并发都是 `seats_used` / `queue_depth` 的子集。 */
+export function seatTitle(vm: Vm): string {
+  const used = Number(vm.seats_used) || 0
+  const grace = Number(vm.seats_grace) || 0
+  const queued = Number(vm.queue_depth) || 0
+  const conc = Number(vm.conc_waiting) || 0
+  const parts = [`席位 ${used}/${Number(vm.seats_max) || 0}`]
+  if (grace) parts.push(`宽限保留 ${grace}`)
+  if (queued) parts.push(`排队 ${queued}${conc ? `（等并发 ${conc}）` : ''}`)
+  return parts.join(' · ')
+}
+
 export function vmCooldownTitle(vm: Vm): string {
   const cool = vmCooldown(vm)
   if (!cool) return '无冷却'
@@ -219,18 +284,21 @@ export function vmCooldownTitle(vm: Vm): string {
 
 export function accountStatus(vm: Vm | undefined): StatusTone {
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  const restricted = restrictionTone(vm)
+  if (restricted) return { ...restricted, label: restricted.text }
 
   if (vm?.availability?.key && !probeTaintedAvailability(vm)) {
     const a = vm.availability
-    // 7 个 key 的完整映射，对齐 index.html 的 accountStatus。
+    // 8 个 key 的完整映射，对齐 index.html 的 accountStatus。
     const fallback: Record<typeof a.key, string> = {
       none: '无凭证',
       ok: '可用',
       off: '调度关',
       cool: '冷却中',
       quota: '额度限制',
-      sessions: '会话已满',
+      drain: '临近闸线',
       bad: '无效凭证',
+      rest: '休息时段',
     }
     // 与 poolStatus 同口径：off 只表达调度意图，凭证死活先于它判。
     if (a.key === 'off') {
@@ -242,9 +310,9 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
     const cls =
       a.key === 'ok'
         ? 'ok'
-        : a.key === 'quota' || a.key === 'sessions'
+        : a.key === 'quota'
           ? 'warn'
-          : a.key === 'cool'
+          : a.key === 'cool' || a.key === 'drain' || a.key === 'rest'
             ? 'caution'
             : a.key === 'off'
               ? 'off'
@@ -340,7 +408,8 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
  */
 export function credentialStatus(vm: Vm | undefined): StatusTone {
   const base = accountStatus(vm)
-  if (base.key !== 'off') return base
+  // 休息时段同理是调度意图（排班），不是凭证状态。
+  if (base.key !== 'off' && base.key !== 'rest') return base
   if (!vm?.has_token) return { cls: 'none', key: 'none', text: '无凭证' }
   const exp = credExpiry(vm)
   if (exp.cls === 'bad') return { cls: 'bad', key: 'bad', text: '已过期' }
@@ -349,10 +418,118 @@ export function credentialStatus(vm: Vm | undefined): StatusTone {
   return { cls: 'ok', key: 'ok', text: '凭证有效' }
 }
 
+function leftoverQuotaOff(vm: Vm | undefined): boolean {
+  if (!vm || vm.schedulable !== false || vm.schedule_manual === true)
+    return false
+  return /^(quota_5h|quota_7d)/.test(String(vm.schedule_disabled_reason || ''))
+}
+
+/** 额度 / 429 / 冷却写成受限，不是操作员关。含未迁完的 leftover quota-off。 */
+export function isRestrictedSchedule(vm: Vm | undefined): boolean {
+  if (!vm) return false
+  return vm.schedule_state === 'restricted' || leftoverQuotaOff(vm)
+}
+
+export function scheduleStateLabel(vm: Vm | undefined): '开' | '受限' | '关' {
+  if (!vm) return '关'
+  if (isRestrictedSchedule(vm)) return '受限'
+  if (vm.schedule_state === 'off' || vm.schedulable === false) return '关'
+  return '开'
+}
+
+export function restrictionUntilOf(vm: Vm | undefined): number | null {
+  if (!vm) return null
+  const until = Number(vm.restriction_until || 0)
+  if (until > 0) return until
+  const cool = Number(vm.cooldown_until || 0)
+  return cool > 0 ? cool : null
+}
+
+/** 详情冷却格与限制态共用同一套文案，不另起一套冷却系统。 */
+export function restrictionCopy(vm: Vm | undefined): string {
+  if (!vm) return '无限制'
+  const restricted = restrictionTone(vm)
+  if (restricted) return restricted.text
+  if (vmCooldown(vm)) return restrictionLabel(vm, '冷却中')
+  return '无限制'
+}
+
+function restrictionLabel(vm: Vm, fallback: string): string {
+  const raw = String(vm.availability?.text || '').trim()
+  if (raw && raw !== '调度关' && vm.availability?.key !== 'off') return raw
+  const reason = String(
+    vm.restriction_reason ||
+      vm.availability?.reason ||
+      vm.schedule_disabled_reason ||
+      ''
+  )
+  if (/quota_5h/.test(reason)) return '5h 限制'
+  if (/quota_7d/.test(reason)) return '7d 限制'
+  return fallback
+}
+
+function restrictionTone(vm: Vm | undefined): StatusTone | null {
+  if (!vm) return null
+  if (vm.schedule_state === 'restricted' || leftoverQuotaOff(vm)) {
+    const reason = String(
+      vm.restriction_reason || vm.availability?.reason || ''
+    )
+    // 休息时段是操作员排班，不是上游冷却：单独成态，别引人去点「清冷却」。
+    if (vm.availability?.key === 'rest' || /rest_period/.test(reason)) {
+      return {
+        key: 'rest',
+        text: restrictionLabel(vm, '休息时段'),
+        cls: 'caution',
+      }
+    }
+    if (
+      vm.availability?.key === 'cool' ||
+      /cool|rate_limited|account_quota/i.test(reason)
+    ) {
+      return {
+        key: 'cool',
+        text: restrictionLabel(vm, '冷却中'),
+        cls: 'caution',
+      }
+    }
+    return {
+      key: 'quota',
+      text: restrictionLabel(vm, '额度限制'),
+      cls: 'warn',
+    }
+  }
+  return null
+}
+
+/** 席位全占：新设备会排队，但这台 VM 照常在调度，不是受限。 */
+function seatsFullTone(vm: Vm | undefined): StatusTone | null {
+  if (!vm || vm.seats_max == null) return null
+  const max = Number(vm.seats_max) || 0
+  if (max <= 0 || (Number(vm.seats_used) || 0) < max) return null
+  return { key: 'seats', text: '席位满', cls: 'caution' }
+}
+
+/**
+ * 状态优先级：吊销/废票 → 额度上限 / 门禁（受限）→ 503 熔断 → 调度关 →
+ * 临近闸线 → 席位满 → 其余。受限与调度关互斥（后端 triad 先判调度关）。
+ * 临近闸线仍在接单，所以排在熔断之后：熔断中的槽确实不接单，要让人看见。
+ */
 export function poolStatus(vm: Vm | undefined): StatusTone {
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  const restricted = restrictionTone(vm)
+  if (restricted) return restricted
+  // 调度关优先于熔断：操作员关掉的槽不显示熔断。
+  if (vm?.schedule_state !== 'off') {
+    const circuit = circuitTone(vm)
+    if (circuit) return circuit
+  }
+  if (vm?.schedule_state === 'off') {
+    if (!vm.has_token) return { key: 'none', text: '无凭证', cls: 'none' }
+    if (ticketExpiredDead(vm)) return { key: 'bad', text: '已过期', cls: 'bad' }
+    return { key: 'off', text: '调度关', cls: 'off' }
+  }
 
   if (vm?.availability?.key && !probeTaintedAvailability(vm)) {
     const a = vm.availability
@@ -369,13 +546,19 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
         return { key: 'bad', text: '已过期', cls: 'bad' }
       return { key: 'off', text: a.text || '调度关', cls: 'off' }
     }
-    if (a.key === 'quota' || a.key === 'sessions') {
+    if (a.key === 'quota') {
       return { key: 'quota', text: a.text || '额度限制', cls: 'warn' }
     }
+    if (a.key === 'rest')
+      return { key: 'rest', text: a.text || '休息时段', cls: 'caution' }
     if (a.key === 'cool' || vmCooldown(vm))
       return { key: 'cool', text: a.text || '冷却中', cls: 'caution' }
+    if (a.key === 'drain')
+      return { key: 'drain', text: a.text || '临近闸线', cls: 'caution' }
     if (!a.usable) return { key: 'bad', text: a.text || '无效凭证', cls: 'bad' }
-    return { key: 'pool', text: a.text || '可用', cls: 'ok' }
+    return (
+      seatsFullTone(vm) || { key: 'pool', text: a.text || '可用', cls: 'ok' }
+    )
   }
   if (!vm?.has_token) return { key: 'none', text: '无凭证', cls: 'none' }
   const fb = vm.fable || {}
@@ -409,7 +592,7 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
   if (windowWarn(vm.status_7d, u7))
     return { key: 'quota', text: '7d 警告', cls: 'caution' }
   if (isTransportProbe(vm) && !isUsageProbeOk(vm)) return transportFailTone()
-  return { key: 'pool', text: '在池', cls: 'ok' }
+  return seatsFullTone(vm) || { key: 'pool', text: '在池', cls: 'ok' }
 }
 
 /**
@@ -431,27 +614,69 @@ export function vmRunning(vm: Vm | undefined): boolean {
   return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
 }
 
+/** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */
+export function openaiPlanLabel(planType: unknown): string {
+  const raw = String(planType || '').trim()
+  switch (raw.toLowerCase()) {
+    case '':
+      return 'GPT'
+    case 'free':
+    case 'free_workspace':
+    case 'guest':
+      return 'Free'
+    case 'go':
+      return 'Go'
+    case 'plus':
+      return 'Plus'
+    case 'pro':
+    case 'prolite':
+      return 'Pro'
+    case 'team':
+    case 'self_serve_business_prolite':
+    case 'self_serve_business_usage_based':
+      return 'Business'
+    case 'business':
+    case 'ent26':
+    case 'enterprise_cbp_automation':
+    case 'enterprise_cbp_usage_based':
+    case 'enterprise':
+    case 'hc':
+      return 'Enterprise'
+    case 'edu':
+    case 'education':
+      return 'Edu'
+    case 'edu_plus':
+      return 'Edu Plus'
+    case 'edu_pro':
+      return 'Edu Pro'
+    default:
+      return raw
+  }
+}
+
 export function claudeTier(vm: Vm | undefined): StatusTone {
   if (isCodexVm(vm)) {
     if (!vm?.has_token)
       return { key: 'none', label: '—', cls: 'none', text: '—' }
-    return { key: 'codex', label: 'GPT', cls: 'codex', text: 'GPT' }
+    const plan = openaiPlanLabel(vm?.plan_type || vm?.chatgpt_plan_type)
+    return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
-  const fb = vm.fable || {}
-  const raw = String(vm.account_tier || '').toLowerCase()
-  // 落盘的 Max 压过 Fable 拒绝：Max 套餐也可能没有 Fable 权限，一次 403
-  // 不是 Pro 的证据。顺序与后端 inferClaudeTier / claude-tier.mjs 一致。
-  if (raw === 'max')
-    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
-  if (raw === 'pro' || fablePlanDenied(fb))
+  if (vm.usage_has_fable === false)
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
+  const raw = String(vm.account_tier || '').toLowerCase()
   const oi = vm.utilization_7d_oi
   const oiN =
     oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
   const realFable =
-    Boolean(fb.ok) || (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
-  if (realFable) return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
+    vm.usage_has_fable === true ||
+    (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
+  // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
+  // 没有套餐证据时不要画成 Pro，否则 Max 探测未完成的槽会一直显示 Pro。
+  if (realFable || raw === 'max')
+    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
+  if (raw === 'pro')
+    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
   return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
 }
 
@@ -468,18 +693,34 @@ export function vmBuckets(vms: Vm[]) {
   return b
 }
 
-/** Coarse fleet grouping shared by the cluster and vm lists (index.html parity). */
-export function fleetGroup(vm: Vm): 'pool' | 'off' | 'none' | 'bad' | 'revoke' {
-  const k = poolStatus(vm).key
+export type FleetGroup =
+  'pool' | 'restricted' | 'off' | 'none' | 'bad' | 'revoke'
+
+/** Coarse fleet grouping for the VM list. 受限 is the triad, not 5h/7d warning. */
+export function fleetGroup(vm: Vm): FleetGroup {
+  const status = poolStatus(vm)
+  const k = status.key
   if (k === 'revoke') return 'revoke'
   if (k === 'bad') return 'bad'
   if (k === 'none') return 'none'
   if (k === 'off') return 'off'
+  if (isRestrictedSchedule(vm) || k === 'cool' || k === 'rest')
+    return 'restricted'
+  if (k === 'quota' && !/警告/.test(String(status.text || '')))
+    return 'restricted'
   return 'pool'
 }
 
-export function fleetCounts(vms: Vm[]) {
-  const c = { all: vms.length, pool: 0, off: 0, none: 0, bad: 0, revoke: 0 }
+export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
+  const c: Record<FleetGroup | 'all', number> = {
+    all: vms.length,
+    pool: 0,
+    restricted: 0,
+    off: 0,
+    none: 0,
+    bad: 0,
+    revoke: 0,
+  }
   for (const vm of vms) c[fleetGroup(vm)] += 1
   return c
 }
@@ -529,16 +770,108 @@ export function healthScore(vms: Vm[]): number {
 
 export function normalizeVmFilter(f: string): string {
   if (f === 'ok') return 'pool'
-  if (f === 'caution') return 'cool'
-  if (f === 'warn') return 'quota'
+  if (f === 'caution' || f === 'cool' || f === 'warn' || f === 'quota') {
+    return 'restricted'
+  }
   return f || 'all'
 }
 
+type ProxyRef = {
+  host?: string
+  port?: number | string
+  id?: string
+  scheme?: string
+  kind?: string
+  label?: string | null
+  node_id?: string | null
+  node_name?: string | null
+}
+
+export type LocalProxyLabelOpts = {
+  /** Cluster node display name. Empty + reveal = control plane. */
+  nodeName?: string | null
+  /** Fallback when the node record is gone but we still know the id. */
+  nodeId?: string | null
+  /** Admin/super may see node names; tenants get the generic label. */
+  revealNode?: boolean
+}
+
+function isLocalProxyLabelOpts(value: unknown): value is LocalProxyLabelOpts {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    ('nodeName' in value || 'nodeId' in value || 'revealNode' in value)
+  )
+}
+
+/**
+ * Shared local-proxy display label.
+ * Tenant: `local代理`. Control plane (admin): `当前VPS local代理`.
+ * Extension node (admin): `${nodeName}local代理`.
+ */
+export function localProxyText(
+  opts?: LocalProxyLabelOpts | string | null
+): string {
+  if (!isLocalProxyLabelOpts(opts) || !opts.revealNode) return 'local代理'
+  const name =
+    String(opts.nodeName || '').trim() || String(opts.nodeId || '').trim()
+  return name ? `${name}local代理` : '当前VPS local代理'
+}
+
+/** Prefer the API's `node_name` field (present only for admin). */
+export function localProxyOptsFromProxy(
+  proxy?: ProxyRef | null,
+  fallback?: LocalProxyLabelOpts
+): LocalProxyLabelOpts {
+  if (proxy && Object.prototype.hasOwnProperty.call(proxy, 'node_name')) {
+    return {
+      nodeName: proxy.node_name ?? null,
+      nodeId: proxy.node_id ?? null,
+      revealNode: true,
+    }
+  }
+  return fallback ?? { revealNode: false }
+}
+
+function isLocalProxyRef(proxy: ProxyRef): boolean {
+  return (
+    String(proxy.id || '').startsWith('px-local') ||
+    proxy.scheme === 'local' ||
+    proxy.kind === 'local' ||
+    proxy.host === 'local'
+  )
+}
+
+/** Local labels come from placement, not the control-plane probe IP. */
 export function proxyHostLabel(
-  proxy: { host?: string; port?: number | string; id?: string } | undefined
+  proxy: ProxyRef | undefined,
+  opts?: LocalProxyLabelOpts | string | null
 ): string {
   if (!proxy) return '—'
-  if (proxy.host)
-    return `${proxy.host}${proxy.port != null ? `:${proxy.port}` : ''}`
+  if (isLocalProxyRef(proxy)) {
+    return localProxyText(
+      localProxyOptsFromProxy(
+        proxy,
+        isLocalProxyLabelOpts(opts) ? opts : undefined
+      )
+    )
+  }
+  if (proxy.host) {
+    const host =
+      proxy.host.includes(':') && !proxy.host.startsWith('[')
+        ? `[${proxy.host}]`
+        : proxy.host
+    return `${host}${proxy.port != null ? `:${proxy.port}` : ''}`
+  }
   return proxy.id || '—'
+}
+
+/** 带代理名称的地址：`名称 · host:port`；没起名就退回 proxyHostLabel()。 */
+export function proxyNamedLabel(
+  proxy: ProxyRef | undefined,
+  opts?: LocalProxyLabelOpts | string | null
+): string {
+  const host = proxyHostLabel(proxy, opts)
+  const name = proxy?.label?.trim()
+  return name && host !== '—' ? `${name} · ${host}` : host
 }

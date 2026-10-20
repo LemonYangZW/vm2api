@@ -14,6 +14,7 @@ import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
   applyEffectiveWindows,
+  extraHeadersFromLimitError,
   extraIsLiveOpen,
   headerHardBlocked,
   headerWindow,
@@ -25,21 +26,36 @@ import {
   wipeElapsedHeaderWindows,
 } from './quota-window.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
+import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
-import { isFableUnavailablePro, isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
+import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
+import {
+  isFablePlanDenied,
+  isInventedFableWindow,
+  isOfficialUsageRateLimited,
+  usageErrorText,
+} from '../oauth/crs-usage-probe.mjs'
 import { normalizeUsage } from '../admin/pricing.mjs'
+import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
 import { isTestProbeSource } from './schedule-eligibility.mjs'
+import {
+  estimateRequestRisk,
+  guardLargeColdEnabled,
+  largeColdThresholdOf,
+  resolveRequestRisk,
+} from './quota-request-risk.mjs'
+import {
+  GATE_DRAINING,
+  GATE_GATED,
+  GATE_OPEN,
+  gatePolicyFields,
+  gateZone,
+  quotaGateOf,
+  worstGateZone,
+} from './quota-gate.mjs'
 
-/** Wrap CLI often reports Extra 5h as `You've hit your limit` without HTTP headers. */
-export function extraHeadersFromLimitError(message, headers = {}) {
-  const h = { ...(headers || {}) }
-  if (Object.keys(h).some((key) => /ratelimit-unified-5h/i.test(key))) return h
-  const text = String(message || '')
-  if (!/hit your limit/i.test(text)) return h
-  h['anthropic-ratelimit-unified-5h-status'] = 'rejected'
-  h['anthropic-ratelimit-unified-5h-utilization'] = '1'
-  return h
-}
+export { extraHeadersFromLimitError }
+export { estimateRequestRisk }
 
 export class AccountQuota {
   constructor({ dataDir, db, config, accounts }) {
@@ -55,7 +71,13 @@ export class AccountQuota {
     this.tiers = normalizeTiers(config?.tiers, this.config, this.concurrency)
     this.inflight = new Map() // accountId → count
     this.rpmBuckets = new Map() // accountId → number[] timestamps ms
+    // Settled-in-band hops whose Extra reading has not yet moved.
+    this.staleSettled = new Map()
+    this.observedUtil = new Map()
+    this.reservationBand = new Map() // accountId → boolean[] (in-band at acquire)
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
+    // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
+    this.vmQuota = new Map()
     // seed accounts
     for (const a of accounts || []) this.ensure(a)
   }
@@ -149,11 +171,15 @@ export class AccountQuota {
     acc.unified.header_stall = 0
 
     const countRequest = extra.countRequest !== false
-    const exhausted = extra.exhausted === true || extra.status === 429 || isUnifiedRejected(h)
+    const exhausted = extra.exhausted === true || isUnifiedRejected(h)
     const writeExtra = countRequest || exhausted
     const u5 = num(h['anthropic-ratelimit-unified-5h-utilization'])
     const u7 = num(h['anthropic-ratelimit-unified-7d-utilization'])
     let sampled = false
+    if (exhausted) {
+      dropElapsedReset(acc, '5h', h['anthropic-ratelimit-unified-5h-reset'])
+      dropElapsedReset(acc, '7d', h['anthropic-ratelimit-unified-7d-reset'])
+    }
     if (
       writeExtra &&
       (u5 != null || h['anthropic-ratelimit-unified-5h-status'] || h['anthropic-ratelimit-unified-5h-reset'])
@@ -203,7 +229,7 @@ export class AccountQuota {
     acc.unified.updated_at = new Date().toISOString()
     if (sampled) acc.unified.headers.sampled_at = new Date().toISOString()
 
-    const usage = normalizeUsage(usageBody || {})
+    const usage = normalizeUsage(disjointOpenaiUsage(usageBody || {}) || {})
     if (
       countRequest &&
       (usage.input_tokens != null ||
@@ -238,6 +264,15 @@ export class AccountQuota {
 
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
+    if (sampled) {
+      const observed5 = headerWindowOrEmpty(saved.unified, '5h')
+      const observed7 = headerWindowOrEmpty(saved.unified, '7d')
+      this._observeUtil(accountId, {
+        u5: observed5.utilization,
+        u7: observed7.utilization,
+        source: 'headers',
+      })
+    }
     return saved
   }
 
@@ -303,6 +338,7 @@ export class AccountQuota {
     if (probe.extra_usage) acc.unified.overage_status = probe.extra_usage.status || acc.unified.overage_status
     acc.unified.extra_usage = probe.extra_usage || acc.unified.extra_usage || null
     const fableTransport = isFableTransportFailure(probe)
+    if (probe.fable) acc.unified.fable_probe_attempted_at = nowIso
     const oi = probe.seven_day_oi || probe.seven_day_overage_included || probe.fable?.seven_day_oi
     const oiUtil =
       oi?.utilization != null
@@ -323,64 +359,61 @@ export class AccountQuota {
       }
     }
     const usageOk = probe.ok === true || (probe.usage_status > 0 && probe.usage_status < 400)
+    const completeOfficialUsage = usageOk && probe.limits_present === true
+    const leftoverFable = acc.unified.fable || {}
+    const hasFableUsage =
+      probe.usage_has_fable === true ||
+      (!isInventedFableWindow(probe.fable || leftoverFable, {
+        utilization_7d_oi: oiNorm,
+        reset_7d_oi: oi?.resets_at || oi?.reset,
+        status_7d_oi: oi?.status,
+        '7d_oi': oi,
+      }) &&
+        (oiNorm != null || oi?.resets_at || oi?.reset || oi?.status))
+    if (completeOfficialUsage && (probe.usage_has_fable === true || hasFableUsage)) acc.unified.usage_has_fable = true
+    else if (completeOfficialUsage && probe.usage_has_fable === false) {
+      acc.unified.usage_has_fable = false
+      delete acc.unified['7d_oi']
+      if (acc.unified.headers) delete acc.unified.headers['7d_oi']
+      delete acc.unified.fable
+    }
+    if (completeOfficialUsage) {
+      if (probe.usage_has_fable === true || hasFableUsage) acc.unified.account_tier = 'max'
+      else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
+      if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
+        acc.unified.account_tier_source = 'usage'
+    }
     if (probe.fable && !fableTransport) {
-      const fableRevokeNoise =
-        usageOk &&
-        (probe.fable.banned ||
-          probe.fable.status === 401 ||
-          /revoked|oauth|authentication/i.test(String(probe.fable.error || '')))
-      const fable429Pro =
-        usageOk &&
-        !oiNorm &&
-        !oi?.resets_at &&
-        !oi?.reset &&
-        (Number(probe.fable.status) === 429 || !!probe.fable.limited)
+      const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
       acc.unified.fable = {
         limited: oiRejected,
         banned: !!probe.fable.banned && !usageOk && (probe.usage_status === 401 || probe.usage_status === 403),
-        plan_denied: !!probe.fable.plan_denied || fableRevokeNoise || fable429Pro,
-        ok: !!probe.fable.ok && !oiRejected,
+        plan_denied: planDenied,
+        ok: completeOfficialUsage && hasFableUsage,
         status: probe.fable.status || 0,
         reset: probe.fable.reset_at || acc.unified['7d_oi']?.reset || null,
         utilization: oiNorm ?? probe.fable.utilization ?? acc.unified['7d_oi']?.utilization ?? null,
         model: probe.fable.model || 'claude-fable-5',
-        error: fableRevokeNoise ? 'plan_denied' : probe.fable.error || null,
+        error: usageOk && Number(probe.fable.status) === 401 ? null : probe.fable.error || null,
         probed_at: probe.probed_at || new Date().toISOString(),
       }
-      const stored = String(acc.unified.account_tier || '').toLowerCase()
-      if (acc.unified.fable.ok) acc.unified.account_tier = 'max'
-      else if (acc.unified.fable.plan_denied && stored !== 'max') acc.unified.account_tier = 'pro'
+      // Only a complete official /usage classifies the plan; Fable hop only fills metadata.
+      if (completeOfficialUsage && hasFableUsage) {
+        acc.unified.account_tier = 'max'
+        acc.unified.account_tier_source = 'usage'
+      }
     } else if (usageOk) {
-      const leftover = acc.unified.fable || {}
-      const stored = String(acc.unified.account_tier || '').toLowerCase()
-      if (
-        stored !== 'max' &&
-        (stored === 'pro' ||
-          isFableUnavailablePro(leftover, {
-            utilization_7d_oi: acc.unified['7d_oi']?.utilization,
-            reset_7d_oi: acc.unified['7d_oi']?.reset,
-            status_7d_oi: acc.unified['7d_oi']?.status,
-            '7d_oi': acc.unified['7d_oi'],
-          }))
-      ) {
-        acc.unified.fable = {
-          limited: false,
-          banned: false,
-          plan_denied: true,
-          ok: false,
-          status: leftover.status || 403,
-          reset: null,
-          utilization: null,
-          model: leftover.model || 'claude-fable-5',
-          error: 'plan_denied',
-          probed_at: probe.probed_at || new Date().toISOString(),
-        }
-        acc.unified.account_tier = 'pro'
-        if (!oiNorm && !oi?.resets_at && !oi?.reset) {
-          acc.unified['7d_oi'] = {
-            utilization: null,
-            reset: null,
-            status: null,
+      const leftover = leftoverFable
+      if (completeOfficialUsage && hasFableUsage) {
+        acc.unified.account_tier = 'max'
+        acc.unified.account_tier_source = 'usage'
+        if (leftover.plan_denied || leftover.ok === false) {
+          acc.unified.fable = {
+            ...leftover,
+            plan_denied: false,
+            ok: true,
+            error: null,
+            probed_at: probe.probed_at || leftover.probed_at || new Date().toISOString(),
           }
         }
       }
@@ -391,7 +424,8 @@ export class AccountQuota {
       at: probe.probed_at || new Date().toISOString(),
       ok: !!probe.ok,
       source: probe.source || 'vm-oauth-usage',
-      error: probe.error || probe.usage_error || (usageOk ? null : probe.fable?.error) || null,
+      error:
+        usageErrorText({ error: probe.error || probe.usage_error || (usageOk ? null : probe.fable?.error) }) || null,
       transport: fableTransport,
     }
     acc.unified.last_probe = acc.last_probe
@@ -402,6 +436,15 @@ export class AccountQuota {
     }
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
+    if (usageOk) {
+      const observed5 = headerWindowOrEmpty(saved.unified, '5h')
+      const observed7 = headerWindowOrEmpty(saved.unified, '7d')
+      this._observeUtil(accountId, {
+        u5: observed5.utilization,
+        u7: observed7.utilization,
+        source: 'official',
+      })
+    }
     if (usageOk && this.headerUnderSafety(saved)) {
       this.clearQuotaExhaustedCooldown(accountId)
     }
@@ -468,17 +511,47 @@ export class AccountQuota {
    * @returns {{ ok: true } | { ok: false, reason, detail }}
    */
   policyFor(acc, { tier } = {}) {
-    return resolveTierPolicy(
-      {
-        tiers: this.tiers,
-        quota: this.config,
-        concurrency: this.concurrency,
-      },
-      acc?.unified?.account_tier || acc?.account_tier || tier,
-    )
+    const quotaConfig = this.quotaConfigFor(acc)
+    return {
+      ...applyVmQuotaPolicy(
+        resolveTierPolicy(
+          {
+            tiers: this.tiers,
+            quota: this.config,
+            concurrency: this.concurrency,
+          },
+          acc?.unified?.account_tier || acc?.account_tier || tier,
+        ),
+        this.vmQuotaOverrideFor(acc),
+      ),
+      // evaluateAccount reads the gate from the policy, so panel and admission share one band/overshoot.
+      ...gatePolicyFields(quotaConfig),
+    }
   }
 
-  canAccept(accountId, { sessionKey = null, tier = null } = {}) {
+  /** Global `quota` block (block switches, weekly split) with the account's VM override applied. */
+  quotaConfigFor(acc) {
+    return applyVmQuotaConfig(this.config, this.vmQuotaOverrideFor(acc))
+  }
+
+  vmQuotaOverrideFor(acc) {
+    return acc?.vm_id ? this.vmQuota.get(acc.vm_id) || null : null
+  }
+
+  /** @param {string} vmId @param {object|null} override normalized (`vmQuotaOverrideOf`) */
+  setVmQuotaOverride(vmId, override) {
+    if (!vmId) return
+    if (override) this.vmQuota.set(vmId, override)
+    else this.vmQuota.delete(vmId)
+  }
+
+  /** Replace every VM override from `listVms` summaries (boot / backup restore). */
+  loadVmQuotaOverrides(vms) {
+    this.vmQuota.clear()
+    for (const vm of vms || []) this.setVmQuotaOverride(vm?.id, vm?.quota_override || null)
+  }
+
+  canAccept(accountId, { tier = null, requestRisk = null, quotaRequest = null } = {}) {
     const acc = this.ensure({ account_id: accountId })
     const policy = this.policyFor(acc, { tier })
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
@@ -486,7 +559,10 @@ export class AccountQuota {
       policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
     )
     const warnRatio = Number(policy.warn_ratio ?? this.config.warn_ratio ?? 0.75)
+    const quotaConfig = this.quotaConfigFor(acc)
     const inflight = this.inflight.get(accountId) || 0
+    const gate = quotaGateOf(quotaConfig)
+    const band = gate.band
 
     const limit = this.limitFor(acc, policy)
     if (inflight >= limit) {
@@ -497,7 +573,7 @@ export class AccountQuota {
       }
     }
 
-    if (this.config.block_on_5h && headerHardBlocked(acc.unified, '5h')) {
+    if (quotaConfig.block_on_5h && headerHardBlocked(acc.unified, '5h')) {
       const h5 = headerWindow(acc.unified, '5h')
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', status: h5.status, source: 'headers' }
       this.repo.save(acc)
@@ -511,7 +587,7 @@ export class AccountQuota {
         },
       }
     }
-    if (this.config.block_on_7d && headerHardBlocked(acc.unified, '7d')) {
+    if (quotaConfig.block_on_7d && headerHardBlocked(acc.unified, '7d')) {
       const h7 = headerWindow(acc.unified, '7d')
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', status: h7.status, source: 'headers' }
       this.repo.save(acc)
@@ -528,10 +604,12 @@ export class AccountQuota {
 
     const w5 = headerWindowOrEmpty(acc.unified, '5h')
     const w7 = headerWindowOrEmpty(acc.unified, '7d')
-    const u5 = Number(w5.utilization || 0)
-    const u7 = Number(w7.utilization || 0)
+    const u5 = asUtilRatio(w5.utilization)
+    const u7 = asUtilRatio(w7.utilization)
+    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN
+    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate) : GATE_OPEN
 
-    if (this.config.block_on_5h && u5 >= ratio) {
+    if (z5 === GATE_GATED) {
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', utilization: u5, status: w5.status }
       this.repo.save(acc)
       return {
@@ -541,13 +619,15 @@ export class AccountQuota {
           utilization: u5,
           safety_ratio: ratio,
           limit_5h: ratio,
+          gate_overshoot: gate.overshoot,
+          inflight,
           reset: w5.reset,
-          message: `5h usage ${(u5 * 100).toFixed(1)}% ≥ safety ${(ratio * 100).toFixed(0)}%; request blocked to protect quota`,
+          message: `5h usage ${(u5 * 100).toFixed(1)}% ≥ safety ${(ratio * 100).toFixed(0)}% + ${(gate.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect quota`,
         },
       }
     }
 
-    if (this.config.block_on_7d && u7 >= weeklyRatio) {
+    if (z7 === GATE_GATED) {
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', utilization: u7, status: w7.status }
       this.repo.save(acc)
       return {
@@ -558,24 +638,33 @@ export class AccountQuota {
           safety_ratio: weeklyRatio,
           weekly_safety_ratio: weeklyRatio,
           limit_7d: weeklyRatio,
+          gate_overshoot: gate.overshoot,
+          inflight,
           reset: w7.reset,
-          message: `7d usage ${(u7 * 100).toFixed(1)}% ≥ weekly ${(weeklyRatio * 100).toFixed(0)}%; request blocked to protect weekly quota`,
+          message: `7d usage ${(u7 * 100).toFixed(1)}% ≥ weekly ${(weeklyRatio * 100).toFixed(0)}% + ${(gate.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect weekly quota`,
         },
       }
     }
 
-    const maxSessions = Number(policy.max_sessions ?? acc.max_sessions ?? 0)
-    if (maxSessions > 0 && sessionKey) {
-      const sess = this.sessions.canAccept(accountId, sessionKey, {
-        max: maxSessions,
-        idleMin: policy.session_idle_min,
-      })
-      if (!sess.ok) {
-        return {
-          ok: false,
-          reason: 'session_limit',
-          detail: sess.detail,
-        }
+    const in5 = z5 === GATE_DRAINING
+    const in7 = z7 === GATE_DRAINING
+    // The header reading predates calls already in flight: near the line, one call
+    // at a time. This is a wait on this account (the scheduler keeps the seat
+    // here), not a reason to leave it.
+    if (inflight > 0 && (in5 || in7)) {
+      return {
+        ok: false,
+        reason: 'quota_band_inflight',
+        detail: {
+          window: in5 ? '5h' : '7d',
+          utilization_5h: u5,
+          utilization_7d: u7,
+          limit_5h: ratio,
+          limit_7d: weeklyRatio,
+          band,
+          gate_overshoot: gate.overshoot,
+          inflight,
+        },
       }
     }
 
@@ -587,6 +676,34 @@ export class AccountQuota {
           ok: false,
           reason: 'rpm_limit',
           detail: { current: rpm.n, max: rpmLimit, reset_at: rpm.resetAt, source: 'gateway' },
+        }
+      }
+    }
+    const stale = this.staleSettled.get(accountId) || 0
+    if (guardLargeColdEnabled(quotaConfig) && (in5 || in7)) {
+      const risk = resolveRequestRisk({ requestRisk, quotaRequest }, accountId, quotaConfig)
+      const tooLarge = this._requestTooLargeInBand({ quotaConfig, risk, stale })
+      if (tooLarge) {
+        return {
+          ok: false,
+          reason: 'quota_guard_request_too_large',
+          detail: {
+            utilization_5h: u5,
+            utilization_7d: u7,
+            limit_5h: ratio,
+            limit_7d: weeklyRatio,
+            gate_overshoot: gate.overshoot,
+            stale_settled: stale,
+            inflight,
+            estimated_prompt_tokens: risk?.estimatedPromptTokens ?? null,
+            uncached_tokens: risk?.uncachedTokens ?? null,
+            cold: risk?.cold ?? null,
+            cold_reason: risk?.coldReason ?? null,
+            reset_5h: w5.reset,
+            reset_7d: w7.reset,
+            message:
+              '临近额度闸线，本请求预估未命中缓存过大。Near the quota safety line, this large uncached request is not eligible on this account.',
+          },
         }
       }
     }
@@ -604,29 +721,37 @@ export class AccountQuota {
     if (inflight >= limit) {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }
+    const inBand = this._drainingNow(accountId, { tier: opts.tier })
+    const stack = this.reservationBand.get(accountId) || []
+    stack.push(inBand)
+    this.reservationBand.set(accountId, stack)
     this.inflight.set(accountId, inflight + 1)
     this._rpmTouch(accountId)
     return { ok: true }
   }
 
   /** sub2api 7d_oi: Fable-only window. Does not unschedulable the account. */
-  fableWindowLimited(accountId) {
-    const acc = this.repo.get(accountId)
-    const status = String(acc?.unified?.['7d_oi']?.status || '').toLowerCase()
-    return status === 'rejected' || status === 'rate_limited'
+  fableWindowLimited(accountId, now = Date.now()) {
+    const oi = this.repo.get(accountId)?.unified?.['7d_oi']
+    if (!oi) return false
+    const status = String(oi.status || '').toLowerCase()
+    if (status !== 'rejected' && status !== 'rate_limited') return false
+    const resetMs = parseResetMs(oi.reset)
+    if (Number.isFinite(resetMs) && resetMs <= now) return false
+    return true
   }
 
   fableWindowResetAt(accountId) {
     const reset = this.repo.get(accountId)?.unified?.['7d_oi']?.reset
     if (!reset) return null
-    const parsed = Date.parse(reset)
-    return Number.isFinite(parsed) ? parsed : null
+    const ms = parseResetMs(reset)
+    return Number.isFinite(ms) ? ms : null
   }
 
-  /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled. */
+  /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled (or the VM override). */
   weeklySplitOf(accountId) {
-    const cfg = weeklySplitConfig(this.config)
     const acc = this.repo.get(accountId)
+    const cfg = weeklySplitConfig(this.quotaConfigFor(acc))
     const u = acc?.unified || {}
     return computeWeeklySplit({
       enabled: cfg.enabled,
@@ -634,6 +759,7 @@ export class AccountQuota {
       utilization_7d: headerWindowOrEmpty(u, '7d').utilization ?? officialWindow(u, '7d').utilization,
       utilization_7d_oi: u['7d_oi']?.utilization ?? u.fable?.utilization,
       status_7d_oi: u['7d_oi']?.status,
+      reset_7d_oi: u['7d_oi']?.reset,
     })
   }
 
@@ -642,8 +768,8 @@ export class AccountQuota {
     const key = kind === 'fable' ? '7d_oi' : '7d'
     const reset = acc?.unified?.[key]?.reset
     if (!reset) return null
-    const parsed = Date.parse(reset)
-    return Number.isFinite(parsed) ? parsed : null
+    const ms = parseResetMs(reset)
+    return Number.isFinite(ms) ? ms : null
   }
 
   acquire(accountId) {
@@ -655,7 +781,77 @@ export class AccountQuota {
   release(accountId) {
     const n = Math.max(0, (this.inflight.get(accountId) || 1) - 1)
     this.inflight.set(accountId, n)
+    const stack = this.reservationBand.get(accountId)
+    if (stack?.length) stack.pop()
+    if (stack && !stack.length) this.reservationBand.delete(accountId)
     return n
+  }
+
+  /**
+   * A hop that actually ran on an in-band account: Extra may still show the
+   * previous percent, so the next large request treats the reading as stale
+   * until headers/official usage move.
+   */
+  noteBandSettled(accountId) {
+    if (!accountId) return 0
+    const stack = this.reservationBand.get(accountId)
+    const reservedInBand = Array.isArray(stack) ? stack.some(Boolean) : false
+    if (!reservedInBand && !this._drainingNow(accountId)) return this.staleSettled.get(accountId) || 0
+    const next = (this.staleSettled.get(accountId) || 0) + 1
+    this.staleSettled.set(accountId, next)
+    return next
+  }
+
+  /**
+   * The stricter 5h/7d gate zone for this account (see quota-gate.mjs), with
+   * the block switches applied. Used by the seat planner to place new devices.
+   */
+  gateZoneOf(accountId, { tier = null } = {}) {
+    const acc = this.repo.get(accountId) || this.ensure({ account_id: accountId })
+    const policy = this.policyFor(acc, { tier })
+    const quotaConfig = this.quotaConfigFor(acc)
+    const gate = quotaGateOf(quotaConfig)
+    const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
+    const weeklyRatio = Number(
+      policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
+    )
+    const u5 = asUtilRatio(headerWindowOrEmpty(acc.unified, '5h').utilization)
+    const u7 = asUtilRatio(headerWindowOrEmpty(acc.unified, '7d').utilization)
+    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN
+    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate) : GATE_OPEN
+    return worstGateZone(z5, z7)
+  }
+
+  _drainingNow(accountId, { tier = null } = {}) {
+    return this.gateZoneOf(accountId, { tier }) === GATE_DRAINING
+  }
+
+  /** Called only for a draining account: a large cold (or stale-reading large) call is not taken here. */
+  _requestTooLargeInBand({ quotaConfig, risk, stale }) {
+    if (!guardLargeColdEnabled(quotaConfig) || !risk) return false
+    const threshold = largeColdThresholdOf(quotaConfig)
+    const uncached = Number(risk.uncachedTokens) || 0
+    const large = risk.largeCold === true || uncached >= threshold
+    if (!large) return false
+    const coldLarge = risk.largeCold === true || (risk.cold !== false && uncached >= threshold)
+    const staleLarge = stale > 0 && large
+    return coldLarge || staleLarge
+  }
+
+  _observeUtil(accountId, { u5 = null, u7 = null, source = 'headers' } = {}) {
+    if (!accountId) return
+    const next5 = u5 == null ? null : asUtilRatio(u5)
+    const next7 = u7 == null ? null : asUtilRatio(u7)
+    const prev = this.observedUtil.get(accountId)
+    this.observedUtil.set(accountId, { u5: next5, u7: next7, source })
+    if (!prev) return
+    const progressed =
+      (next5 != null && prev.u5 != null && next5 > prev.u5 + 0.001) ||
+      (next7 != null && prev.u7 != null && next7 > prev.u7 + 0.001)
+    const reset =
+      (next5 != null && prev.u5 != null && next5 + 0.02 < prev.u5) ||
+      (next7 != null && prev.u7 != null && next7 + 0.02 < prev.u7)
+    if (source === 'official' || progressed || reset) this.staleSettled.set(accountId, 0)
   }
 
   /**
@@ -702,7 +898,10 @@ export class AccountQuota {
       }
     } else {
       acc.unified = next
-      if (wiped.changed) acc.unified.headers = wiped.headers
+      if (wiped.changed) {
+        if (wiped.headers) acc.unified.headers = wiped.headers
+        if (wiped.oi != null) acc.unified['7d_oi'] = wiped.oi
+      }
       if (changed) {
         writeOfficialWindow(acc, '5h', n5)
         writeOfficialWindow(acc, '7d', n7)
@@ -728,8 +927,8 @@ export class AccountQuota {
     const weeklyRatio = Number(policy.limit_7d ?? policy.weekly_safety_ratio ?? 0.8)
     const w5 = headerWindowOrEmpty(acc.unified, '5h')
     const w7 = headerWindowOrEmpty(acc.unified, '7d')
-    const u5 = Number(w5.utilization || 0)
-    const u7 = Number(w7.utilization || 0)
+    const u5 = officialUtilToExtra(w5.utilization) || 0
+    const u7 = officialUtilToExtra(w7.utilization) || 0
     if (u5 >= 1 || u5 >= ratio) return false
     if (u7 >= 1 || u7 >= weeklyRatio) return false
     return true
@@ -744,6 +943,8 @@ export class AccountQuota {
       return false
     }
     if (!state) return false
+    // Live 429 / overload columns belong to RateLimitService; passive Extra never lifts them.
+    if (Number(state.rate_limit_reset_at) > Date.now() || Number(state.overload_until) > Date.now()) return false
     const reason = String(state.cooldown_reason || '')
     const quotaCool = !reason || /quota|account_quota_exhausted|rate_limited/i.test(reason)
     if (!quotaCool) return false
@@ -909,13 +1110,11 @@ export class AccountQuota {
       changed = true
     }
     if (fb && (fb.banned || revoke.test(String(fb.error || '')))) {
-      const stored = String(u.account_tier || '').toLowerCase()
       u.fable = {
         ...fb,
         banned: false,
-        // Leftover revoke on a Max ticket is not a Pro plan_denied.
-        plan_denied: stored === 'max' ? false : true,
-        error: revoke.test(String(fb.error || '')) ? (stored === 'max' ? null : 'plan_denied') : fb.error || null,
+        plan_denied: revoke.test(String(fb.error || '')) ? false : !!fb.plan_denied,
+        error: revoke.test(String(fb.error || '')) ? null : fb.error || null,
       }
       changed = true
     }
@@ -925,14 +1124,42 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
-  setAccountTier(accountId, tier) {
+  setAccountTier(accountId, tier, { source = null } = {}) {
     const key = String(tier || '').toLowerCase()
     if (!accountId || (key !== 'pro' && key !== 'max')) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    if (acc.unified?.account_tier === key) return acc
+    if (acc.unified?.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return acc
+    if (acc.unified?.account_tier === key && (acc.unified?.account_tier_source || null) === source) return acc
     acc.unified = acc.unified || {}
     acc.unified.account_tier = key
+    acc.unified.account_tier_source = source
+    acc.unified.updated_at = new Date().toISOString()
+    return this.repo.save(acc)
+  }
+
+  markModelUnsupported(accountId, model, durationMs = 60 * 60_000) {
+    const key = resolvePolicyModelId(model) || String(model || '').trim()
+    if (!accountId || !key) return null
+    const acc = this.repo.get(accountId)
+    if (!acc) return null
+    acc.unified = acc.unified || {}
+    acc.unified.model_denied_until = {
+      ...(acc.unified.model_denied_until || {}),
+      [key]: Date.now() + durationMs,
+    }
+    acc.unified.updated_at = new Date().toISOString()
+    return this.repo.save(acc)
+  }
+
+  clearModelUnsupported(accountId, model) {
+    const key = resolvePolicyModelId(model) || String(model || '').trim()
+    if (!accountId || !key) return null
+    const acc = this.repo.get(accountId)
+    if (!acc?.unified?.model_denied_until?.[key]) return acc
+    const denied = { ...acc.unified.model_denied_until }
+    delete denied[key]
+    acc.unified.model_denied_until = denied
     acc.unified.updated_at = new Date().toISOString()
     return this.repo.save(acc)
   }
@@ -1048,6 +1275,13 @@ function num(v) {
   return Number.isFinite(n) ? n : null
 }
 
+/** Header samples are 0–1; a leftover official reading can still be 0–100. */
+function asUtilRatio(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return 0
+  return n > 1.5 ? n / 100 : n
+}
+
 function isUnifiedRejected(h = {}) {
   const s5 = String(h['anthropic-ratelimit-unified-5h-status'] || '').toLowerCase()
   const s7 = String(h['anthropic-ratelimit-unified-7d-status'] || '').toLowerCase()
@@ -1076,10 +1310,13 @@ function officialUtilToExtra(value) {
 }
 
 function officialLooksLimited(window = {}) {
+  const raw = window.utilization
+  const ratio = officialUtilToExtra(raw)
+  const percent = Number(raw) > 1.5
+  if (percent && ratio != null && ratio < 1) return false
   const s = String(window.status || '').toLowerCase()
   if (s === 'rejected' || s === 'rate_limited') return true
-  const n = Number(window.utilization)
-  return Number.isFinite(n) && n >= 1
+  return ratio != null && ratio >= 1
 }
 
 function officialLooksOpen(window = {}) {
@@ -1112,10 +1349,14 @@ function syncActiveToPassive(acc, sampledAt) {
   for (const key of ['5h', '7d']) {
     const src = acc.unified.official?.[key] || acc.unified[key]
     const extra = acc.unified.headers[key]
-    if (!shouldCopyOfficialToExtra(src, extra, now)) continue
+    const officialReset = src?.reset || src?.resets_at || null
+    if (!shouldCopyOfficialToExtra(src, extra, now)) {
+      if (officialReset && extra && !extra.reset) writeHeaderWindow(acc, key, { reset: officialReset })
+      continue
+    }
     writeHeaderWindow(acc, key, {
       utilization: officialUtilToExtra(src.utilization),
-      reset: src.reset || src.resets_at || extra?.reset || null,
+      reset: officialReset || extra?.reset || null,
       status: src.status || null,
     })
   }
@@ -1204,6 +1445,15 @@ function applyHeaderExhausted(acc, h = {}) {
   acc.unified.headers.exhausted_at = new Date().toISOString()
 }
 
+/** A reject without a fresh reset must not inherit last window's elapsed reset (wiped to 0 at once). */
+function dropElapsedReset(acc, key, incomingReset) {
+  if (incomingReset) return
+  const cur = acc.unified.headers?.[key]
+  if (!cur?.reset) return
+  const ms = parseResetMs(cur.reset)
+  if (Number.isFinite(ms) && ms <= Date.now()) acc.unified.headers[key] = { ...cur, reset: null }
+}
+
 function writeOfficialWindow(acc, key, incoming = {}) {
   const next = applyOfficialWindow(incoming)
   if (!next) return
@@ -1214,11 +1464,7 @@ function writeOfficialWindow(acc, key, incoming = {}) {
 }
 
 function officialOpen(window = {}) {
-  const u = Number(window.utilization)
-  const s = String(window.status || '').toLowerCase()
-  if (s === 'rejected' || s === 'rate_limited') return false
-  if (Number.isFinite(u) && u >= 1) return false
-  return true
+  return !officialLooksLimited(window)
 }
 
 function clearHeaderExhaustIfOfficialOpen(acc) {
@@ -1244,23 +1490,31 @@ function clearHeaderExhaustIfOfficialOpen(acc) {
 }
 
 function statusFromUtil(u) {
-  if (u >= 1) return 'rate_limited'
-  if (u >= 0.85) return 'warning'
+  const ratio = officialUtilToExtra(u) || 0
+  if (ratio >= 1) return 'rate_limited'
+  if (ratio >= 0.85) return 'warning'
   return 'active'
 }
 
 function windowIsFull(status, utilization) {
-  if (utilization != null && Number.isFinite(Number(utilization))) return Number(utilization) >= 1
+  const ratio = officialUtilToExtra(utilization)
+  const percent = Number(utilization) > 1.5
+  if (percent && ratio != null && ratio < 1) return false
+  if (ratio != null && ratio >= 1) return true
   const s = String(status || '').toLowerCase()
   return s === 'rejected' || s === 'rate_limited'
 }
 
 function statusFromProbeWindow(utilization, incomingStatus) {
-  if (utilization != null && Number.isFinite(Number(utilization))) {
-    if (Number(utilization) >= 1) return 'rejected'
+  const ratio = officialUtilToExtra(utilization)
+  const percent = Number(utilization) > 1.5
+  if (ratio != null) {
+    if (ratio >= 1) return 'rejected'
     const s = String(incomingStatus || '').toLowerCase()
     if (s === 'allowed' || s === 'allowed_warning' || s === 'active') return incomingStatus
-    return statusFromUtil(Number(utilization))
+    if (percent && (s === 'rejected' || s === 'rate_limited')) return 'allowed'
+    if (s === 'rejected' || s === 'rate_limited') return incomingStatus
+    return statusFromUtil(ratio)
   }
   return incomingStatus || null
 }
@@ -1270,11 +1524,12 @@ export function applyOfficialWindow(incoming = {}) {
   if (incoming.utilization == null && !incoming.status && !incoming.resets_at && !incoming.reset) {
     return null
   }
-  const utilization = incoming.utilization != null ? Number(incoming.utilization) || 0 : null
+  const raw = incoming.utilization != null ? Number(incoming.utilization) : null
+  const utilization = raw != null && Number.isFinite(raw) ? officialUtilToExtra(raw) : null
   return {
     utilization,
     reset: incoming.resets_at || incoming.reset || null,
-    status: statusFromProbeWindow(utilization, incoming.status) || 'allowed',
+    status: statusFromProbeWindow(raw, incoming.status) || 'allowed',
     ...(incoming.stale ? { stale: true, stale_reason: incoming.stale_reason || null } : {}),
   }
 }

@@ -4,8 +4,17 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { PoolScheduler, formatPoolSelectionSummary } from '../../src/lib/pool/pool-scheduler.mjs'
-import { SessionLimitRegistry } from '../../src/lib/pool/session-limit.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
+import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { PanelUserStore } from '../../src/lib/admin/panel-users.mjs'
+import { persistVmOwner } from '../../src/lib/vm/vm-registry.mjs'
+import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import {
+  applyCrsIdentityReplace,
+  rebuildOutboundSession,
+  resolveOutboundSessionId,
+} from '../../src/lib/identity/identity-rewrite.mjs'
 
 function project() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-pool-scheduler-'))
@@ -93,7 +102,7 @@ function scheduler(root, extras = {}) {
     runtimeRepo: extras.runtimeRepo || new RuntimeRepo(),
     stickyRouter: extras.stickyRouter || null,
     accountQuota: extras.accountQuota || { canAccept: () => ({ ok: true }) },
-    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
+    workerHealth: extras.workerHealth || (async () => ({ ok: true, credential: { generation: 1, has_access: true } })),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
 }
@@ -163,6 +172,26 @@ test('healthy sticky binding outranks weighted selection', async (t) => {
   selected.release()
 })
 
+test('an exhausted kernel is excluded even when the conversation is pinned to it', async (t) => {
+  const root = project()
+  kernelFaults.set('vm-02', 'container recovery exhausted')
+  t.after(() => {
+    kernelFaults.delete('vm-02')
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, {
+    stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-fault',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+})
+
 test('account and model cooldowns remove only affected candidates', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -191,22 +220,6 @@ test('account and model cooldowns remove only affected candidates', async (t) =>
   })
   assert.equal(selected.ok, true)
   selected.release()
-})
-
-test('weighted round robin distributes equal-load candidates', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = scheduler(root)
-  const counts = { 'account-1': 0, 'account-2': 0 }
-  for (let i = 0; i < 10; i++) {
-    const selected = await pool.selectAndReserve({
-      model: 'claude-test',
-      allowWait: false,
-    })
-    counts[selected.accountId]++
-    selected.release()
-  }
-  assert.deepEqual(counts, { 'account-1': 5, 'account-2': 5 })
 })
 
 test('adaptive reset level and manual level order ordinary candidates', async (t) => {
@@ -434,6 +447,14 @@ test('formatPoolSelectionSummary keeps a compact internal log line', () => {
     }),
     'all_accounts_busy soonest=10064s sticky_cleared',
   )
+  assert.equal(
+    formatPoolSelectionSummary({
+      reason: 'no_eligible_accounts',
+      soonest_available_ms: null,
+      eligible: 0,
+    }),
+    'no_eligible_accounts eligible=0',
+  )
 })
 
 test('fable family cooldown still allows sonnet on the same account', async (t) => {
@@ -656,14 +677,14 @@ test('unpinned slot follows live tier concurrency after reloadConfig', async (t)
   fs.writeFileSync(file, JSON.stringify(vm))
   const accountQuota = new AccountQuota({
     dataDir: path.join(root, 'data'),
-    config: { tiers: { max: { max_concurrency: 2, max_rpm: 0, max_sessions: 0 } } },
+    config: { tiers: { max: { max_concurrency: 2, max_rpm: 0 } } },
     accounts: [{ account_id: 'account-1', vm_id: 'vm-01', max_concurrency: 2 }],
   })
   accountQuota.setAccountTier('account-1', 'max')
   const pool = scheduler(root, { accountQuota })
   accountQuota.reloadConfig({
     quota: { block_on_5h: true, block_on_7d: true },
-    tiers: { max: { max_concurrency: 3, max_rpm: 0, max_sessions: 0 } },
+    tiers: { max: { max_concurrency: 3, max_rpm: 0 } },
   })
   const held = []
   for (let i = 0; i < 3; i++) {
@@ -854,7 +875,35 @@ test('sticky cooldown unbinds and rotates to a free account', async (t) => {
   selected.release()
 })
 
-test('sticky concurrency still waits on the bound account', async (t) => {
+test('sticky provider pause rotates instead of failing closed', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  const unbound = []
+  const pool = scheduler(root, {
+    runtimeRepo: repo,
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: (key) => unbound.push(key),
+    },
+  })
+  pool.markCooldown(
+    { accountId: 'account-1', vmId: 'vm-01' },
+    { until: Date.now() + 60 * 60 * 1000, reason: 'provider_pause' },
+  )
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-pause',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-2')
+  assert.notEqual(selected.selectionReason, 'sticky')
+  assert.deepEqual(unbound, ['conversation-pause'])
+  selected.release()
+})
+
+test('#A01: a busy sticky home lends the turn to a free seat and keeps the pin', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const file = path.join(root, 'vms', 'vm-01.json')
@@ -875,14 +924,18 @@ test('sticky concurrency still waits on the bound account', async (t) => {
   })
   assert.equal(first.ok, true)
   assert.equal(first.vmId, 'vm-01')
+  const started = Date.now()
   const second = await pool.selectAndReserve({
     model: 'claude-test',
     stickyKey: 'conversation-busy',
-    allowWait: false,
+    allowWait: true,
   })
-  assert.equal(second.ok, false)
-  assert.equal(second.reason, 'all_accounts_busy')
+  assert.equal(second.ok, true)
+  assert.equal(second.vmId, 'vm-02')
+  assert.equal(second.selectionReason, 'sticky-spill')
+  assert.ok(Date.now() - started < 50)
   assert.deepEqual(unbound, [])
+  second.release()
   first.release()
 })
 
@@ -925,7 +978,55 @@ test('sticky RPM still waits on the bound account', async (t) => {
   first.release()
 })
 
-test('dead sticky binding is unbound then WRR continues', async (t) => {
+test('sticky RPM borrows a free account without unbinding', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const unbound = []
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: (key) => unbound.push(key),
+    },
+    accountQuota: {
+      canAccept: (accountId) =>
+        accountId === 'account-1'
+          ? { ok: false, reason: 'rpm_limit', detail: { reset_at: Date.now() + 60_000 } }
+          : { ok: true },
+      tryAcquire: () => ({ ok: true }),
+    },
+  })
+  applyShortWaits(pool, { sticky: 30, fallback: 30 })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-opus-5',
+    stickyKey: 'conversation-rpm',
+    allowWait: true,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-2')
+  assert.equal(selected.selectionReason, 'sticky-spill')
+  assert.deepEqual(unbound, [])
+  selected.release()
+})
+
+test('opus is not scheduled onto an OpenAI slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-02.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.platform = 'openai'
+  vm.family = 'codex'
+  vm.codex_kernel = true
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const selected = await scheduler(root).selectAndReserve({
+    model: 'claude-opus-5',
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'no_eligible_accounts')
+})
+
+test('dead sticky binding is unbound then selection continues', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const unbound = []
@@ -977,21 +1078,31 @@ test('pinVmId skips quota tryAcquire and does not tight-loop', async (t) => {
   picked.release()
 })
 
-test('reserve miss excludes the account instead of spinning', async (t) => {
+test('reserve miss waits on the raced account before retrying', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let tries = 0
   const pool = scheduler(root, {
     accountQuota: {
       canAccept: () => ({ ok: true }),
-      tryAcquire: () => ({ ok: false, reason: 'quota_5h_safety' }),
+      tryAcquire: () => (++tries <= 2 ? { ok: false, reason: 'concurrency_limit' } : { ok: true }),
+      release: () => {},
     },
+    config: { fallback_wait_timeout_ms: 200 },
   })
-  const picked = await Promise.race([
-    pool.selectAndReserve({ model: 'claude-test', allowWait: false }),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('reserve-miss tight-loop')), 200)),
-  ])
-  assert.equal(picked.ok, false)
-  assert.equal(picked.reason, 'no_eligible_accounts')
+  const pending = pool.selectAndReserve({ model: 'claude-test' })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const waiting = pool.waiterSnapshot()
+  assert.equal(waiting.total, 1)
+  assert.equal(
+    Object.values(waiting).some((count) => count === 1),
+    true,
+  )
+  pool.notifyCapacity()
+  const picked = await pending
+  assert.equal(picked.ok, true)
+  assert.equal(tries, 3)
+  picked.release()
 })
 
 test('pinVmId can test a slot parked with leftover oauth_no_refresh', async (t) => {
@@ -1125,6 +1236,30 @@ test('fable skips pro and unknown, lands on max', async (t) => {
   selected.release()
 })
 
+test('fable skips a Max account recently denied that model', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const accountQuota = {
+    repo: {
+      get: (id) => ({
+        account_id: id,
+        unified: {
+          account_tier: 'max',
+          ...(id === 'account-1' ? { model_denied_until: { 'claude-fable-5': Date.now() + 60_000 } } : {}),
+        },
+      }),
+    },
+    canAccept: () => ({ ok: true }),
+  }
+  const selected = await scheduler(root, { accountQuota }).selectAndReserve({
+    model: 'claude-fable-5',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+})
+
 test('fable with only pro slots returns fable_requires_max', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -1184,68 +1319,56 @@ test('allowed_models prefix matches dated fable ids', async (t) => {
   selected.release()
 })
 
-test('reserve release keeps session occupancy until idle prune', async (t) => {
+function cleanupProject(root, pool) {
+  try {
+    for (const timer of pool?.cooldownTimers?.values?.() || []) clearTimeout(timer)
+    pool?.cooldownTimers?.clear?.()
+  } catch {}
+  try {
+    fs.rmSync(root, { recursive: true, force: true })
+  } catch {}
+}
+
+test('syncQuotaSchedule keeps Extra 5h exhausted schedulable and skips the slot', async (t) => {
   const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const sessions = new SessionLimitRegistry()
-  const pool = scheduler(root, {
-    accountQuota: {
-      canAccept: () => ({ ok: true }),
-      tryAcquire: () => ({ ok: true }),
-      sessions,
-    },
+  let pool
+  t.after(() => cleanupProject(root, pool))
+  const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
+  q.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
+  const reset = new Date(Date.now() + 4 * 3600_000).toISOString()
+  q.ingestHeaders('account-1', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': reset,
   })
-  const selected = await pool.selectAndReserve({
-    model: 'claude-test',
-    stickyKey: 'sess-1',
-    allowWait: false,
-    pinVmId: 'vm-01',
+  const repo = new RuntimeRepo()
+  pool = new PoolScheduler({
+    projectRoot: root,
+    accountQuota: q,
+    runtimeRepo: repo,
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
   })
-  assert.equal(selected.ok, true)
-  assert.equal(sessions.snapshot(selected.accountId, { max: 4 }).active, 1)
-  selected.release()
-  assert.equal(sessions.snapshot(selected.accountId, { max: 4 }).active, 1)
-  assert.equal(sessions.canAccept(selected.accountId, 'sess-1', { max: 1 }).ok, true)
-  assert.equal(sessions.canAccept(selected.accountId, 'sess-2', { max: 1 }).ok, false)
+  const vmPath = path.join(root, 'vms', 'vm-01.json')
+  const restricted = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
+  assert.equal(restricted.action, 'restrict')
+  assert.equal(restricted.reason, 'quota_5h_header')
+  const parked = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(parked.schedulable, true)
+  assert.equal(parked.schedule_disabled_reason ?? null, null)
+  assert.equal(parked.status, 'running')
+  assert.equal(parked.claude.temp_unschedulable_reason, 'quota_5h_header')
+  assert.ok(Number(parked.claude.temp_unschedulable_until) > Date.now())
+  const picked = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(picked.ok, true)
+  assert.equal(picked.accountId, 'account-2')
+  picked.release()
 })
 
-test('overlapping same session key stays occupied after both reservations release', async (t) => {
+test('syncQuotaSchedule auto-picks Extra 5h again after the window opens', async (t) => {
   const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const sessions = new SessionLimitRegistry()
-  const pool = scheduler(root, {
-    accountQuota: {
-      canAccept: () => ({ ok: true }),
-      tryAcquire: () => ({ ok: true }),
-      sessions,
-    },
-  })
-  const first = await pool.selectAndReserve({
-    model: 'claude-test',
-    stickyKey: 'shared',
-    allowWait: false,
-    pinVmId: 'vm-01',
-  })
-  const second = await pool.selectAndReserve({
-    model: 'claude-test',
-    stickyKey: 'shared',
-    allowWait: false,
-    pinVmId: 'vm-01',
-  })
-  assert.equal(first.ok, true)
-  assert.equal(second.ok, true)
-  assert.equal(sessions.snapshot('account-1', { max: 4 }).active, 1)
-  first.release()
-  assert.equal(sessions.snapshot('account-1', { max: 4 }).active, 1)
-  second.release()
-  assert.equal(sessions.snapshot('account-1', { max: 4 }).active, 1)
-  assert.equal(sessions.canAccept('account-1', 'shared', { max: 1 }).ok, true)
-  assert.equal(sessions.canAccept('account-1', 'other', { max: 1 }).ok, false)
-})
-
-test('syncQuotaSchedule turns Extra 5h reject into 调度关 and restores when open', (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let pool
+  t.after(() => cleanupProject(root, pool))
   const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
   q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   const reset = new Date(Date.now() + 4 * 3600_000).toISOString()
@@ -1254,36 +1377,76 @@ test('syncQuotaSchedule turns Extra 5h reject into 调度关 and restores when o
     'anthropic-ratelimit-unified-5h-status': 'rejected',
     'anthropic-ratelimit-unified-5h-reset': reset,
   })
-  const pool = new PoolScheduler({
+  pool = new PoolScheduler({
     projectRoot: root,
     accountQuota: q,
     runtimeRepo: new RuntimeRepo(),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
   })
   const vmPath = path.join(root, 'vms', 'vm-01.json')
-  const off = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
-  assert.equal(off.action, 'disable')
-  assert.equal(off.reason, 'quota_5h_header')
-  const paused = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-  assert.equal(paused.schedulable, false)
-  assert.equal(paused.schedule_disabled_reason, 'quota_5h_header')
-  assert.equal(paused.status, 'running')
-
+  pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
   q.ingestHeaders('account-1', {
     'anthropic-ratelimit-unified-5h-utilization': '0.2',
     'anthropic-ratelimit-unified-5h-status': 'allowed',
     'anthropic-ratelimit-unified-5h-reset': reset,
   })
   const on = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
-  assert.equal(on.action, 'enable')
+  assert.equal(on.action, 'clear')
   const restored = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   assert.equal(restored.schedulable, true)
-  assert.equal(restored.schedule_disabled_reason, null)
+  assert.equal(restored.schedule_disabled_reason ?? null, null)
+  assert.equal(restored.claude.temp_unschedulable_until, undefined)
+  const other = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-02.json'), 'utf8'))
+  other.schedulable = false
+  other.schedule_manual = true
+  other.schedule_disabled_reason = 'disabled'
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify(other))
+  const picked = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(picked.ok, true)
+  assert.equal(picked.accountId, 'account-1')
+  picked.release()
 })
 
-test('syncQuotaSchedule still 调度关 when leftover schedule_manual is set', (t) => {
+test('syncQuotaSchedule does not turn a manual-off slot back on', async (t) => {
   const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let pool
+  t.after(() => cleanupProject(root, pool))
+  const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
+  q.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
+  q.ingestHeaders('account-1', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() + 4 * 3600_000).toISOString(),
+  })
+  const vmPath = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  vm.schedulable = false
+  vm.schedule_manual = true
+  vm.schedule_disabled_reason = 'disabled'
+  fs.writeFileSync(vmPath, JSON.stringify(vm))
+  pool = new PoolScheduler({
+    projectRoot: root,
+    accountQuota: q,
+    runtimeRepo: new RuntimeRepo(),
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
+  })
+  const out = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
+  assert.ok(out.action === 'restrict' || out.action === 'keep')
+  const after = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(after.schedulable, false)
+  assert.equal(after.schedule_disabled_reason, 'disabled')
+  assert.equal(after.schedule_manual, true)
+  const picked = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(picked.ok, true)
+  assert.equal(picked.accountId, 'account-2')
+  picked.release()
+})
+
+test('leftover quota 调度关 is restored to restricted without flipping the operator off', (t) => {
+  const root = project()
+  let pool
+  t.after(() => cleanupProject(root, pool))
   const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
   q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   q.ingestHeaders('account-1', {
@@ -1293,15 +1456,16 @@ test('syncQuotaSchedule still 调度关 when leftover schedule_manual is set', (
   })
   const vmPath = path.join(root, 'vms', 'vm-01.json')
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-  vm.schedule_manual = true
+  vm.schedulable = false
+  vm.schedule_disabled_reason = 'quota_5h_header'
   fs.writeFileSync(vmPath, JSON.stringify(vm))
-  const pool = new PoolScheduler({ projectRoot: root, accountQuota: q, runtimeRepo: new RuntimeRepo() })
+  pool = new PoolScheduler({ projectRoot: root, accountQuota: q, runtimeRepo: new RuntimeRepo() })
   const out = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
-  assert.equal(out.action, 'disable')
+  assert.equal(out.action, 'restore')
   const after = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-  assert.equal(after.schedulable, false)
-  assert.equal(after.schedule_disabled_reason, 'quota_5h_header')
-  assert.equal(after.schedule_manual, true)
+  assert.equal(after.schedulable, true)
+  assert.equal(after.schedule_disabled_reason ?? null, null)
+  assert.equal(after.claude.temp_unschedulable_reason, 'quota_5h_header')
 })
 
 test('peekAccount keeps sticky without bind unbind or inflight', async (t) => {
@@ -1371,4 +1535,1283 @@ test('platform scope skips tenant-owned VMs', async (t) => {
     pinVmId: 'vm-01',
   })
   assert.equal(miss.ok, false)
+})
+
+test('deleting a tenant makes its assigned spare selectable while the primary quota is exhausted', async (t) => {
+  const root = project()
+  const quota = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  let pool
+  t.after(() => {
+    quota.db.close()
+    cleanupProject(root, pool)
+  })
+  const users = new PanelUserStore({ db: quota.db, projectRoot: root })
+  const user = users.create({ username: 'tenant', password: 'tenant-pass' })
+  persistVmOwner(root, 'vm-02', { ownerUserId: user.id, origin: 'admin_assigned' })
+  quota.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
+  quota.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
+  quota.ingestHeaders('account-1', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() + 3600_000).toISOString(),
+  })
+  pool = scheduler(root, { accountQuota: quota })
+  const exhausted = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(exhausted.ok, false)
+
+  assert.equal(users.remove(user.id), true)
+  const recovered = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(recovered.ok, true)
+  assert.equal(recovered.vmId, 'vm-02')
+  assert.equal(recovered.accountId, 'account-2')
+  recovered.release()
+})
+
+function busyKernelHealth() {
+  return { ok: true, ready_slots: 0, cli_pid: 9, credential: { generation: 1, has_access: true } }
+}
+
+function applyShortWaits(pool, { sticky = 200, fallback = 20 } = {}) {
+  pool.config.sticky_wait_timeout_ms = sticky
+  pool.config.fallback_wait_timeout_ms = fallback
+}
+
+test('slot-full kernel with live CLI is waitable, not worker_unhealthy', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  const pool = scheduler(root, {
+    runtimeRepo: repo,
+    workerHealth: async () => busyKernelHealth(),
+  })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.waitReason, 'slot_busy')
+  assert.notEqual(repo.get(selected.accountId)?.status, 'worker_unhealthy')
+  assert.equal(repo.get(selected.accountId)?.status, 'busy')
+  selected.release()
+})
+
+test('kernel without cli_pid and no ready slot is skipped as unhealthy', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root, {
+    workerHealth: async (exec) => {
+      if (exec.vmId === 'vm-01') {
+        return { ok: true, engine: 'rust', ready_slots: 0, credential: { generation: 1, has_access: true } }
+      }
+      return { ok: true, ready_slots: 2, cli_pid: 8, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+})
+
+test('sticky wait uses sticky timeout; fallback wait uses fallback timeout', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.maxConcurrency = 1
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: () => {},
+    },
+  })
+  applyShortWaits(pool, { sticky: 200, fallback: 20 })
+  const first = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-wait',
+    allowWait: false,
+  })
+  assert.equal(first.ok, true)
+  const stickyStarted = Date.now()
+  const stickyBusy = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-wait',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+  })
+  const stickyElapsed = Date.now() - stickyStarted
+  assert.equal(stickyBusy.ok, false)
+  assert.equal(stickyBusy.reason, 'all_accounts_busy')
+  assert.ok(stickyElapsed >= 160, `sticky waited ${stickyElapsed}ms`)
+  assert.ok(stickyElapsed < 350, `sticky waited ${stickyElapsed}ms`)
+  first.release()
+
+  const holdA = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(holdA.ok, true)
+  const fallbackStarted = Date.now()
+  const fallbackBusy = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+  })
+  const fallbackElapsed = Date.now() - fallbackStarted
+  assert.equal(fallbackBusy.ok, false)
+  assert.ok(fallbackElapsed >= 10, `fallback waited ${fallbackElapsed}ms`)
+  assert.ok(fallbackElapsed < 80, `fallback waited ${fallbackElapsed}ms`)
+  holdA.release()
+})
+
+test('failover deadline clips sticky wait instead of waiting the full plan', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.maxConcurrency = 1
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: () => {},
+    },
+  })
+  applyShortWaits(pool, { sticky: 200, fallback: 20 })
+  const first = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-deadline',
+    allowWait: false,
+  })
+  const started = Date.now()
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-deadline',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+    deadline: Date.now() + 50,
+  })
+  const elapsed = Date.now() - started
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'all_accounts_busy')
+  assert.ok(elapsed < 140, `deadline wait lasted ${elapsed}ms`)
+  first.release()
+})
+
+test('a full pool queue still lets a free account be selected without waiting', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.maxConcurrency = 1
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root)
+  applyShortWaits(pool, { sticky: 400, fallback: 400 })
+  pool.config.queue_max = 1
+  const first = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(first.ok, true)
+  const waiting = pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(pool.snapshot().waiters['account-1'], 1)
+  assert.equal(pool.snapshot().waiters.total, 1)
+  const other = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(other.ok, true)
+  assert.equal(other.accountId, 'account-2')
+  other.release()
+  first.release()
+  const waited = await waiting
+  assert.equal(waited.ok, true)
+  waited.release()
+})
+
+test('rpm window expiry rechecks instead of failing the waiter', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const resetAt = Date.now() + 40
+  const pool = scheduler(root, {
+    accountQuota: {
+      canAccept: () => {
+        if (Date.now() < resetAt) return { ok: false, reason: 'rpm_limit', detail: { reset_at: resetAt } }
+        return { ok: true }
+      },
+      tryAcquire: () => ({ ok: true }),
+    },
+  })
+  applyShortWaits(pool, { sticky: 400, fallback: 400 })
+  const started = Date.now()
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-1')
+  assert.ok(Date.now() - started >= 30)
+  selected.release()
+})
+
+test('idle candidate is reserved before waiting when another account releases', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const id of ['vm-01', 'vm-02']) {
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    vm.policy.maxConcurrency = 1
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const pool = scheduler(root)
+  applyShortWaits(pool, { sticky: 400, fallback: 400 })
+  const first = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  const second = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, true)
+  assert.notEqual(first.accountId, second.accountId)
+  const pending = pool.selectAndReserve({ model: 'claude-test', allowWait: true })
+  setTimeout(() => second.release(), 30)
+  const third = await pending
+  assert.equal(third.ok, true)
+  assert.equal(third.accountId, second.accountId)
+  third.release()
+  first.release()
+})
+
+test('account concurrency is not clamped to ready_slots', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.maxConcurrency = 4
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, {
+    workerHealth: async () => busyKernelHealth(),
+  })
+  const held = []
+  for (let i = 0; i < 4; i++) {
+    const selected = await pool.selectAndReserve({
+      model: 'claude-test',
+      excluded: new Set(['account-2']),
+      allowWait: false,
+    })
+    assert.equal(selected.ok, true, `reserve ${i}`)
+    assert.equal(selected.waitReason, 'slot_busy')
+    held.push(selected)
+  }
+  const fifth = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(fifth.ok, false)
+  assert.equal(fifth.reason, 'all_accounts_busy')
+  for (const item of held) item.release()
+})
+
+test('skipSessionSlot probe still obeys concurrency quota cooldown and hard block gates', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vmFile = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  vm.policy.maxConcurrency = 1
+  vm.policy.sessionSlots = 1
+  fs.writeFileSync(vmFile, JSON.stringify(vm))
+
+  const pool = scheduler(root)
+  const held = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+    skipSessionSlot: true,
+  })
+  assert.equal(held.ok, true)
+  const concurrency = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+    skipSessionSlot: true,
+  })
+  assert.equal(concurrency.ok, false)
+  assert.ok((concurrency.wait_reasons || []).includes('concurrency_limit'))
+  held.release()
+
+  const quotaPool = scheduler(root, {
+    accountQuota: {
+      canAccept: () => ({ ok: false, reason: 'rpm_limit', detail: { reset_at: Date.now() + 60_000 } }),
+      tryAcquire: () => ({ ok: true }),
+    },
+  })
+  const quota = await quotaPool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+    skipSessionSlot: true,
+  })
+  assert.equal(quota.ok, false)
+  assert.ok((quota.wait_reasons || []).includes('rpm_limit'))
+
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', cooldown_until: Date.now() + 60_000 })
+  const cooldownPool = scheduler(root, { runtimeRepo })
+  const cooldown = await cooldownPool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+    skipSessionSlot: true,
+  })
+  assert.equal(cooldown.ok, false)
+  assert.ok((cooldown.wait_reasons || []).includes('account_cooldown'))
+
+  const hardRepo = new RuntimeRepo()
+  hardRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', rate_limit_reset_at: Date.now() + 60_000 })
+  const hardPool = scheduler(root, { runtimeRepo: hardRepo })
+  const hard = await hardPool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+    skipSessionSlot: true,
+  })
+  assert.equal(hard.ok, false)
+  assert.equal(hard.reason, 'pool_rate_limited')
+  assert.ok(hard.retry_after_ms > 50_000 && hard.retry_after_ms <= 60_000)
+
+  const overloadRepo = new RuntimeRepo()
+  overloadRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', overload_until: Date.now() + 30_000 })
+  overloadRepo.upsert({ account_id: 'account-2', vm_id: 'vm-02', rate_limit_reset_at: Date.now() + 60_000 })
+  const overloaded = await scheduler(root, { runtimeRepo: overloadRepo }).selectAndReserve({
+    model: 'claude-test',
+    allowWait: false,
+    skipSessionSlot: true,
+  })
+  assert.equal(overloaded.reason, 'pool_overload_cooldown')
+  assert.ok(overloaded.retry_after_ms > 20_000 && overloaded.retry_after_ms <= 30_000)
+})
+
+test('exact sticky session outranks device VM affinity', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: (key) => (key === 'sess-bound' ? { vmId: 'vm-02', accountId: 'account-2' } : null),
+    },
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess-bound',
+    deviceVmId: 'vm-01',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  assert.equal(selected.selectionReason, 'sticky')
+  selected.release()
+})
+
+test('device VM affinity places new sessions on one VM', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.sessionSlots = 2
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, { accountQuota: { canAccept: () => ({ ok: true }) } })
+
+  const first = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'device-sess-a',
+    deviceVmId: 'vm-01',
+    allowWait: false,
+  })
+  const second = await pool.selectAndReserve({
+    model: 'claude-sonnet-test',
+    stickyKey: 'device-sess-b',
+    deviceVmId: 'vm-01',
+    allowWait: false,
+  })
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, true)
+  assert.equal(first.vmId, 'vm-01')
+  assert.equal(second.vmId, 'vm-01')
+  assert.equal(first.selectionReason, 'device-affinity')
+  assert.equal(second.selectionReason, 'device-affinity')
+  first.release()
+  second.release()
+})
+
+test('device VM affinity falls back when preferred VM is not eligible', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'device-ineligible-session',
+    deviceVmId: 'vm-01',
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  assert.notEqual(selected.selectionReason, 'device-affinity')
+  selected.release()
+})
+
+test('parallel sessions spread to the less loaded VM', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root, { accountQuota: { canAccept: () => ({ ok: true }) } })
+  const first = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conv-a', allowWait: false })
+  const second = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conv-b', allowWait: false })
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, true)
+  assert.notEqual(first.accountId, second.accountId)
+  first.release()
+  second.release()
+})
+
+test('sticky slot_busy stays on the bound account', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const unbound = []
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: (key) => unbound.push(key),
+    },
+    workerHealth: async (exec) => {
+      if (exec.vmId === 'vm-01') return busyKernelHealth()
+      return { ok: true, ready_slots: 2, cli_pid: 8, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-slot',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-1')
+  assert.equal(selected.selectionReason, 'sticky')
+  assert.equal(selected.waitReason, 'slot_busy')
+  assert.deepEqual(unbound, [])
+  selected.release()
+})
+
+test('#A02: a sticky reserve miss takes the free seat elsewhere and keeps the pin', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const unbound = []
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: (key) => unbound.push(key),
+    },
+  })
+  const real = pool.reserve.bind(pool)
+  const tried = []
+  pool.reserve = (candidate, opts) => {
+    tried.push(candidate.accountId)
+    // The racing request that won account-1's last seat.
+    if (candidate.accountId === 'account-1') return null
+    return real(candidate, opts)
+  }
+  const started = Date.now()
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conversation-one',
+    deadline: Date.now() + 5000,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-2')
+  assert.deepEqual(tried, ['account-1', 'account-2'])
+  assert.ok(Date.now() - started < 100)
+  assert.deepEqual(unbound, [])
+  selected.release()
+})
+
+test('#A08: a refused reservation hands back exactly what it took; release is idempotent', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let refuse = false
+  let quotaInflight = 0
+  const pool = scheduler(root, {
+    accountQuota: {
+      canAccept: () => ({ ok: true }),
+      tryAcquire: () => {
+        if (refuse) return { ok: false, reason: 'quota_5h_safety' }
+        quotaInflight += 1
+        return { ok: true }
+      },
+      release: () => {
+        quotaInflight -= 1
+      },
+    },
+  })
+  const [candidate] = await pool.eligibleCandidates({ model: 'claude-test', excluded: new Set(['account-2']) })
+  const first = pool.reserve(candidate)
+  first.release()
+  refuse = true
+  assert.equal(pool.reserve(candidate), null)
+  assert.equal(pool.inflight.get('account-1') || 0, 0)
+  assert.equal(quotaInflight, 0)
+  refuse = false
+  const again = pool.reserve(candidate)
+  assert.ok(again)
+  again.release()
+  again.release()
+  assert.equal(pool.inflight.get('account-1') || 0, 0)
+  assert.equal(quotaInflight, 0)
+})
+
+test('#A15: a hard account exit moves every pinned conversation but not live leases', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const held = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:old',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  sticky.bind('sess:old', { accountId: held.accountId, vmId: held.vmId })
+  sticky.bind('sess:other', { accountId: held.accountId, vmId: held.vmId })
+  pool.releaseAccountSessions({ accountId: held.accountId, vmId: held.vmId })
+  assert.equal(sticky.resolve('sess:old'), null)
+  assert.equal(sticky.resolve('sess:other'), null)
+  assert.equal(pool.inflight.get(held.accountId), 1)
+  held.release()
+  assert.equal(pool.inflight.get(held.accountId) || 0, 0)
+  const moved = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'sess:old', allowWait: false })
+  assert.equal(moved.ok, true)
+  moved.release()
+})
+
+test('live rate_limit_reset_at gates the account and unbinds its sticky session', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', rate_limit_reset_at: Date.now() + 3_600_000 })
+  const unbound = []
+  const stickyRouter = {
+    resolve: () => ({ accountId: 'account-1', vmId: 'vm-01' }),
+    unbind: (key) => unbound.push(key),
+  }
+  const pool = scheduler(root, { runtimeRepo, stickyRouter })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conv-1', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  assert.deepEqual(unbound, ['conv-1'])
+  selected.release()
+})
+
+test('hard block releases every sticky alias', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', rate_limit_reset_at: Date.now() + 3_600_000 })
+  const unbound = []
+  const pool = scheduler(root, {
+    runtimeRepo,
+    stickyRouter: {
+      resolve: () => ({ accountId: 'account-1', vmId: 'vm-01' }),
+      unbind: (key) => unbound.push(key),
+    },
+    accountQuota: { canAccept: () => ({ ok: true }) },
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'conv-1',
+    stickyKeys: ['conv-1', 'fam:dev-9'],
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  assert.deepEqual(unbound, ['conv-1', 'fam:dev-9'])
+  selected.release()
+})
+
+test('overload_until gates the account until it passes', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({ account_id: 'account-2', vm_id: 'vm-02', overload_until: Date.now() + 600_000 })
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', overload_until: Date.now() - 1 })
+  const pool = scheduler(root, { runtimeRepo })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', excluded: new Set(), allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+})
+
+test('passive quota sync never clears a live 429 block', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const runtimeRepo = new RuntimeRepo()
+  const until = Date.now() + 3_600_000
+  runtimeRepo.upsert({
+    account_id: 'account-1',
+    vm_id: 'vm-01',
+    cooldown_until: until,
+    cooldown_reason: 'account_quota_exhausted',
+    rate_limit_reset_at: until,
+  })
+  const pool = scheduler(root, { runtimeRepo })
+  const vm = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-01.json'), 'utf8'))
+  const cleared = pool.clearQuotaRestriction(vm, 'account-1', path.join(root, 'vms', 'vm-01.json'))
+  assert.equal(cleared, false)
+  assert.equal(runtimeRepo.get('account-1').cooldown_until, until)
+  assert.equal(runtimeRepo.get('account-1').rate_limit_reset_at, until)
+})
+
+test('pinVmId still reaches a slot whose unit circuit is open', async (t) => {
+  const root = project()
+  const { unitCircuit } = await import('../../src/lib/pool/unit-circuit.mjs')
+  t.after(() => {
+    unitCircuit.reset('account-2')
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root)
+  for (let i = 0; i < 5; i++) unitCircuit.recordFailure('account-2')
+  const open = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(open.vmId, 'vm-01')
+  open.release()
+  const pinned = await pool.selectAndReserve({ model: 'claude-test', pinVmId: 'vm-02', allowWait: false })
+  assert.equal(pinned.ok, true)
+  assert.equal(pinned.vmId, 'vm-02')
+  pinned.release()
+  assert.equal(unitCircuit.snapshot('account-2').state, 'open')
+})
+
+function verifiedHop(text) {
+  return {
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    body: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      stop_reason: 'end_turn',
+    },
+  }
+}
+
+test('family without pin schedules parent and child on one VM', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4 },
+  })
+  const req = { apiKeyRecord: { id: 'key-a' }, headers: {} }
+  const parentBody = { metadata: { user_id: { device_id: 'dev-1', session_id: 'parent-sess' } } }
+  const childBody = {
+    metadata: {
+      user_id: JSON.stringify({
+        device_id: 'dev-1',
+        session_id: 'child-sess',
+        parent_session_id: 'parent-sess',
+        root_session_id: 'parent-sess',
+      }),
+    },
+  }
+  const parentKey = sticky.extractPoolKey(req, parentBody, { platform: 'anthropic' })
+  const childKey = sticky.extractPoolKey(req, childBody, { platform: 'anthropic' })
+  const familyKey = sticky.familyKey(req, 'parent-sess', 'anthropic')
+  assert.notEqual(parentKey, childKey)
+  const parent = await runner.run({
+    requestId: 'parent-hop',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    callAttempt: () => verifiedHop('parent'),
+  })
+  const family = sticky.resolve(familyKey)
+  assert.equal(parent.ok, true)
+  assert.ok(family.vmId)
+  assert.equal(family.sessionId, null)
+  const child = await runner.run({
+    requestId: 'child-hop',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: childKey,
+    familyKey,
+    familyVmId: family.vmId,
+    callAttempt: () => verifiedHop('child'),
+  })
+  assert.equal(child.ok, true)
+  assert.equal(child.vmId, family.vmId)
+  const parentHold = await pool.selectAndReserve({
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyVmId: family.vmId,
+    allowWait: false,
+  })
+  const childHold = await pool.selectAndReserve({
+    model: 'claude-sonnet-test',
+    stickyKey: childKey,
+    familyVmId: family.vmId,
+    allowWait: false,
+  })
+  assert.equal(parentHold.ok, true)
+  assert.equal(childHold.ok, true)
+  assert.equal(parentHold.vmId, family.vmId)
+  assert.equal(childHold.vmId, family.vmId)
+  parentHold.release()
+  childHold.release()
+  const otherVm = parent.vmId === 'vm-01' ? 'vm-02' : 'vm-01'
+  const spilled = await pool.selectAndReserve({
+    model: 'claude-haiku-test',
+    stickyKey: 'sibling-sess',
+    familyVmId: family.vmId,
+    allowWait: false,
+  })
+  assert.equal(spilled.ok, true)
+  assert.equal(spilled.vmId, family.vmId)
+  assert.notEqual(spilled.vmId, otherVm)
+  spilled.release()
+  const moved = sticky.rebindFamily(familyKey, {
+    accountId: sticky.resolve(familyKey).accountId === 'account-1' ? 'account-2' : 'account-1',
+    vmId: otherVm,
+  })
+  assert.ok(moved.generation > family.generation)
+  const after = await pool.selectAndReserve({
+    model: 'claude-sonnet-test',
+    stickyKey: childKey,
+    familyVmId: moved.vmId,
+    allowWait: false,
+  })
+  assert.equal(after.ok, true)
+  assert.equal(after.vmId, otherVm)
+  after.release()
+})
+
+test('family whose VM is gated moves as a whole and releases its sticky pins', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const runtimeRepo = new RuntimeRepo()
+  const pool = scheduler(root, { runtimeRepo, stickyRouter: sticky })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4 },
+  })
+  const parentKey = sticky.canonicalSessionKey('parent-sess')
+  const childKey = sticky.canonicalSessionKey('child-sess')
+  const familyKey = sticky.canonicalFamilyKey('parent-sess')
+  const first = await runner.run({
+    requestId: 'parent-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    callAttempt: () => verifiedHop('one'),
+  })
+  assert.equal(first.ok, true)
+  const home = sticky.resolve(familyKey)
+  assert.equal(home.vmId, first.vmId)
+  // The home VM hits its 5h window: gated for the next hour.
+  runtimeRepo.upsert({ account_id: home.accountId, vm_id: home.vmId, rate_limit_reset_at: Date.now() + 3_600_000 })
+  const again = await runner.run({
+    requestId: 'parent-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    familyVmId: home.vmId,
+    callAttempt: () => verifiedHop('two'),
+  })
+  assert.equal(again.ok, true)
+  assert.notEqual(again.vmId, home.vmId)
+  assert.equal(sticky.resolve(familyKey).vmId, again.vmId)
+  assert.equal(sticky.resolve(parentKey).vmId, again.vmId)
+  const child = await runner.run({
+    requestId: 'child-1',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: childKey,
+    familyKey,
+    familyVmId: sticky.resolve(familyKey).vmId,
+    callAttempt: () => verifiedHop('child'),
+  })
+  assert.equal(child.ok, true)
+  assert.equal(child.vmId, again.vmId)
+})
+
+test('family VM left only for kernel slot_busy keeps the family pin', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4, max_same_account_retries: 0 },
+  })
+  const parentKey = sticky.canonicalSessionKey('parent-sess')
+  const familyKey = sticky.canonicalFamilyKey('parent-sess')
+  const first = await runner.run({
+    requestId: 'p1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    callAttempt: () => verifiedHop('one'),
+  })
+  const home = sticky.resolve(familyKey)
+  const busy = await runner.run({
+    requestId: 'p2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    familyVmId: home.vmId,
+    callAttempt: () => ({
+      ok: false,
+      status: 503,
+      terminalState: 'rejected',
+      body: {
+        type: 'error',
+        error: { type: 'worker_error', code: 'slot_busy', message: 'rust kernel has no free slot' },
+      },
+    }),
+  })
+  assert.equal(first.ok, true)
+  assert.equal(busy.ok, false)
+  assert.equal(sticky.resolve(familyKey).vmId, home.vmId)
+})
+
+function applyRebuildAttempt(callerSession, extra = {}) {
+  return async (_body, selected, attemptExtra = {}) => {
+    const stickyBound = attemptExtra.freshSlot ? null : attemptExtra.stickyBound
+    const sessionId = resolveOutboundSessionId(callerSession, {
+      mode: 'rebuild',
+      officialClient: true,
+      boundSessionId: stickyBound?.sessionId || '',
+      boundVmId: stickyBound?.vmId || '',
+      vmId: selected.vmId,
+      epoch: extra.epoch ?? attemptExtra.attemptStartedAt ?? Date.now(),
+    })
+    extra.seen?.push({ vmId: selected.vmId, sessionId })
+    const identity = { deviceId: 'dev', accountUuid: 'acc', vmId: selected.vmId }
+    const inbound = { metadata: { user_id: { session_id: callerSession } } }
+    const out = applyCrsIdentityReplace(inbound, identity, inbound, {}, { officialClient: true, sessionId })
+    const uid = JSON.parse(out.metadata.user_id)
+    extra.headers?.push({
+      'x-claude-code-session-id': uid.session_id,
+      metadata_session_id: uid.session_id,
+    })
+    return { body: out, meta: { sessionId } }
+  }
+}
+
+test('rebuild outbound session stays on one VM and changes after failover', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4, max_same_account_retries: 0 },
+  })
+  const caller = 'inbound-A'
+  const stickyKey = sticky.canonicalSessionKey(caller)
+  const seen = []
+  const headers = []
+  const first = await runner.run({
+    requestId: 'rebuild-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    applyAttempt: applyRebuildAttempt(caller, { seen, headers, epoch: 1000 }),
+    callAttempt: () => verifiedHop('one'),
+  })
+  assert.equal(first.ok, true)
+  assert.equal(seen.length, 1)
+  assert.notEqual(seen[0].sessionId, caller)
+  assert.equal(seen[0].sessionId, rebuildOutboundSession({ identity: caller, epoch: 1000 }))
+  assert.equal(sticky.resolve(stickyKey).sessionId, seen[0].sessionId)
+  assert.equal(headers[0]['x-claude-code-session-id'], headers[0].metadata_session_id)
+  assert.equal(headers[0]['x-claude-code-session-id'], seen[0].sessionId)
+
+  const secondSeen = []
+  const second = await runner.run({
+    requestId: 'rebuild-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    applyAttempt: applyRebuildAttempt(caller, { seen: secondSeen, epoch: 2000 }),
+    callAttempt: () => verifiedHop('two'),
+  })
+  assert.equal(second.ok, true)
+  assert.equal(second.vmId, first.vmId)
+  assert.equal(secondSeen[0].sessionId, seen[0].sessionId)
+  assert.equal(sticky.resolve(stickyKey).sessionId, seen[0].sessionId)
+})
+
+test('family migration remints parent and child outbound sessions', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4 },
+  })
+  const parentKey = sticky.canonicalSessionKey('parent-A')
+  const childKey = sticky.canonicalSessionKey('child-A')
+  const familyKey = sticky.canonicalFamilyKey('parent-A')
+  const parentSeen = []
+  const parent = await runner.run({
+    requestId: 'fam-parent-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    applyAttempt: applyRebuildAttempt('parent-A', { seen: parentSeen, epoch: 11 }),
+    callAttempt: () => verifiedHop('parent'),
+  })
+  const childSeen = []
+  const child = await runner.run({
+    requestId: 'fam-child-1',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: childKey,
+    familyKey,
+    familyVmId: sticky.resolve(familyKey).vmId,
+    applyAttempt: applyRebuildAttempt('child-A', { seen: childSeen, epoch: 12 }),
+    callAttempt: () => verifiedHop('child'),
+  })
+  assert.equal(parent.ok, true)
+  assert.equal(child.ok, true)
+  assert.equal(child.vmId, parent.vmId)
+  const parentS1 = parentSeen[0].sessionId
+  const childS1 = childSeen[0].sessionId
+  assert.notEqual(parentS1, 'parent-A')
+  assert.notEqual(childS1, 'child-A')
+
+  const otherVm = parent.vmId === 'vm-01' ? 'vm-02' : 'vm-01'
+  const otherAccount = parent.accountId === 'account-1' ? 'account-2' : 'account-1'
+  sticky.rebindFamily(familyKey, { accountId: otherAccount, vmId: otherVm })
+
+  const parentAfter = []
+  const childAfter = []
+  const parent2 = await runner.run({
+    requestId: 'fam-parent-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: parentKey,
+    familyKey,
+    familyVmId: otherVm,
+    applyAttempt: applyRebuildAttempt('parent-A', { seen: parentAfter, epoch: 21 }),
+    callAttempt: () => verifiedHop('parent-2'),
+  })
+  const child2 = await runner.run({
+    requestId: 'fam-child-2',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: childKey,
+    familyKey,
+    familyVmId: otherVm,
+    applyAttempt: applyRebuildAttempt('child-A', { seen: childAfter, epoch: 22 }),
+    callAttempt: () => verifiedHop('child-2'),
+  })
+  assert.equal(parent2.ok, true)
+  assert.equal(child2.ok, true)
+  assert.equal(parent2.vmId, otherVm)
+  assert.equal(child2.vmId, otherVm)
+  assert.notEqual(parentAfter[0].sessionId, parentS1)
+  assert.notEqual(childAfter[0].sessionId, childS1)
+  assert.equal(sticky.resolve(parentKey).sessionId, parentAfter[0].sessionId)
+  assert.equal(sticky.resolve(childKey).sessionId, childAfter[0].sessionId)
+})
+
+test('intra-request failover remints and persists the second outbound session', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4, max_same_account_retries: 0 },
+  })
+  const caller = 'fail-A'
+  const stickyKey = sticky.canonicalSessionKey(caller)
+  const seen = []
+  let attempts = 0
+  const result = await runner.run({
+    requestId: 'rebuild-fail',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    applyAttempt: async (body, selected, attemptExtra) =>
+      applyRebuildAttempt(caller, { seen, epoch: attemptExtra.attemptNo })(body, selected, attemptExtra),
+    callAttempt: () => {
+      attempts += 1
+      if (attempts === 1) {
+        return {
+          ok: false,
+          status: 429,
+          terminalState: 'rejected',
+          body: { type: 'error', error: { type: 'rate_limit_error', message: 'rate limited' } },
+        }
+      }
+      return verifiedHop('ok')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(seen.length, 2)
+  assert.notEqual(seen[0].vmId, seen[1].vmId)
+  assert.notEqual(seen[0].sessionId, seen[1].sessionId)
+  assert.notEqual(seen[1].sessionId, caller)
+  assert.equal(sticky.resolve(stickyKey).vmId, seen[1].vmId)
+  assert.equal(sticky.resolve(stickyKey).sessionId, seen[1].sessionId)
+})
+
+test('returning to a previously used VM mints a new outbound session', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }) } })
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4 },
+  })
+  const caller = 'return-A'
+  const stickyKey = sticky.canonicalSessionKey(caller)
+  const firstSeen = []
+  const first = await runner.run({
+    requestId: 'return-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    applyAttempt: applyRebuildAttempt(caller, { seen: firstSeen, epoch: 1 }),
+    callAttempt: () => verifiedHop('one'),
+  })
+  const firstVm = first.vmId
+  const firstS = firstSeen[0].sessionId
+  const otherVm = firstVm === 'vm-01' ? 'vm-02' : 'vm-01'
+  const otherAccount = first.accountId === 'account-1' ? 'account-2' : 'account-1'
+  sticky.unbind(stickyKey)
+  sticky.bind(stickyKey, { accountId: otherAccount, vmId: otherVm, sessionId: 'S-other' })
+
+  const backSeen = []
+  sticky.unbind(stickyKey)
+  const back = await runner.run({
+    requestId: 'return-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    pinVmId: firstVm,
+    applyAttempt: applyRebuildAttempt(caller, { seen: backSeen, epoch: 3 }),
+    callAttempt: () => verifiedHop('back'),
+  })
+  assert.equal(back.ok, true)
+  assert.equal(back.vmId, firstVm)
+  assert.notEqual(backSeen[0].sessionId, firstS)
+  assert.notEqual(backSeen[0].sessionId, 'S-other')
+  assert.equal(sticky.resolve(stickyKey).sessionId, backSeen[0].sessionId)
+})
+
+test('a key scope only reserves the checked VMs', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const selected = await pool.selectAndReserve({
+    model: 'claude-haiku-4-5',
+    allowWait: false,
+    keyScope: { group_type: 'anthropic', allowed_vms: ['vm-02'] },
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+  const blocked = await pool.selectAndReserve({
+    model: 'claude-haiku-4-5',
+    allowWait: false,
+    keyScope: { group_type: 'openai', allowed_vms: ['vm-02'] },
+  })
+  assert.equal(blocked.ok, false)
+  const open = await pool.eligibleCandidates({
+    model: 'claude-haiku-4-5',
+    keyScope: { group_type: 'all', allowed_vms: [] },
+  })
+  assert.deepEqual(open.map((c) => c.vmId).sort(), ['vm-01', 'vm-02'])
+})
+
+test('peekAccount honors the key scope', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const peeked = await pool.peekAccount({
+    model: 'claude-haiku-4-5',
+    keyScope: { group_type: 'anthropic', allowed_vms: ['vm-02'] },
+  })
+  assert.equal(peeked.ok, true)
+  assert.equal(peeked.vmId, 'vm-02')
+  const none = await pool.peekAccount({ keyScope: { group_type: 'openai', allowed_vms: ['vm-02'] } })
+  assert.equal(none.ok, false)
+})
+
+test('a vm pool drops a sticky VM that is no longer a member', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const unbound = []
+  const pool = scheduler(root, {
+    stickyRouter: {
+      resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }),
+      unbind: (key) => unbound.push(key),
+    },
+  })
+  const scope = {
+    group_type: 'all',
+    vm_pool_id: 'pool_abcd1234',
+    allowed_vms: ['vm-02'],
+    vm_pool_error: null,
+  }
+  const selected = await pool.selectAndReserve({
+    model: 'claude-haiku-4-5',
+    allowWait: false,
+    stickyKey: 'sess-left',
+    keyScope: scope,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  assert.deepEqual(unbound, ['sess-left'])
+  selected.release()
+  const blocked = await pool.selectAndReserve({
+    model: 'claude-haiku-4-5',
+    allowWait: false,
+    keyScope: { ...scope, allowed_vms: [], vm_pool_error: 'disabled' },
+  })
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.vmId, undefined)
+})
+
+function setActiveHours(root, id, activeHours) {
+  const file = path.join(root, 'vms', `${id}.json`)
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy = { ...(vm.policy || {}), active_hours: activeHours }
+  fs.writeFileSync(file, JSON.stringify(vm))
+}
+
+// A UTC window opening ~2h from now: `now` is always outside, `until` is exact.
+function restingWindow() {
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const startHour = (now.getUTCHours() + 2) % 24
+  const endHour = (now.getUTCHours() + 4) % 24
+  const until = new Date(now)
+  until.setUTCMinutes(0, 0, 0)
+  until.setUTCHours(startHour)
+  if (until.getTime() <= now.getTime()) until.setUTCDate(until.getUTCDate() + 1)
+  return {
+    config: { start: `${pad(startHour)}:00`, end: `${pad(endHour)}:00`, timezone: 'UTC' },
+    until: until.getTime(),
+  }
+}
+
+test('a resting slot is skipped and the pool fails over', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  setActiveHours(root, 'vm-01', restingWindow().config)
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+})
+
+test('an all-rest pool reports retry_after_ms for the next window open', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const rest = restingWindow()
+  setActiveHours(root, 'vm-01', rest.config)
+  setActiveHours(root, 'vm-02', rest.config)
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'no_eligible_accounts')
+  const delta = rest.until - Date.now()
+  assert.ok(selected.retry_after_ms > 0, `retry_after_ms=${selected.retry_after_ms}`)
+  assert.ok(Math.abs(selected.retry_after_ms - delta) < 5000)
+})
+
+test('a pinned diagnostic still reaches a resting slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  setActiveHours(root, 'vm-01', restingWindow().config)
+  const selected = await scheduler(root).selectAndReserve({
+    model: 'claude-test',
+    pinVmId: 'vm-01',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+})
+
+test('a resting slot that cannot serve the model does not promise a Retry-After', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const rest = restingWindow()
+  for (const id of ['vm-01', 'vm-02']) {
+    setActiveHours(root, id, rest.config)
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    vm.policy.allowed_models = ['claude-other']
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.retry_after_ms, null)
 })

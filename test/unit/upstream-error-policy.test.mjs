@@ -6,6 +6,34 @@ import {
   shouldContinue,
 } from '../../src/lib/pool/upstream-error-policy.mjs'
 
+test('unified account 429 without reset header uses usage window then 30 minutes', () => {
+  const now = 1_700_000_000_000
+  const usageReset = now + 3_600_000
+  const fromUsage = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { type: 'error', error: { type: 'rate_limit_error', message: 'limited' } },
+      headers: {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+      },
+    },
+    { model: 'claude-opus-test', now, usage: { reset_5h: new Date(usageReset).toISOString() } },
+  )
+  assert.equal(fromUsage.reason, 'account_quota_exhausted')
+  assert.equal(fromUsage.cooldownUntil, usageReset)
+  const fallback = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { type: 'error', error: { type: 'rate_limit_error', message: 'limited' } },
+      headers: {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+      },
+    },
+    { model: 'claude-opus-test', now },
+  )
+  assert.equal(fallback.cooldownUntil, now + 30 * 60_000)
+})
+
 test('unified account 429 cools account until authoritative reset', () => {
   const now = 1_700_000_000_000
   const reset = now + 120_000
@@ -26,18 +54,54 @@ test('unified account 429 cools account until authoritative reset', () => {
   assert.equal(shouldContinue(policy), true)
 })
 
-test('model 429 only cools requested model', () => {
+test('#163: a bare 429 is unknown for every model; the model name never decides scope', () => {
+  for (const model of ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5', 'claude-opus-4-6', 'unknown-model']) {
+    const policy = classifyUpstreamResult(
+      { status: 429, body: { error: { type: 'rate_limit_error', message: 'Rate limited' } }, headers: {} },
+      { model, now: 1000 },
+    )
+    assert.equal(policy.reason, 'rate_limited_unknown', model)
+    assert.equal(policy.scope, 'account', model)
+    assert.equal(policy.cooldownUntil, 61_000, model)
+    assert.equal(policy.circuit, undefined, model)
+  }
+})
+
+test('#163: upstream text naming a model family limits only that model', () => {
   const policy = classifyUpstreamResult(
     {
       status: 429,
-      body: { error: { type: 'rate_limit_error', message: 'model capacity' } },
+      body: { error: { type: 'rate_limit_error', message: 'Opus usage limit reached for this period' } },
+      headers: { 'retry-after': '120' },
+    },
+    { model: 'claude-opus-4-6', now: 1000 },
+  )
+  assert.equal(policy.scope, 'model')
+  assert.equal(policy.reason, 'opus_rate_limited')
+  assert.equal(policy.model, 'claude-opus-4-6')
+  assert.equal(policy.decision.scope, 'model')
+})
+
+test('#163: per-minute evidence is an RPM cooldown, not an account quota', () => {
+  const byText = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { message: 'Number of requests has exceeded your per-minute rate limit' } },
       headers: {},
     },
     { model: 'claude-sonnet-test', now: 1000 },
   )
-  assert.equal(policy.scope, 'model')
-  assert.equal(policy.model, 'claude-sonnet-test')
-  assert.equal(policy.cooldownUntil, 61_000)
+  const byHeader = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { message: 'limited' } },
+      headers: { 'anthropic-ratelimit-requests-remaining': '0' },
+    },
+    { model: 'claude-sonnet-test', now: 1000 },
+  )
+  assert.equal(byText.reason, 'rpm_limited')
+  assert.equal(byHeader.reason, 'rpm_limited')
+  assert.equal(byText.scope, 'account')
 })
 
 test('entitlement 429 stops without poisoning pool', () => {
@@ -50,6 +114,20 @@ test('entitlement 429 stops without poisoning pool', () => {
   )
   assert.equal(policy.scope, 'request')
   assert.equal(policy.action, 'stop')
+})
+
+test('wrap Connection error retries the same account', () => {
+  const policy = classifyUpstreamResult({
+    status: 200,
+    ok: false,
+    committed: false,
+    terminalState: 'incomplete',
+    body: { error: { type: 'api_error', message: 'provider error: provider error: Connection error.' } },
+  })
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'wrap_connection_error')
+  assert.equal(policy.retrySameAccount, true)
 })
 
 test('committed incomplete stream never switches account', () => {
@@ -98,7 +176,7 @@ test('response-header timeout does not cool the account', () => {
   assert.equal(shouldContinue(policy), true)
 })
 
-test('generic 502/5xx can failover without account cooldown', () => {
+test('generic 502 overload switches units through the circuit, not a 15s cooldown', () => {
   const policy = classifyUpstreamResult(
     {
       status: 502,
@@ -107,8 +185,145 @@ test('generic 502/5xx can failover without account cooldown', () => {
     { now: 1000 },
   )
   assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'provider_overloaded')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.circuit, true)
+  assert.equal(policy.decision.scope, 'unit')
+  assert.equal(policy.decision.action, 'next_unit')
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('incomplete 502 is an empty hop, not account overload', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 502,
+      terminalState: 'incomplete',
+      committed: false,
+      body: { type: 'error', error: { type: 'api_error', message: 'provider error' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.scope, 'stream')
+  assert.equal(policy.reason, 'empty_response')
+  assert.equal(policy.action, 'continue')
   assert.equal(policy.cooldownUntil, null)
   assert.equal(policy.retrySameAccount, true)
+})
+
+test('slot_busy 503 does not park the account', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 503,
+      body: {
+        type: 'error',
+        error: { type: 'worker_error', code: 'slot_busy', message: 'rust kernel has no free slot' },
+      },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'slot_busy')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, false)
+})
+
+test('a 502 plan-limit message switches accounts until the reset named in the text', () => {
+  const now = Date.parse('2026-09-23T12:37:10Z')
+  const policy = classifyUpstreamResult(
+    {
+      status: 502,
+      body: {
+        error: {
+          type: 'api_error',
+          message: "provider error: You've hit your limit · resets 4:20pm (America/Los_Angeles)",
+        },
+      },
+    },
+    // An elapsed leftover window reset must lose to the text reset.
+    { now, usage: { reset_5h: new Date(now - 3_600_000).toISOString() } },
+  )
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.reason, 'account_quota_exhausted')
+  assert.equal(policy.cooldownUntil, Date.parse('2026-09-23T23:20:00Z'))
+  assert.equal(policy.rememberRefusal, undefined)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('200 + streamed plan-limit error is account quota, not http_200 stop', () => {
+  const now = Date.parse('2026-09-23T12:37:10Z')
+  const policy = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 200,
+      committed: false,
+      terminalState: 'incomplete',
+      body: {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: "provider error: provider error: You've hit your limit · resets 11am (America/New_York)",
+        },
+      },
+    },
+    { now },
+  )
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.reason, 'account_quota_exhausted')
+  assert.equal(policy.cooldownUntil, Date.parse('2026-09-23T15:00:00Z'))
+  assert.equal(policy.retrySameAccount, false)
+})
+
+test('extra usage required stays a request-scoped entitlement stop', () => {
+  const policy = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { type: 'error', error: { type: 'rate_limit_error', message: 'Extra usage required for this model' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.reason, 'entitlement_required')
+})
+
+test('empty_response retries the same account', () => {
+  const policy = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 502,
+      terminalState: 'incomplete',
+      body: { type: 'error', error: { type: 'api_error', code: 'empty_response', message: 'no output' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(policy.reason, 'empty_response')
+  assert.equal(policy.retrySameAccount, true)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('client cancel stops and an upstream reset is not a cancel', () => {
+  const cancelled = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 499,
+      clientCancelled: true,
+      terminalState: 'cancelled',
+      body: { type: 'error', error: { code: 'client_cancelled', message: 'Client closed the connection' } },
+    },
+    { now: 1000 },
+  )
+  assert.equal(cancelled.reason, 'client_cancelled')
+  assert.equal(cancelled.action, 'stop')
+  assert.equal(cancelled.retrySameAccount, false)
+  const reset = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 0,
+      transportError: true,
+      body: { type: 'error', error: { code: 'ECONNRESET', message: 'socket hang up' } },
+    },
+    { now: 1000 },
+  )
+  assert.notEqual(reset.reason, 'client_cancelled')
 })
 
 test('transport timeout is not treated as a dead proxy', () => {
@@ -126,7 +341,7 @@ test('transport timeout is not treated as a dead proxy', () => {
   assert.equal(policy.cooldownUntil, null)
 })
 
-test('529 still uses a short provider cooldown', () => {
+test('529 stays on the overload column and does not open the unit circuit', () => {
   const policy = classifyUpstreamResult(
     {
       status: 529,
@@ -135,9 +350,11 @@ test('529 still uses a short provider cooldown', () => {
     { now: 1000 },
   )
   assert.equal(policy.scope, 'provider')
-  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'provider_overloaded')
-  assert.equal(policy.cooldownUntil, 16_000)
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.circuit, undefined)
+  assert.equal(policy.decision.action, 'next_unit')
 })
 
 test('signature error has one scoped repair', () => {
@@ -242,6 +459,69 @@ test('7d_oi 429 cools fable family not the account', () => {
   assert.equal(policy.cooldownUntil, now + 90_000)
 })
 
+test('thinking-only verified hop retries the same account', () => {
+  const policy = classifyUpstreamResult({
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    committed: false,
+    body: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'plan', signature: 'sig' }],
+      stop_reason: null,
+    },
+  })
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'incomplete_assistant')
+  assert.equal(policy.retrySameAccount, true)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('text plus end_turn is success even without ok flag', () => {
+  const policy = classifyUpstreamResult({
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    body: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'hello' }],
+      stop_reason: 'end_turn',
+    },
+  })
+  assert.equal(policy.scope, 'success')
+  assert.equal(policy.action, 'complete')
+})
+
+test('verified text without stop_reason retries instead of succeeding', () => {
+  const policy = classifyUpstreamResult({
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    committed: false,
+    body: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'partial' }],
+    },
+  })
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'incomplete_assistant')
+})
+
+test('non-assistant ok envelope is not classified as success', () => {
+  const policy = classifyUpstreamResult({
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    committed: false,
+    body: { output_text: 'assembled text', error: { message: 'original upstream failure' } },
+  })
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'incomplete_assistant')
+})
+
 test('200 refusal with empty visible output is content_filter, not success', () => {
   const policy = classifyUpstreamResult({
     ok: true,
@@ -257,6 +537,33 @@ test('200 refusal with empty visible output is content_filter, not success', () 
   assert.equal(policy.scope, 'request')
   assert.equal(policy.action, 'stop')
   assert.equal(policy.reason, 'content_filter_refusal')
+})
+
+test('Usage Policy API Error stops the request and is cached with no expiry', () => {
+  const msg =
+    'API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach.'
+  for (const status of [400, 502]) {
+    const policy = classifyUpstreamResult({
+      ok: false,
+      status,
+      terminalState: 'rejected',
+      body: {
+        type: 'error',
+        error: { type: status === 400 ? 'invalid_request_error' : 'api_error', message: msg },
+      },
+    })
+    assert.equal(policy.action, 'stop', String(status))
+    assert.equal(policy.reason, 'usage_policy_refusal')
+    assert.equal(policy.scope, 'request')
+    assert.equal(policy.rememberRefusal, true)
+    assert.equal(policy.refusalTtlMs, 0)
+    assert.equal(policy.cooldownUntil, null)
+    assert.equal(shouldContinue(policy), false)
+    assert.equal(policy.decision.origin, 'client')
+    assert.notEqual(policy.action, 'repair-and-retry')
+    assert.notEqual(policy.reason, 'invalid_request')
+    assert.notEqual(policy.reason, 'provider_pause')
+  }
 })
 
 test('assistant prefill 400 is repairable', () => {
@@ -315,7 +622,7 @@ test('invalid encrypted_content flattens the replayed search history once', () =
   assert.equal(classifyUpstreamResult(result, { repaired: true }).action, 'stop')
 })
 
-test('401 with refresh is oauth_revoked on the first hop', () => {
+test('401 with refresh asks for one same-unit refresh instead of permanent revoke', () => {
   const policy = classifyUpstreamResult(
     {
       status: 401,
@@ -323,10 +630,13 @@ test('401 with refresh is oauth_revoked on the first hop', () => {
     },
     { hasRefresh: true, oauth401CooldownMs: 20_000 },
   )
-  assert.equal(policy.scope, 'account')
-  assert.equal(policy.action, 'continue-and-cooldown')
-  assert.equal(policy.reason, 'oauth_revoked')
-  assert.equal(policy.cooldownUntil, Number.MAX_SAFE_INTEGER)
+  assert.equal(policy.scope, 'credential')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.reason, 'oauth_refresh_required')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, true)
+  assert.equal(policy.decision.action, 'retry_same')
+  assert.equal(policy.decision.credentialRefreshNeeded, true)
   assert.equal(shouldContinue(policy), true)
 })
 

@@ -16,6 +16,54 @@ function makePool() {
   return pool
 }
 
+test('proxy pool persists custom dns_primary and rejects invalid URLs without changing it', (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  assert.equal(pool.updateConfig({ dns_primary: '8.8.8.8:53' }).ok, true)
+  const primary = 'https://cloudflare-dns.com:8443/dns-query?key=a%2Cb'
+  assert.equal(pool.updateConfig({ dns_primary: primary }).ok, true)
+  for (const invalid of [
+    '9.9.9.9:53',
+    'http://cloudflare-dns.com/dns-query',
+    'https://user@cloudflare-dns.com/dns-query',
+    'https://cloudflare-dns.com/dns-query#fragment',
+    'https://cloudflare-dns.com/dns-query?key=a,b',
+    'https://cloudflare-dns.com:65536/dns-query',
+  ]) {
+    const result = pool.updateConfig({ dns_primary: invalid })
+    assert.equal(result.ok, false, invalid)
+    assert.equal(result.error, 'invalid_dns_primary', invalid)
+    assert.equal(pool.snapshot().config.dns_primary, primary)
+  }
+  const reopened = new ProxyPool({ dataDir: dir })
+  reopened.stopScheduler()
+  assert.equal(reopened.snapshot().config.dns_primary, primary)
+})
+
+test('DNS type suppression persists both toggle states and rejects non-booleans', (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  assert.equal(pool.snapshot().config.dns_disable_svcb_https, false)
+  assert.equal(pool.updateConfig({ dns_disable_svcb_https: true }).ok, true)
+  for (const value of ['false', 1, null, [], {}]) {
+    const result = pool.updateConfig({ dns_disable_svcb_https: value, dns_primary: '8.8.8.8:53' })
+    assert.equal(result.error, 'invalid_dns_disable_svcb_https')
+    assert.equal(pool.snapshot().config.dns_disable_svcb_https, true)
+    assert.equal(pool.snapshot().config.dns_primary, 'auto')
+  }
+  const reopened = new ProxyPool({ dataDir: dir })
+  reopened.stopScheduler()
+  assert.equal(reopened.snapshot().config.dns_disable_svcb_https, true)
+  assert.equal(reopened.updateConfig({ dns_disable_svcb_https: false }).ok, true)
+  const disabled = new ProxyPool({ dataDir: dir })
+  disabled.stopScheduler()
+  assert.equal(disabled.snapshot().config.dns_disable_svcb_https, false)
+})
+
 test('clampBindLimit defaults to 5 and stays in 1..32', () => {
   assert.equal(clampBindLimit(undefined), MAX_VMS_PER_PROXY)
   assert.equal(clampBindLimit(5), 5)
@@ -121,6 +169,31 @@ test('probeOne repairs egress then passes', async () => {
   }
 })
 
+test('startScheduler immediately repairs enabled egress', async () => {
+  const socks = await listenSocks()
+  let healthy = false
+  let repairs = 0
+  const pool = new ProxyPool({
+    dataDir: tmpDir(),
+    egressCheck: () => ({ ok: healthy, reason: healthy ? null : 'not_running' }),
+    repairEgress: () => {
+      repairs += 1
+      healthy = true
+    },
+  })
+  try {
+    pool.importLines(`${socks.host}:${socks.port}`)
+    pool.startScheduler()
+    const deadline = Date.now() + 1000
+    while (!healthy && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(healthy, true)
+    assert.equal(repairs, 1)
+  } finally {
+    pool.stopScheduler()
+    socks.server.close()
+  }
+})
+
 test('egress_down does not mark a live SOCKS proxy dead', async () => {
   const socks = await listenSocks()
   const pool = new ProxyPool({
@@ -195,4 +268,25 @@ test('ensureLocal adds a single local egress row', () => {
   const auth = pool.getProxyForVm('vm-01')
   assert.equal(auth.scheme, 'local')
   assert.equal(auth.url, '')
+})
+
+test('local egress probe stays direct when kin-egress is down', async () => {
+  const disabled = []
+  const pool = new ProxyPool({
+    dataDir: tmpDir(),
+    egressCheck: () => ({ ok: false, reason: 'local_network_missing' }),
+    onDisableVm: (vmId) => disabled.push(vmId),
+  })
+  pool.stopScheduler()
+  pool.ensureLocal()
+  pool.bind('px-local', 'vm-01')
+  const row = pool.state.proxies.find((p) => p.id === 'px-local')
+  const result = await pool.probeOne(row)
+  assert.equal(result.ok, true)
+  assert.equal(result.scope, 'local')
+  assert.equal(result.mode, 'direct')
+  pool._applyProbeResult(row, result)
+  assert.equal(row.status, 'ok')
+  assert.equal(row.enabled, true)
+  assert.equal(disabled.length, 0)
 })

@@ -1,3 +1,4 @@
+import type { Vm } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,10 +13,16 @@ import {
 } from '@/components/ui/select'
 import { TabsContent } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  DATAPLANE_HINT,
+  HOP_TRANSPORT_LABEL,
+  dataplaneLabel,
+} from '@/features/vm/dataplane-contract'
 import { TestChatResultCard } from '@/features/vm/test-chat-result-card'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
 
 type VmTestTabProps = {
+  vm: Vm
   models: { id: string; label?: string; display_name?: string }[]
   model: string
   prompt: string
@@ -23,6 +30,7 @@ type VmTestTabProps = {
   reasoningEffort: string
   credType: CredType
   isCodex?: boolean
+  dataplane?: string | null
   result: TestChatResult | null
   running: boolean
   modelsRefreshing: boolean
@@ -32,6 +40,8 @@ type VmTestTabProps = {
   onReasoningEffortChange: (value: string) => void
   onTest: () => void
   onRefreshModels: () => void
+  canRefreshModels?: boolean
+  schedule?: React.ReactNode
 }
 
 const CODEX_EFFORTS = [
@@ -44,7 +54,17 @@ const CODEX_EFFORTS = [
 ] as const
 
 export function VmTestTab(props: VmTestTabProps) {
+  return (
+    <TabsContent value='test' className='space-y-3 pt-4'>
+      <VmTestPanel {...props} className='max-w-lg' />
+    </TabsContent>
+  )
+}
+
+/** 不依赖 Tabs 上下文的测试面板，详情页 Tab 与弹窗共用。 */
+export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
   const {
+    vm,
     models,
     model,
     prompt,
@@ -52,6 +72,7 @@ export function VmTestTab(props: VmTestTabProps) {
     reasoningEffort,
     credType,
     isCodex = false,
+    dataplane,
     result,
     running,
     modelsRefreshing,
@@ -61,11 +82,13 @@ export function VmTestTab(props: VmTestTabProps) {
     onReasoningEffortChange,
     onTest,
     onRefreshModels,
+    canRefreshModels = true,
+    schedule,
   } = props
 
   return (
-    <TabsContent value='test' className='space-y-3 pt-4'>
-      <Card className='max-w-lg'>
+    <>
+      <Card className={props.className}>
         <CardHeader className='pb-2'>
           <CardTitle className='text-sm'>发一条测试对话</CardTitle>
         </CardHeader>
@@ -145,21 +168,33 @@ export function VmTestTab(props: VmTestTabProps) {
                     }`}
             </p>
           </div>
+          {isCodex ? null : (
+            <div className='space-y-1'>
+              <Label>内核</Label>
+              <p className='text-xs text-muted-foreground'>
+                {HOP_TRANSPORT_LABEL} · {dataplaneLabel(dataplane)}。
+                {DATAPLANE_HINT}
+              </p>
+            </div>
+          )}
           <div className='flex gap-2'>
             <Button onClick={onTest} disabled={running} loading={running}>
               开始测试
             </Button>
-            <Button
-              variant='ghost'
-              onClick={onRefreshModels}
-              disabled={modelsRefreshing}
-            >
-              刷新列表
-            </Button>
+            {canRefreshModels ? (
+              <Button
+                variant='ghost'
+                onClick={onRefreshModels}
+                loading={modelsRefreshing}
+              >
+                刷新列表
+              </Button>
+            ) : null}
           </div>
+          {schedule}
         </CardContent>
       </Card>
-      <TestChatResultCard result={result} running={running} />
-    </TabsContent>
+      <TestChatResultCard result={result} running={running} vm={vm} />
+    </>
   )
 }

@@ -10,6 +10,7 @@ import {
   shouldProbeFable,
   normUtilization,
   FABLE_PROBE_MODEL,
+  tierFromFableAttempts,
   PASSIVE_HEADER_SOURCE,
   probeFromPassiveHeaders,
   probeVmUsage,
@@ -27,8 +28,26 @@ test('oauth usage parse: official percent scale 1 = 1%', () => {
   assert.equal(p.five_hour.status, 'allowed')
   assert.equal(p.seven_day.utilization, 0.34)
   assert.equal(p.seven_day_sonnet.utilization, 0.08)
-  assert.equal(p.seven_day_opus.utilization, 0.08)
+  assert.equal(p.seven_day_opus, null)
+  assert.equal(p.seven_day_oauth_apps, null)
   assert.equal(p.extra_usage.is_enabled, true)
+})
+
+test('oauth usage parse: 2.1.293 windows stay separate', () => {
+  const p = parseOAuthUsage({
+    five_hour: { utilization: 12, resets_at: '2026-10-07T20:00:00Z' },
+    seven_day: { utilization: 34, resets_at: '2026-10-12T00:00:00Z' },
+    seven_day_sonnet: { utilization: 8, resets_at: '2026-10-12T00:00:00Z' },
+    seven_day_opus: { utilization: 2, resets_at: '2026-10-12T00:00:00Z' },
+    seven_day_oauth_apps: { utilization: 5, resets_at: '2026-10-12T00:00:00Z' },
+    extra_usage: { is_enabled: true, monthly_limit: 2000, used_credits: 100, utilization: 5 },
+  })
+  assert.equal(p.seven_day_sonnet.utilization, 0.08)
+  assert.equal(p.seven_day_opus.utilization, 0.02)
+  assert.equal(p.seven_day_oauth_apps.utilization, 0.05)
+  assert.equal(p.extra_usage.monthly_limit, 2000)
+  assert.equal(p.extra_usage.used_credits, 100)
+  assert.equal(p.extra_usage.utilization, 0.05)
 })
 
 test('oauth usage parse: Fable weekly_scoped from limits[]', () => {
@@ -51,6 +70,33 @@ test('oauth usage parse: Fable weekly_scoped from limits[]', () => {
   assert.equal(p.seven_day_oi.resets_at, '2026-08-24T00:00:00Z')
 })
 
+test('oauth usage parse: Fable model id in limits is Max evidence', () => {
+  const p = parseOAuthUsage({
+    five_hour: { utilization: 10, resets_at: '2026-08-18T20:00:00Z' },
+    seven_day: { utilization: 20, resets_at: '2026-08-24T00:00:00Z' },
+    limits: [
+      {
+        kind: 'weekly_scoped',
+        percent: 3,
+        resets_at: '2026-08-24T00:00:00Z',
+        scope: { model: { id: 'claude-fable-5-1' } },
+      },
+    ],
+  })
+  assert.equal(p.usage_has_fable, true)
+  assert.equal(p.seven_day_oi.utilization, 0.03)
+})
+
+test('oauth usage parse: limits without Fable is not Max', () => {
+  const p = parseOAuthUsage({
+    five_hour: { utilization: 10 },
+    seven_day: { utilization: 20 },
+    limits: [{ kind: 'weekly_all', percent: 20, scope: { model: { display_name: 'Sonnet' } } }],
+  })
+  assert.equal(p.usage_has_fable, false)
+  assert.equal(p.seven_day_oi, null)
+})
+
 test('normUtilization header/legacy: 85 is 0.85, 0.85 stays 0.85', () => {
   assert.equal(normUtilization(85), 0.85)
   assert.equal(normUtilization(0.85), 0.85)
@@ -67,6 +113,26 @@ test('fable 429 is isolated weekly limit, not account ban', () => {
   assert.equal(r.plan_denied, false)
   assert.equal(r.ok, false)
   assert.equal(r.utilization, null)
+})
+
+test('fable attempts: 200 is Max, 403-only is Pro, 429 does not classify', () => {
+  assert.equal(
+    tierFromFableAttempts([
+      { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5-1' },
+      { ok: true, status: 200, model: 'claude-fable-5' },
+    ]).tier,
+    'max',
+  )
+  assert.equal(
+    tierFromFableAttempts([
+      { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5-1' },
+      { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
+    ]).tier,
+    'pro',
+  )
+  assert.equal(tierFromFableAttempts([{ ok: false, limited: true, status: 429, model: FABLE_PROBE_MODEL }]).tier, null)
+  assert.equal(tierFromFableAttempts([{ transport: true, status: 0 }]).tier, null)
+  assert.equal(FABLE_PROBE_MODEL, 'claude-fable-5-1')
 })
 
 test('fable 403 permission is plan denied, not account ban', () => {
@@ -96,25 +162,43 @@ test('fable probe reads 7d_oi utilization from response headers', () => {
   assert.equal(r.reset_at, '2026-08-24T00:00:00Z')
 })
 
-test('Pro slots skip Fable model probe', () => {
-  assert.equal(shouldProbeFable({ storedTier: 'pro' }), false)
-  assert.equal(shouldProbeFable({ fable: { plan_denied: true, status: 403 } }), false)
-  assert.equal(shouldProbeFable({ fable: { ok: false, status: 429, error: 'Error' } }), false)
+test('Pro slots are rechecked after an hour so a mistaken tier can recover', () => {
+  const recent = new Date().toISOString()
+  const stale = new Date(Date.now() - 61 * 60_000).toISOString()
   assert.equal(
-    shouldProbeFable({ fable: { ok: true }, quota: { utilization_7d_oi: 0.21, reset_7d_oi: '2026-08-24T00:00:00Z' } }),
+    shouldProbeFable({ storedTier: 'pro', fable: { plan_denied: true, status: 403, probed_at: recent } }),
+    false,
+  )
+  assert.equal(
+    shouldProbeFable({ storedTier: 'pro', fable: { plan_denied: true, status: 403, probed_at: stale } }),
     true,
   )
+  assert.equal(shouldProbeFable({ storedTier: 'pro' }), true)
+  assert.equal(shouldProbeFable({ fable: { ok: false, status: 429, error: 'Error' } }), true)
+  assert.equal(
+    shouldProbeFable({
+      storedTier: 'pro',
+      fable: { ok: false, status: 429, error: 'Error', probed_at: stale },
+      quota: { utilization_7d_oi: 1, status_7d_oi: 'rejected' },
+    }),
+    true,
+  )
+  assert.equal(
+    shouldProbeFable({ fable: { ok: true }, quota: { utilization_7d_oi: 0.21, reset_7d_oi: '2026-08-24T00:00:00Z' } }),
+    false,
+  )
   assert.equal(shouldProbeFable({ fable: {}, storedTier: 'max' }), true)
+  assert.equal(shouldProbeFable({ storedTier: 'pro', quota: { usage_has_fable: true } }), false)
 })
 
-test('Fable 429 without a real 7d_oi window is Pro', () => {
-  assert.equal(isFableUnavailablePro({ ok: false, status: 429, error: 'Error' }, {}), true)
+test('Fable 429 without a real 7d_oi window is not Pro evidence', () => {
+  assert.equal(isFableUnavailablePro({ ok: false, status: 429, error: 'Error' }, {}), false)
   assert.equal(
     isFableUnavailablePro(
       { ok: false, status: 429, error: 'Error' },
       { utilization_7d_oi: 1, status_7d_oi: 'rejected' },
     ),
-    true,
+    false,
   )
   assert.equal(
     isFableUnavailablePro({ ok: false, status: 502 }, { utilization_7d_oi: 0.44, reset_7d_oi: '2026-08-24T00:00:00Z' }),
@@ -161,6 +245,7 @@ test('usage hop is skipped while 429 backoff is live', () => {
   const live = { usage_rate_limited_until: '2026-08-25T14:15:00.000Z' }
   assert.equal(shouldHopOfficialUsage(live, { now }), false)
   assert.equal(shouldHopOfficialUsage(live, { now, hop: false }), false)
+  assert.equal(shouldHopOfficialUsage(live, { now, force: true }), true)
   assert.equal(shouldHopOfficialUsage({}, { now, hop: false }), false)
   assert.equal(shouldHopOfficialUsage({}, { now }), true)
   assert.equal(shouldHopOfficialUsage({ usage_rate_limited_until: '2026-08-25T13:59:00.000Z' }, { now }), true)

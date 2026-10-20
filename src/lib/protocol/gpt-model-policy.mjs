@@ -3,7 +3,7 @@
  * Live ids from ChatGPT sync; seed is empty-catalog fallback.
  */
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { isGptSeriesId } from './gpt-ids.mjs'
+import { isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 const SETTINGS_KEY = 'gpt_model_policy'
 
@@ -34,6 +34,8 @@ function entry(id, extra = {}) {
 export function seedGptPolicy() {
   const models = {}
   for (const [id, extra] of [
+    ['gpt-6-sol', { display_name: 'GPT-6 Sol', sort: 70 }],
+    ['gpt-6-luna', { display_name: 'GPT-6 Luna', sort: 71 }],
     ['gpt-5.6', { display_name: 'GPT-5.6', sort: 76 }],
     ['gpt-5.5', { display_name: 'GPT-5.5', sort: 77 }],
     ['gpt-5.4', { display_name: 'GPT-5.4', sort: 80, aliases: ['codex'] }],
@@ -140,13 +142,18 @@ export function resetGptModelPolicy() {
   return policy
 }
 
-export function syncGptIdsIntoPolicy(ids = []) {
+/**
+ * Replace the GPT catalog with the live Codex list. Existing rows keep their edits;
+ * a GPT id the policy has never seen starts disabled until the admin enables it
+ * (GPT has no worker_only mode).
+ */
+export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
   if (!loaded) loadGptModelPolicy()
   const live = []
   const seen = new Set()
   for (const item of ids || []) {
     const id = String(typeof item === 'string' ? item : item?.id || '').trim()
-    if (!isGptSeriesId(id) || seen.has(id.toLowerCase()) || /(?:^|[-_])(luna|wm)(?:[-_]|$)/i.test(id)) continue
+    if (!isSyncableGptCatalogId(id) || seen.has(id.toLowerCase())) continue
     seen.add(id.toLowerCase())
     live.push({
       id,
@@ -154,15 +161,17 @@ export function syncGptIdsIntoPolicy(ids = []) {
     })
   }
   if (!live.length) {
-    return { ok: true, synced: 0, ids: listGptPolicyModels().map((m) => m.id) }
+    return { ok: true, synced: 0, added: [], ids: listGptPolicyModels().map((m) => m.id) }
   }
   const next = {}
+  const added = []
   for (const row of live) {
     const prev = policy.models[row.id]
+    if (!prev) added.push(row.id)
     next[row.id] = entry(row.id, {
       ...prev,
-      display_name: row.display_name || prev?.display_name || row.id,
-      enabled: prev?.enabled !== false,
+      display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
+      enabled: prev ? prev.enabled !== false : false,
       source: 'codex',
     })
   }
@@ -177,6 +186,7 @@ export function syncGptIdsIntoPolicy(ids = []) {
   return {
     ok: true,
     synced: live.length,
+    added,
     ids: listGptPolicyModels().map((m) => m.id),
   }
 }

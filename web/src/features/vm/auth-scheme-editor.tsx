@@ -27,8 +27,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 /** 「跟随凭证类型默认」在 select 里的哨兵值 —— 提交时翻译成空串。 */
 const FOLLOW = 'follow'
@@ -41,6 +48,7 @@ export function AuthSchemeEditor({ vm }: { vm: Vm }) {
   const effective = authSchemeOf(vm)
   const fallback = defaultAuthScheme(credTypeOf(vm))
   const [value, setValue] = useState<string>(explicit ?? FOLLOW)
+  const canEdit = useVmPerms().admin
 
   const save = useMutation({
     mutationFn: () =>
@@ -69,19 +77,39 @@ export function AuthSchemeEditor({ vm }: { vm: Vm }) {
     onError: (e: Error) => toast.error(e.message || '更新失败'),
   })
 
+  if (!canEdit) return null
+
   return (
     <>
-      <Button
-        size='sm'
-        variant='ghost'
-        className='h-6 px-2 text-xs'
-        onClick={() => {
-          setValue(explicit ?? FOLLOW)
-          setOpen(true)
-        }}
-      >
-        编辑
-      </Button>
+      {isRemoteVm(vm) ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span>
+              <Button
+                size='sm'
+                variant='ghost'
+                className='h-6 px-2 text-xs'
+                disabled
+              >
+                编辑
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{REMOTE_UNSUPPORTED_TEXT}</TooltipContent>
+        </Tooltip>
+      ) : (
+        <Button
+          size='sm'
+          variant='ghost'
+          className='h-6 px-2 text-xs'
+          onClick={() => {
+            setValue(explicit ?? FOLLOW)
+            setOpen(true)
+          }}
+        >
+          编辑
+        </Button>
+      )}
       <Dialog
         open={open}
         onOpenChange={(v) => {

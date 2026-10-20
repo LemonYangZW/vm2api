@@ -1,24 +1,27 @@
 import type { Dashboard } from '@/types/panel-overview'
 import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
-import type {
-  ConcurrencyInfo,
-  RpmInfo,
-  SessionCapacity,
-  VmCostSummary,
-  WeeklySplitSummary,
+import {
+  fableCap,
+  fableCardInfo,
+  type ConcurrencyInfo,
+  type RpmInfo,
+  type VmCostSummary,
+  type WeeklySplitSummary,
 } from '@/lib/fable-status'
-import { fableCap, fableCardInfo } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
 import { isCodexVm } from '@/lib/vm-kind'
 import {
   accountStatus,
   accountUsable,
   poolStatus,
-  proxyHostLabel,
-  vmCooldownTitle,
+  proxyNamedLabel,
+  restrictionCopy,
+  restrictionUntilOf,
+  scheduleStateLabel,
   vmRunning,
 } from '@/lib/vm-status'
+import { formatWindowSpend } from '@/lib/vm-usage'
 import {
   kernelHopReady,
   kernelProcessUp,
@@ -26,13 +29,26 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
-import { ConcRpmEditor } from '@/features/vm/conc-rpm-editor'
-import { Field, Meter, ResetAt } from '@/features/vm/detail-section-primitives'
+import { dataplaneLabel } from '@/features/vm/dataplane-contract'
+import { CircuitField } from '@/features/vm/detail-circuit-field'
+import {
+  Field,
+  Meter,
+  quotaWindowHint,
+  ResetAt,
+} from '@/features/vm/detail-section-primitives'
+import type { VmTodayCounts } from '@/features/vm/detail-today'
 import { KernelFeatTags } from '@/features/vm/kernel-feat-tags'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { OpenaiQuotaPanel } from '@/features/vm/openai-quota-panel'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
+import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
+import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
+import { telemetryView } from './telemetry-policy'
+import { telemetryStatusLabel } from './telemetry-status'
 
 type Props = {
   vm: Vm
@@ -46,9 +62,9 @@ type Props = {
   now: number
   cost: VmCostSummary
   split: WeeklySplitSummary | null
-  sess: SessionCapacity | null
   conc: ConcurrencyInfo
   rpm: RpmInfo | null
+  today: VmTodayCounts
 }
 
 type Verdict = {
@@ -124,7 +140,7 @@ function slotVerdict(
 
 function workerLabel(value: unknown) {
   const raw = String(value || '').trim()
-  if (raw === 'go' || raw === 'rust') return 'Rust · Claude Code cli-hop'
+  if (raw === 'go' || raw === 'rust') return 'Rust · cli-hop'
   return raw || '—'
 }
 
@@ -134,6 +150,11 @@ function topologyLabel(
   if (topology?.rust_pid1) return 'kernel PID1'
   if (topology?.go_worker_pid1) return '旧拓扑'
   return '未知'
+}
+
+function money(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : 0
 }
 
 export function VmStatusBoard(props: Props) {
@@ -149,14 +170,22 @@ export function VmStatusBoard(props: Props) {
     now,
     cost,
     split,
-    sess,
     conc,
     rpm,
+    today,
   } = props
   const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
   const fable = fableCardInfo(vm, tierKey, fableCap(dash.data))
-  const telemetry = kernel?.telemetry
+  const reset5 = acc.reset_5h ?? vm.reset_5h
+  const reset7 = acc.reset_7d ?? vm.reset_7d
+  const cost5 = money(acc.window_5h_cost ?? vm.window_5h_cost ?? cost.w)
+  const cost7 = money(acc.window_7d_cost ?? vm.window_7d_cost)
+  const fableCost = money(acc.window_fable_cost ?? vm.window_fable_cost)
+  const spend5 = formatWindowSpend(cost5, vm.estimate_5h)
+  const spend7 = formatWindowSpend(cost7, vm.estimate_7d)
+  const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
+  const telemetry = telemetryView(vm.seed_policy, kernel?.telemetry)
   const topology = kernel?.process_topology
   const rust = wrapHealthLabel(kernel?.rust_health)
 
@@ -207,7 +236,10 @@ export function VmStatusBoard(props: Props) {
               <>
                 <Field label='镜像' compact>
                   <div className='space-y-1'>
-                    <div>{String(vm.kernel || '—')}</div>
+                    <div className='flex flex-wrap items-center gap-1.5'>
+                      <span>{String(vm.kernel || '—')}</span>
+                      <RuntimeChip vm={vm} />
+                    </div>
                     <KernelFeatTags kernel={vm.kernel} />
                   </div>
                 </Field>
@@ -218,9 +250,20 @@ export function VmStatusBoard(props: Props) {
                 </Field>
               </>
             )}
-            <Field label='冷却' compact>
-              {vmCooldownTitle(vm)}
+            <Field label='调度状态' compact>
+              {scheduleStateLabel(vm)}
             </Field>
+            <Field label='限制至' compact>
+              {restrictionUntilOf(vm) ? (
+                <ResetAt value={restrictionUntilOf(vm)} now={now} />
+              ) : (
+                '—'
+              )}
+            </Field>
+            <Field label='冷却' compact>
+              {restrictionCopy(vm)}
+            </Field>
+            <CircuitField vm={vm} now={now} />
           </div>
         </div>
 
@@ -228,28 +271,55 @@ export function VmStatusBoard(props: Props) {
           <h3 className='text-sm font-medium'>额度</h3>
           <div className='mt-3 grid gap-3'>
             {isCodexVm(vm) ? (
-              <OpenaiQuotaPanel vm={vm} u5={u5} u7={u7} now={now} />
+              <OpenaiQuotaPanel
+                vm={vm}
+                u5={u5}
+                u7={u7}
+                now={now}
+                cost5={cost5}
+                cost7={cost7}
+              />
             ) : (
               <>
                 <Meter
                   label='5 小时已用'
                   value={u5}
-                  hint={
-                    vm.reset_5h
-                      ? `重置 ${String(vm.status_5h || '')}`.trim()
-                      : undefined
+                  gate={
+                    vm.quota_policy ? vm.quota_policy.limit_5h * 100 : undefined
                   }
+                  hint={[
+                    quotaWindowHint(u5, reset5, now),
+                    spend5.costText,
+                    spend5.remainText,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
                 />
                 <Meter
                   label='7 天已用'
                   value={u7}
-                  hint={String(vm.status_7d || '')}
+                  gate={
+                    vm.quota_policy ? vm.quota_policy.limit_7d * 100 : undefined
+                  }
+                  hint={[
+                    quotaWindowHint(u7, reset7, now),
+                    spend7.costText,
+                    spend7.remainText,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
                 />
                 {fable.usedPct != null ? (
                   <Meter
                     label='Fable 已用'
                     value={fable.usedPct}
-                    hint={fable.bits.join(' · ')}
+                    hint={[
+                      ...fable.bits,
+                      spendFable.costText,
+                      spendFable.remainText,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
                   />
                 ) : (
                   <div className='flex items-center justify-between gap-2 text-sm'>
@@ -271,13 +341,7 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
-                {sess ? (
-                  <Meter
-                    label='会话'
-                    value={sess.max > 0 ? (sess.active / sess.max) * 100 : 0}
-                    hint={`${sess.active}/${sess.max}`}
-                  />
-                ) : null}
+                <ClaudeResetActions vm={vm} now={now} />
               </>
             )}
           </div>
@@ -295,7 +359,7 @@ export function VmStatusBoard(props: Props) {
                 )}
               </div>
               <div className='text-[11px] text-muted-foreground'>
-                {fmtNum(cost.req)} req
+                {fmtNum(today.requests)} req
               </div>
             </div>
             <div>
@@ -310,25 +374,21 @@ export function VmStatusBoard(props: Props) {
           </div>
           <div className='mt-3 divide-y'>
             <Field label='代理' compact>
-              <span className='font-mono text-xs'>{proxyHostLabel(proxy)}</span>
+              <span className='font-mono text-xs'>
+                {proxyNamedLabel(proxy)}
+              </span>
             </Field>
-            <Field label='并发 / RPM' compact>
-              <div className='flex items-center gap-1'>
-                <span className='tabular-nums'>
-                  {conc.inf}/{conc.max}
-                  {' · '}
-                  {rpm ? `${rpm.n}/${rpm.max} rpm` : 'rpm 不限'}
-                </span>
-                <ConcRpmEditor vm={vm} />
-              </div>
-            </Field>
+            <div className='space-y-2 py-2'>
+              <VmSchedulingBlock vm={vm} conc={conc} rpm={rpm} />
+              <VmMemoryBlock vm={vm} />
+            </div>
             {isCodexVm(vm) ? null : (
               <>
                 <Field label='5h 重置' compact>
-                  <ResetAt value={vm.reset_5h} now={now} />
+                  <ResetAt value={reset5} now={now} />
                 </Field>
                 <Field label='7d 重置' compact>
-                  <ResetAt value={vm.reset_7d} now={now} />
+                  <ResetAt value={reset7} now={now} />
                 </Field>
               </>
             )}
@@ -339,14 +399,15 @@ export function VmStatusBoard(props: Props) {
                 <Field label='cli-hop' compact>
                   {rust}
                 </Field>
+                <Field label='内核' compact>
+                  {isCodexVm(vm) ? '—' : dataplaneLabel(vm.resolved_dataplane)}
+                </Field>
                 <Field label='拓扑' compact>
                   {topologyLabel(topology)}
                   {topology?.go_telemetry ? ' · Go telemetry' : ''}
                 </Field>
                 <Field label='遥测' compact>
-                  {telemetry?.enabled
-                    ? `运行中${telemetry.read_only ? ' · 只读' : ''}`
-                    : '未启用'}
+                  {telemetryStatusLabel(telemetry)}
                 </Field>
               </>
             )}

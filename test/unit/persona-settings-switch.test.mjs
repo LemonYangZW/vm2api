@@ -28,11 +28,12 @@ import {
   personaOptionsFromRoutingFile,
   wrapMandatoryConstraint,
 } from '../../src/lib/identity/crs-persona.mjs'
+import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
 
 const SETTINGS_RADIOS = Object.freeze(['rewrite', 'official_prompt', 'overwrite', 'zero', 'none'])
 
 const UNOFFICIAL = {
-  model: 'claude-sonnet-5',
+  model: 'claude-sonnet-5-5',
   messages: [{ role: 'user', content: 'hello from settings switch' }],
 }
 
@@ -52,8 +53,7 @@ function firstUser(out) {
 }
 
 function envText(out) {
-  const sys = Array.isArray(out.system) ? out.system : []
-  return String(sys[3]?.text || '')
+  return envTextAt(out)
 }
 
 function envTextAt(out) {
@@ -108,10 +108,10 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
     persistSettings(file, { persona_inject: 'rewrite', persona_park: true, persona_agent: 'default' })
     const rewrite = applyFromSettings(file)
     assert.equal(rewrite.system.length, 4)
-    assert.equal(rewrite.system[1].text, CRS_OFFICIAL_SYSTEM)
-    assert.equal(rewrite.system[2].text, CRS_AGENT_EXPANSION)
-    assert.deepEqual(rewrite.system[2].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
-    assert.ok(!rewrite.system[2].text.includes('# Doing tasks'))
+    assert.equal(rewrite.system[0].text, CRS_OFFICIAL_SYSTEM)
+    assert.equal(rewrite.system[1].text, CRS_AGENT_EXPANSION)
+    assert.deepEqual(rewrite.system[1].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
+    assert.ok(!rewrite.system[1].text.includes('# Doing tasks'))
     assert.match(envText(rewrite), /Timezone: America\/Los_Angeles/)
     assert.ok(!envText(rewrite).includes('You have been invoked'))
     assert.ok(!envText(rewrite).includes('# Text output'))
@@ -123,18 +123,20 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
 
     persistSettings(file, { persona_inject: 'official_prompt', persona_park: true })
     const official = applyFromSettings(file)
-    assert.equal(official.system.length, 2)
+    assert.equal(official.system.length, 4)
     assert.equal(official.system[1].text, CRS_OFFICIAL_SYSTEM)
+    assert.equal(official.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
+    assert.match(official.system[3].text, /^# Environment\n - Timezone: /)
+    assert.ok(!official.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
     assert.ok(!official.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
-    assert.ok(!official.system.some((b) => b?.text === CRS_OFFICIAL_AGENT_PROMPT))
-    assert.equal(envTextAt(official), '')
+    assert.equal(envTextAt(official), '# Environment\n - Timezone: America/Los_Angeles')
     assert.match(firstUser(official), /MANDATORY constraints for this turn/)
 
     persistSettings(file, { persona_inject: 'overwrite' })
     const overwrite = applyFromSettings(file)
-    assert.equal(overwrite.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
-    assert.ok(overwrite.system[2].text.includes('# Doing tasks'))
-    assert.deepEqual(overwrite.system[2].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_CONTROL_TTL })
+    assert.equal(overwrite.system[1].text, CRS_OFFICIAL_AGENT_PROMPT)
+    assert.ok(overwrite.system[1].text.includes('# Doing tasks'))
+    assert.deepEqual(overwrite.system[1].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_CONTROL_TTL })
     assert.match(envText(overwrite), /You have been invoked/)
     assert.match(envText(overwrite), /Timezone: America\/Los_Angeles/)
     assert.match(envText(overwrite), /OS Version: Linux 6\.8\.0-51-generic/)
@@ -142,12 +144,12 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
 
     persistSettings(file, { persona_inject: 'zero', persona_agent: 'default' })
     const zero = applyFromSettings(file)
-    assert.equal(zero.system.length, 3)
+    assert.equal(zero.system.length, 4)
     assert.match(zero.system[0].text, /x-anthropic-billing-header:/)
     assert.match(zero.system[0].text, /prompt_version=<You are Anthropic Claude Agent SDK\.>/)
     assert.equal(zero.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
     assert.equal(zero.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
-    assert.ok(!envTextAt(zero).includes('# Environment'))
+    assert.equal(envTextAt(zero), '# Environment\n - Timezone: America/Los_Angeles')
     assert.ok(!zero.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
     assert.ok(!firstUser(zero).includes('MANDATORY constraints for this turn'))
 
@@ -162,11 +164,11 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
 test('switching back to rewrite restores short expansion after overwrite', () => {
   withRouting((file) => {
     persistSettings(file, { persona_inject: 'overwrite', persona_park: true })
-    assert.equal(applyFromSettings(file).system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
+    assert.equal(applyFromSettings(file).system[1].text, CRS_OFFICIAL_AGENT_PROMPT)
     persistSettings(file, { persona_inject: 'rewrite' })
     const back = applyFromSettings(file)
-    assert.equal(back.system[2].text, CRS_AGENT_EXPANSION)
-    assert.deepEqual(back.system[2].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
+    assert.equal(back.system[1].text, CRS_AGENT_EXPANSION)
+    assert.deepEqual(back.system[1].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
     assert.ok(!envText(back).includes('You have been invoked'))
   })
 })
@@ -175,29 +177,29 @@ test('persona_agent does not change zero; leftover rewrite agent does not flip d
   withRouting((file) => {
     persistSettings(file, { persona_inject: 'rewrite', persona_agent: 'rewrite' })
     const def = applyFromSettings(file)
-    assert.equal(def.system[2].text, CRS_AGENT_EXPANSION)
-    assert.ok(!def.system[2].text.includes('# Doing tasks'))
+    assert.equal(def.system[1].text, CRS_AGENT_EXPANSION)
+    assert.ok(!def.system[1].text.includes('# Doing tasks'))
 
     persistSettings(file, { persona_inject: 'zero', persona_agent: 'default' })
     const zeroDefault = applyFromSettings(file)
-    assert.equal(zeroDefault.system.length, 3)
+    assert.equal(zeroDefault.system.length, 4)
     assert.match(zeroDefault.system[0].text, /prompt_version=</)
     assert.equal(zeroDefault.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
     assert.equal(zeroDefault.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
 
     persistSettings(file, { persona_inject: 'zero', persona_agent: 'rewrite' })
     const full = applyFromSettings(file)
-    assert.equal(full.system.length, 3)
+    assert.equal(full.system.length, 4)
     assert.ok(!full.system.some((b) => b?.text === CRS_OFFICIAL_AGENT_PROMPT))
 
     persistSettings(file, { persona_inject: 'zero', persona_agent: 'minimal' })
     const min = applyFromSettings(file)
-    assert.equal(min.system.length, 3)
+    assert.equal(min.system.length, 4)
     assert.ok(!min.system.some((b) => b?.text === CRS_AGENT_PROMPT_MINIMAL))
 
     persistSettings(file, { persona_inject: 'zero', persona_agent: 'required' })
     const req = applyFromSettings(file)
-    assert.equal(req.system.length, 3)
+    assert.equal(req.system.length, 4)
     assert.ok(!req.system.some((b) => b?.text === CRS_AGENT_PROMPT_REQUIRED))
   })
 })
@@ -213,7 +215,7 @@ test('persona_expansion never drops agent+env; official_tools restores 4 blocks'
     persistSettings(file, { persona_expansion: 'official_tools' })
     const four = applyFromSettings(file)
     assert.equal(four.system.length, 4)
-    assert.equal(four.system[2].text, CRS_AGENT_EXPANSION)
+    assert.equal(four.system[1].text, CRS_AGENT_EXPANSION)
   })
 })
 
@@ -273,25 +275,28 @@ test('zero agent aliases match settings radio values', () => {
 
 test('official_prompt attaches caller agent and keeps leftover overlay', () => {
   withRouting((file) => {
-    persistSettings(file, { persona_inject: 'official_prompt', persona_park: true })
+    persistSettings(file, {
+      persona_inject: 'official_prompt',
+      persona_park: true,
+      agent_standing_presets: { official: true },
+    })
     const withAgent = applyFromSettings(file, {
       ...UNOFFICIAL,
       system: [{ type: 'text', text: CRS_OFFICIAL_AGENT_PROMPT }],
     })
-    assert.equal(withAgent.system.length, 3)
-    assert.equal(withAgent.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
-    assert.deepEqual(withAgent.system[2].cache_control, { type: 'ephemeral', ttl: '1h', scope: 'global' })
-    assert.equal(envTextAt(withAgent), '')
+    assert.equal(withAgent.system.length, 4)
+    assert.equal(withAgent.system[2].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
+    assert.deepEqual(withAgent.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+    assert.match(envTextAt(withAgent), /^# Environment\n - Timezone: /)
 
     const withLeftover = applyFromSettings(file, {
       ...UNOFFICIAL,
       system: '你是一个高速收费员。',
     })
-    assert.equal(withLeftover.system.length, 2)
+    assert.equal(withLeftover.system.length, 5)
     assert.ok(!withLeftover.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
-    assert.ok(!withLeftover.system.some((b) => b?.text === '你是一个高速收费员。'))
-    assert.equal(withLeftover.messages[1].role, 'system')
-    assert.equal(withLeftover.messages[1].content, wrapMandatoryConstraint('你是一个高速收费员。'))
-    assert.equal(envTextAt(withLeftover), '')
+    assert.equal(withLeftover.system[4].text, '你是一个高速收费员。')
+    assert.ok(!withLeftover.messages.some((message) => message.role === 'system'))
+    assert.match(envTextAt(withLeftover), /^# Environment/)
   })
 })

@@ -3,20 +3,19 @@
  * and optionally disable Nagle so Claude Code subagent tokens are not delayed.
  */
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
+import { CORS_ALLOW_HEADERS, corsHeadersForRequest } from './cors.mjs'
 
-export const CORS_ALLOW_HEADERS =
-  'authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-kin-rewrite, x-panel-token, x-request-id, x-kin-debug, x-kin-log, x-kin-vm, x-kin-backend'
+export { CORS_ALLOW_HEADERS } from './cors.mjs'
 
-export function corsHeaders(extra = {}) {
-  return {
-    'access-control-allow-origin': '*',
-    'access-control-allow-headers': CORS_ALLOW_HEADERS,
-    'access-control-allow-methods': 'GET,POST,OPTIONS,PUT,DELETE,PATCH',
-    ...extra,
-  }
+export function corsHeaders(extra = {}, req = null) {
+  return corsHeadersForRequest(req, extra)
 }
 
-export function readBody(req, maxBytes) {
+function requestFromResponse(res) {
+  return res?.req || res?._kinReq || null
+}
+
+function collectBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
@@ -49,21 +48,7 @@ export function readBody(req, maxBytes) {
     req.on('end', () => {
       if (settled) return
       settled = true
-      const raw = Buffer.concat(chunks).toString('utf8')
-      if (!raw) return resolve({})
-      try {
-        resolve(JSON.parse(raw))
-      } catch (e) {
-        reject(
-          makeError({
-            type: ErrorType.INVALID_REQUEST,
-            code: ErrorCode.INVALID_JSON,
-            message: 'Request body is not valid JSON: ' + (e.message || 'parse error'),
-            status: 400,
-            details: { parse_error: String(e.message || e) },
-          }),
-        )
-      }
+      resolve(Buffer.concat(chunks))
     })
     req.on('error', (e) =>
       fail(
@@ -76,6 +61,49 @@ export function readBody(req, maxBytes) {
       ),
     )
   })
+}
+
+export function readBody(req, maxBytes) {
+  return collectBody(req, maxBytes).then((buf) => {
+    const raw = buf.toString('utf8')
+    if (!raw) return {}
+    try {
+      return JSON.parse(raw)
+    } catch (e) {
+      throw makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: ErrorCode.INVALID_JSON,
+        message: 'Request body is not valid JSON: ' + (e.message || 'parse error'),
+        status: 400,
+        details: { parse_error: String(e.message || e) },
+      })
+    }
+  })
+}
+
+/**
+ * Node 的 WHATWG URL 会拒绝未加括号的 IPv6、非 ASCII Host、空 Host。
+ * 安装探活打的是 127.0.0.1，浏览器若用这类 Host 打开 /cc，旧代码在进路由前就 500。
+ * Host 解析失败时仍用路径路由；路径本身非法才返回 null。
+ */
+export function parseRequestUrl(req) {
+  const raw = req?.url || '/'
+  const host = String(req?.headers?.host || '').trim()
+  const bases = []
+  if (host) bases.push(`http://${host}`)
+  bases.push('http://127.0.0.1')
+  for (const base of bases) {
+    try {
+      return new URL(raw, base)
+    } catch {
+      // try the next base
+    }
+  }
+  return null
+}
+
+export function readRawBody(req, maxBytes) {
+  return collectBody(req, maxBytes)
 }
 
 export function applySseSocketTuning(res, { tcpNodelay = true } = {}) {
@@ -99,17 +127,18 @@ export function createRespond(cfg, options = {}) {
 
   function json(res, status, body) {
     const data = JSON.stringify(body)
-    const headers = corsHeaders({
+    const headers = corsHeadersForRequest(requestFromResponse(res), {
       'content-type': 'application/json; charset=utf-8',
       'x-kin-rewrite': cfg.rewrite.enabled ? 'on' : 'off',
     })
     if (res._kinRequestId) headers['x-request-id'] = res._kinRequestId
+    if (body?.error?.details?.retryable === false) headers['x-should-retry'] = 'false'
     res.writeHead(status, headers)
     res.end(data)
   }
 
   function writeSSEHeaders(res) {
-    const headers = corsHeaders({
+    const headers = corsHeadersForRequest(requestFromResponse(res), {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
@@ -121,5 +150,5 @@ export function createRespond(cfg, options = {}) {
     applySseSocketTuning(res, { tcpNodelay: resolveNodelay() })
   }
 
-  return { json, writeSSEHeaders, readBody, corsHeaders }
+  return { json, writeSSEHeaders, readBody, readRawBody, corsHeaders }
 }

@@ -6,7 +6,7 @@ const COOKIE = 'kin_panel_token'
 export { LS_TOKEN, LS_USER, LS_BASE, COOKIE }
 
 export function sameOriginPanel(host = location.hostname): boolean {
-  return /^(ccmax20\.cc|www\.ccmax20\.cc|kin\.fkcodex\.com)$/i.test(host || '')
+  return /^kin\.fkcodex\.com$/i.test(host || '')
 }
 
 export function apiBase(): string {
@@ -14,9 +14,7 @@ export function apiBase(): string {
   if (sameOriginPanel(host)) return ''
   const saved = (localStorage.getItem(LS_BASE) || '').replace(/\/$/, '')
   if (saved) return saved
-  if (/vercel\.app$|netlify\.app$|github\.io$|grok\.me$/i.test(host)) {
-    return 'https://ccmax20.cc'
-  }
+  // No saved base: talk to the backend that served this page.
   return ''
 }
 
@@ -38,14 +36,33 @@ export function sessionToken(): string {
 }
 
 export function hasSession(): boolean {
-  return Boolean(sessionToken() || storedUser())
+  return Boolean(sessionToken())
+}
+
+type PanelSessionExpiredListener = () => void
+const panelSessionExpiredListeners = new Set<PanelSessionExpiredListener>()
+let panelSessionExpiredHandled = false
+
+/** Register UI handler: toast + redirect after panel 401 (see panelFetch). */
+export function onPanelSessionExpired(listener: PanelSessionExpiredListener) {
+  panelSessionExpiredListeners.add(listener)
+  return () => panelSessionExpiredListeners.delete(listener)
+}
+
+export function expirePanelSession() {
+  if (panelSessionExpiredHandled) return
+  panelSessionExpiredHandled = true
+  clearSession()
+  for (const listener of panelSessionExpiredListeners) listener()
 }
 
 export function setSession(token: string, user?: string) {
   clearClientCookie(COOKIE)
   clearClientCookie('kin_console_token')
-  if (token && apiBase()) localStorage.setItem(LS_TOKEN, token)
-  else localStorage.removeItem(LS_TOKEN)
+  if (token) {
+    panelSessionExpiredHandled = false
+    localStorage.setItem(LS_TOKEN, token)
+  } else localStorage.removeItem(LS_TOKEN)
   if (user) localStorage.setItem(LS_USER, user)
 }
 

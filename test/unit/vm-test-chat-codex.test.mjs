@@ -37,6 +37,12 @@ function seedCodexVm(root, id = 'vm-codex-01') {
   )
 }
 
+function seedRouting(root) {
+  const configDir = path.join(root, 'src', 'config')
+  fs.mkdirSync(configDir, { recursive: true })
+  fs.writeFileSync(path.join(configDir, 'routing.json'), JSON.stringify({}))
+}
+
 async function startLoopbackServer(t, respond) {
   const calls = []
   const server = http.createServer(async (req, res) => {
@@ -79,6 +85,7 @@ test('runVmTestChat Codex slot loopbacks /v1/responses and never /v1/messages', 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-codex-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
+  seedRouting(root)
 
   const { baseUrl, calls } = await startLoopbackServer(t, () => ({
     status: 200,
@@ -131,6 +138,7 @@ test('runVmTestChat Codex slot refreshes OAuth after wrapped 401', async (t) => 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-codex-401-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
+  seedRouting(root)
   let hits = 0
   const { baseUrl, calls } = await startLoopbackServer(t, () => {
     hits += 1
@@ -188,6 +196,7 @@ test('runVmTestChat Codex slot rejects Claude models', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-codex-reject-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
+  seedRouting(root)
   const result = await runVmTestChat({
     projectRoot: root,
     vmId: 'vm-codex-01',
@@ -235,6 +244,7 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
     projectRoot: root,
     vmId: 'vm-codex-01',
     refresh: true,
+    catalogClientVersion: '0.158.0',
     fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({}) }),
   })
   assert.equal(denied.source, 'policy')
@@ -250,6 +260,7 @@ test('syncCodexCatalog refreshes OAuth on 401 then merges GPT ids', async (t) =>
     projectRoot: root,
     vmId: 'vm-codex-01',
     rotate: true,
+    catalogClientVersion: '0.158.0',
     fetchImpl: async (url) => {
       const href = String(url)
       if (href.includes('/oauth/token')) {
@@ -282,6 +293,7 @@ test('runVmTestChat Codex ENOENT is not rewritten as wrap cli-hop', async (t) =>
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-codex-enoent-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
+  seedRouting(root)
   const model = listTestableModels('openai')[0]?.id || 'gpt-5.5'
   const { baseUrl } = await startLoopbackServer(t, () => ({
     status: 503,

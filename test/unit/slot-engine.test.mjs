@@ -5,19 +5,44 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   assertCliHopAllowed,
+  KERNEL_NATIVE_SLOT_COUNT,
   normalizeInferenceConfig,
+  normalizeKernelDataplane,
+  normalizeSessionSlots,
   parseSlotEnginePolicyPatch,
   parseSlotPolicyTargets,
   personaModeFromPreset,
   resolveCliSystemLayout,
   resolveInferenceEngine,
+  resolveKernelDataplane,
   resolveOfficialCcInference,
+  resolveSessionSlots,
   resolveSlotPersonaPreset,
   slotPersonaModeOverride,
   validateInferenceRoutingPatch,
 } from '../../src/lib/vm/slot-engine.mjs'
 
 import { persistSlotEnginePolicy, persistSlotEnginePolicyMany, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
+
+test('session slots default to native capacity and clamp persisted values', () => {
+  assert.equal(KERNEL_NATIVE_SLOT_COUNT, 20)
+  assert.equal(normalizeSessionSlots(undefined), 20)
+  assert.equal(normalizeSessionSlots(0), 1)
+  assert.equal(normalizeSessionSlots(99), 20)
+  assert.equal(resolveSessionSlots({ policy: { sessionSlots: 4 } }, { inference: { session_slots: 8 } }), 4)
+  assert.equal(resolveSessionSlots({}, { inference: { session_slots: 8 } }), 8)
+  assert.equal(normalizeInferenceConfig({}).session_slots, 20)
+})
+
+test('routing patch rejects session slots outside the native range', () => {
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { session_slots: 0 } }), [
+    'inference.session_slots 必须是 1–20 的整数',
+  ])
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { session_slots: 21 } }), [
+    'inference.session_slots 必须是 1–20 的整数',
+  ])
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { session_slots: 8 } }), [])
+})
 
 function makeRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-engine-'))
@@ -46,10 +71,32 @@ test('vm engine overrides routing, empty inherits rust', () => {
   assert.equal(resolveInferenceEngine({ inference_engine: 'rust' }, { inference: { engine: 'go' } }), 'rust')
 })
 
-test('resolveCliSystemLayout is zero unless persona_inject is set', () => {
-  assert.equal(resolveCliSystemLayout({}, {}), 'zero')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'zero')
+test('kernel dataplane defaults wrap and accepts cc and crag', () => {
+  assert.equal(resolveKernelDataplane({}, {}), 'wrap')
+  assert.equal(resolveKernelDataplane({}, { inference: { dataplane: 'crag' } }), 'crag')
+  assert.equal(resolveKernelDataplane({}, { inference: { dataplane: 'cc-node' } }), 'cc')
+  assert.equal(resolveKernelDataplane({ dataplane: 'wrap' }, { inference: { dataplane: 'crag' } }), 'wrap')
+  assert.equal(normalizeKernelDataplane('cli-node'), 'wrap')
+  assert.equal(normalizeKernelDataplane('cc'), 'cc')
+  assert.equal(normalizeKernelDataplane('official-cli'), 'crag')
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { dataplane: 'nope' } }), [
+    'inference.dataplane 必须是 wrap、cc 或 crag',
+  ])
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { dataplane: 'cc' } }), [])
+  const patch = parseSlotEnginePolicyPatch({ dataplane: 'cc' })
+  assert.equal(patch.ok, true)
+  assert.equal(patch.patch.dataplane, 'cc')
+  const cragPatch = parseSlotEnginePolicyPatch({ dataplane: 'crag' })
+  assert.equal(cragPatch.ok, true)
+  assert.equal(cragPatch.patch.dataplane, 'crag')
+})
+
+test('resolveCliSystemLayout follows persona_preset, not leftover inject-only', () => {
+  assert.equal(resolveCliSystemLayout({}, {}), 'identity')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'identity')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official' } }), 'identity')
   assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_inject: 'rewrite' } }), 'identity')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'zero' } }), 'zero')
   assert.equal(
     resolveCliSystemLayout({ persona_preset: 'zero' }, { compatibility: { persona_inject: 'rewrite' } }),
     'zero',

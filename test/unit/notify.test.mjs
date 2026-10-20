@@ -4,11 +4,16 @@ import {
   normalizeNotifyConfig,
   mergeNotifyConfig,
   publicNotifyConfig,
+  publicRoutingNotify,
   summarizePoolAvailability,
   detectPoolNotifyEvents,
+  DEFAULT_NOTIFY,
   formatNotifyMessage,
   notifyChannelsReady,
   sendTelegramNotify,
+  sendWecomNotify,
+  wecomWebhookUrl,
+  dispatchNotify,
   sendNotifyTest,
   createNotifyMonitor,
   SECRET_KEEP,
@@ -51,6 +56,22 @@ test('merge keeps secrets when the panel sends empty or mask', () => {
   assert.equal(pub.email.pass_set, true)
   assert.equal(pub.telegram.bot_token, '')
   assert.equal(pub.telegram.bot_token_set, true)
+})
+
+test('publicRoutingNotify redacts notify secrets and keeps routing fields', () => {
+  const pub = publicRoutingNotify({
+    concurrency: 4,
+    notify: {
+      enabled: true,
+      email: { enabled: true, host: 'smtp.example', to: 'a@x.com', pass: 'old-pass' },
+      telegram: { enabled: true, bot_token: '123:secret', chat_id: '9' },
+    },
+  })
+  assert.equal(pub.concurrency, 4)
+  assert.equal(pub.notify.email.pass, '')
+  assert.equal(pub.notify.email.pass_set, true)
+  assert.equal(pub.notify.telegram.bot_token, '')
+  assert.equal(pub.notify.telegram.bot_token_set, true)
 })
 
 test('summarize matches overview usable口径', () => {
@@ -184,7 +205,12 @@ test('format message stays Chinese and includes console url', () => {
     ],
     now,
   )
-  const msg = formatNotifyMessage({ type: 'pool_empty', title: '账号池无可用账号' }, snap)
+  const msg = formatNotifyMessage(
+    { type: 'pool_empty', title: '账号池无可用账号' },
+    snap,
+    DEFAULT_NOTIFY,
+    'http://127.0.0.1:8787',
+  )
   assert.match(msg.text, /账号池无可用账号/)
   assert.match(msg.text, /凭证 3 · 可用 0/)
   assert.match(msg.text, /不可用 3/)
@@ -196,7 +222,15 @@ test('format message stays Chinese and includes console url', () => {
   assert.match(msg.text, /vm-04 d@x 无效凭证/)
   assert.doesNotMatch(msg.text, /vm-03 c@x/)
   assert.doesNotMatch(msg.text, /^不可用$/m)
-  assert.match(msg.text, /ccmax20\.cc\/#\/cluster/)
+  assert.match(msg.text, /http:\/\/127\.0\.0\.1:8787\/#\/cluster/)
+  const custom = formatNotifyMessage(
+    { type: 'pool_empty' },
+    snap,
+    normalizeNotifyConfig({ console_url: 'https://panel.example/' }),
+    'http://127.0.0.1:8787',
+  )
+  assert.match(custom.text, /https:\/\/panel\.example\/#\/cluster/)
+  assert.doesNotMatch(formatNotifyMessage({ type: 'pool_empty' }, snap).text, /#\/cluster/)
   assert.match(msg.subject, /KIN/)
 })
 
@@ -320,4 +354,82 @@ test('test helper routes to the asked channel', async () => {
     snapshot: summarizePoolAvailability([]),
   })
   assert.equal(out.channel, 'telegram')
+})
+
+test('wecom webhook is redacted, merged and accepts a bare key', async () => {
+  const url = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abcd1234-ef56-7890'
+  const prev = normalizeNotifyConfig({ wecom: { enabled: true, webhook: url } })
+  const merged = mergeNotifyConfig(prev, { wecom: { enabled: true, webhook: '', mention_all: true } })
+  assert.equal(merged.wecom.webhook, url)
+  assert.equal(merged.wecom.mention_all, true)
+  const pub = publicNotifyConfig(merged)
+  assert.equal(pub.wecom.webhook, '')
+  assert.equal(pub.wecom.webhook_set, true)
+  assert.equal(notifyChannelsReady(merged).wecom, true)
+  assert.equal(wecomWebhookUrl('abcd1234-ef56-7890'), url)
+  assert.equal(wecomWebhookUrl('http://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x'), '')
+  assert.equal(wecomWebhookUrl('not a url'), '')
+  assert.equal(
+    notifyChannelsReady(normalizeNotifyConfig({ wecom: { enabled: true, webhook: 'bad url' } })).wecom,
+    false,
+  )
+})
+
+test('wecom send posts a text message and never echoes the key', async () => {
+  const cfg = normalizeNotifyConfig({ wecom: { enabled: true, webhook: 'secret-key-123456', mention_all: true } })
+  let called = null
+  const out = await sendWecomNotify(
+    cfg,
+    { text: '你'.repeat(1000) },
+    {
+      fetch: async (u, init) => {
+        called = { url: u, init }
+        return { ok: true, status: 200, text: async () => '{"errcode":0,"errmsg":"ok"}' }
+      },
+    },
+  )
+  assert.equal(out.ok, true)
+  assert.equal(out.channel, 'wecom')
+  assert.match(called.url, /qyapi\.weixin\.qq\.com\/cgi-bin\/webhook\/send\?key=secret-key-123456/)
+  const body = JSON.parse(called.init.body)
+  assert.equal(body.msgtype, 'text')
+  assert.deepEqual(body.text.mentioned_list, ['@all'])
+  assert.ok(Buffer.byteLength(body.text.content) <= 2048)
+  assert.match(body.text.content, /…$/)
+
+  await assert.rejects(
+    () =>
+      sendWecomNotify(
+        cfg,
+        { text: 'x' },
+        {
+          fetch: async () => ({
+            ok: true,
+            status: 200,
+            text: async () => '{"errcode":93000,"errmsg":"invalid webhook url, key=secret-key-123456"}',
+          }),
+        },
+      ),
+    (err) => {
+      assert.match(String(err.message), /wecom_93000/)
+      assert.doesNotMatch(String(err.message), /secret-key-123456/)
+      return true
+    },
+  )
+})
+
+test('dispatch includes wecom and the test helper routes to it', async () => {
+  const cfg = normalizeNotifyConfig({ wecom: { enabled: true, webhook: 'secret-key-123456' } })
+  const fetch = async () => ({ ok: true, status: 200, text: async () => '{"errcode":0}' })
+  const all = await dispatchNotify(cfg, { text: 'hi' }, { fetch })
+  assert.equal(all.ok, true)
+  assert.deepEqual(
+    all.results.map((r) => r.channel),
+    ['wecom'],
+  )
+  const out = await sendNotifyTest(normalizeNotifyConfig({ wecom: { webhook: 'secret-key-123456' } }), 'wecom', {
+    fetch,
+    snapshot: summarizePoolAvailability([]),
+  })
+  assert.equal(out.channel, 'wecom')
 })

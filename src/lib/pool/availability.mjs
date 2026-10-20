@@ -7,9 +7,11 @@ import {
   effectiveRateWindow,
   headerHardBlocked,
   headerWindowOrEmpty,
+  parseResetMs,
   WINDOW_5H_MS,
   WINDOW_7D_MS,
 } from './quota-window.mjs'
+import { GATE_DRAINING, GATE_GATED, gateZone, quotaGateOf } from './quota-gate.mjs'
 import { DEFAULT_TIER_POLICIES } from './quota-tiers.mjs'
 import { isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
 import { expiresAtToMs } from '../oauth/oauth-credentials.mjs'
@@ -25,8 +27,9 @@ export const INVALID_CREDENTIAL_TEXT = '无效凭证'
 export const AUTH_COOLDOWN_TEXT = '鉴权冷却'
 export const REVOKE_TEXT = 'revoke'
 /** Dead grant only. Do not match stale-access 401 (`authentication_failed_after_refresh`) or `/usage` 429. */
+export const TRANSIENT_CREDENTIAL_REFRESH_FAIL = /worker_output_invalid|refresh_rejected|refresh_denied/i
 export const CREDENTIAL_REFRESH_FAIL =
-  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed/i
+  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied/i
 
 function liveAccessTtlMs(vm = {}, workerCredential = {}, expiresAt = null) {
   return (
@@ -62,7 +65,11 @@ export function isCredentialRefreshFailed({
 } = {}) {
   if (isOfficialUsageRateLimited(probe)) return false
   const recordedError = currentRefreshError(vm, refreshError)
-  const accessLive = isLiveRefreshedAccess({ vm, expiresAt, workerCredential, now }) && !recordedError
+  const transientRecorded = TRANSIENT_CREDENTIAL_REFRESH_FAIL.test(String(recordedError || ''))
+  // A transient refresh write failure must not eject a ticket that is still
+  // live. Once the access expires, the same error becomes admission-fatal.
+  const accessLive =
+    isLiveRefreshedAccess({ vm, expiresAt, workerCredential, now }) && !(recordedError && !transientRecorded)
   const staleProbe = probeOlderThanRefresh(
     {
       last_probe: probe,
@@ -70,7 +77,8 @@ export function isCredentialRefreshFailed({
     },
     { last_probe: probe },
   )
-  const bits = [scheduleDisabledReason, vm.schedule_disabled_reason, recordedError]
+  const bits = [scheduleDisabledReason, vm.schedule_disabled_reason]
+  if (!(accessLive && transientRecorded)) bits.push(recordedError)
   // Leftover worker last_error must not keep a freshly rotated ticket out of the pool.
   if (!accessLive) bits.push(workerLastError)
   if (!staleProbe && !(accessLive && isUsageRefreshSuccess(probe))) {
@@ -136,18 +144,50 @@ function quotaWindows(quota = {}, account = {}) {
   }
 }
 
+/** Effective 5h/7d windows and utilization ratios, the one reading admission and the seat budget share. */
+function usageWindows(quota = {}, account = {}, now = Date.now()) {
+  const q = quotaWindows(quota, account)
+  const lastUsedAt = account.last_used_at || quota.last_used_at || q.last_used_at || null
+  const w5 = effectiveRateWindow(
+    {
+      utilization: q.utilization_5h,
+      status: q.status_5h,
+      reset: q.reset_5h,
+    },
+    { lastUsedAt, source: 'headers', durationMs: WINDOW_5H_MS, now },
+  )
+  const w7 = effectiveRateWindow(
+    {
+      utilization: q.utilization_7d,
+      status: q.status_7d,
+      reset: q.reset_7d,
+    },
+    { lastUsedAt, source: 'headers', durationMs: WINDOW_7D_MS, now },
+  )
+  return { q, w5, w7, u5: utilRatio(w5.utilization), u7: utilRatio(w7.utilization) }
+}
+
+/**
+ * Seat budget headroom: min(limit_5h − u5, limit_7d − u7) with the same
+ * windows and safety lines evaluateAccount admits against.
+ */
+export function budgetHeadroom({ account = {}, quota = {}, policy = null, now = Date.now() } = {}) {
+  const pol = policyOf({ policy })
+  const { u5, u7 } = usageWindows(quota || {}, account || {}, now)
+  return Math.min(pol.limit_5h - u5, pol.limit_7d - u7)
+}
+
 function policyOf(input = {}) {
   const p = input.policy || {}
   const fallback = DEFAULT_TIER_POLICIES.default
   return {
     limit_5h: Number(p.limit_5h ?? p.safety_ratio ?? fallback.limit_5h),
     limit_7d: Number(p.limit_7d ?? p.weekly_safety_ratio ?? fallback.limit_7d),
-    max_sessions: Number(p.max_sessions ?? 0),
-    session_idle_min: Number(p.session_idle_min ?? 5),
+    gate: quotaGateOf(p),
   }
 }
 
-function finish(base, { key, text, accept, usable, reason = null, window = null, sessions = null } = {}) {
+function finish(base, { key, text, accept, usable, reason = null, window = null, until = null } = {}) {
   return {
     ...base,
     key,
@@ -156,8 +196,18 @@ function finish(base, { key, text, accept, usable, reason = null, window = null,
     usable,
     reason,
     window,
-    sessions,
+    until,
   }
+}
+
+function resetUntilMs(reset, now = Date.now()) {
+  const ms = parseResetMs(reset)
+  return Number.isFinite(ms) && ms > now ? ms : null
+}
+
+function quotaUntilMs(quota = {}, window = '5h', now = Date.now()) {
+  if (window === '7d') return resetUntilMs(quota.reset_7d, now)
+  return resetUntilMs(quota.reset_5h, now)
 }
 
 /**
@@ -182,8 +232,7 @@ export function evaluateAccount({
   workerCredential = null,
   quota = {},
   policy = null,
-  sessionKey = null,
-  sessionLimit = null,
+  hardBlock = null,
   cooldownUntil = null,
   cooldownReason = null,
   now = Date.now(),
@@ -194,8 +243,9 @@ export function evaluateAccount({
   const claude = vm.claude || {}
   const token = hasToken ?? !!(vm.has_token || claude.has_access)
   const refresh = hasRefresh ?? !!(vm.has_refresh || claude.has_refresh)
-  const inPool = (schedulable ?? vm.schedulable) !== false
   const disabledReason = scheduleDisabledReason ?? vm.schedule_disabled_reason ?? null
+  const leftoverQuotaOff = isLeftoverQuotaScheduleOff(vm, disabledReason)
+  const inPool = leftoverQuotaOff || (schedulable ?? vm.schedulable) !== false
   const extras = { lastProbe, last_probe: lastProbe, probeSource, probe_source: probeSource }
   const probe = probeOf(account, quota, extras)
   const source = sourceOf(probe, account, quota, extras)
@@ -271,6 +321,19 @@ export function evaluateAccount({
     )
   }
 
+  // sub2api IsSchedulable: live rate_limit_reset_at / overload_until win over passive Extra.
+  if (hardBlock?.until > now) {
+    const overloaded = hardBlock.reason === 'overloaded'
+    return finish(base, {
+      key: overloaded ? 'cool' : 'quota',
+      text: overloaded ? '过载冷却' : '限流中',
+      accept: false,
+      usable: true,
+      reason: hardBlock.reason,
+      until: hardBlock.until,
+    })
+  }
+
   if (headerHardBlocked(account.unified || {}, '5h', now) || headerHardBlocked(quota, '5h', now)) {
     return finish(base, {
       key: 'quota',
@@ -279,6 +342,7 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_5h_header',
       window: '5h',
+      until: quotaUntilMs({ ...quota, reset_5h: quota.reset_5h || account.unified?.headers?.['5h']?.reset }, '5h', now),
     })
   }
   if (headerHardBlocked(account.unified || {}, '7d', now) || headerHardBlocked(quota, '7d', now)) {
@@ -289,29 +353,11 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_7d_header',
       window: '7d',
+      until: quotaUntilMs({ ...quota, reset_7d: quota.reset_7d || account.unified?.headers?.['7d']?.reset }, '7d', now),
     })
   }
 
-  const q = quotaWindows(quota, account)
-  const lastUsedAt = account.last_used_at || quota.last_used_at || q.last_used_at || null
-  const w5 = effectiveRateWindow(
-    {
-      utilization: q.utilization_5h,
-      status: q.status_5h,
-      reset: q.reset_5h,
-    },
-    { lastUsedAt, source: 'headers', durationMs: WINDOW_5H_MS, now },
-  )
-  const w7 = effectiveRateWindow(
-    {
-      utilization: q.utilization_7d,
-      status: q.status_7d,
-      reset: q.reset_7d,
-    },
-    { lastUsedAt, source: 'headers', durationMs: WINDOW_7D_MS, now },
-  )
-  const u5 = utilRatio(w5.utilization)
-  const u7 = utilRatio(w7.utilization)
+  const { q, u5, u7, w5, w7 } = usageWindows(quota, account, now)
 
   if (u5 >= 1) {
     return finish(base, {
@@ -321,6 +367,7 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_5h_header',
       window: '5h',
+      until: resetUntilMs(w5.reset, now),
     })
   }
   if (u7 >= 1) {
@@ -331,10 +378,13 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_7d_header',
       window: '7d',
+      until: resetUntilMs(w7.reset, now),
     })
   }
 
-  if (u5 >= pol.limit_5h) {
+  const z5 = gateZone(u5, pol.limit_5h, pol.gate)
+  const z7 = gateZone(u7, pol.limit_7d, pol.gate)
+  if (z5 === GATE_GATED) {
     return finish(base, {
       key: 'quota',
       text: '5h 限制',
@@ -342,9 +392,10 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_5h_safety',
       window: '5h',
+      until: resetUntilMs(w5.reset, now),
     })
   }
-  if (u7 >= pol.limit_7d) {
+  if (z7 === GATE_GATED) {
     return finish(base, {
       key: 'quota',
       text: '7d 限制',
@@ -352,6 +403,7 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_7d_safety',
       window: '7d',
+      until: resetUntilMs(w7.reset, now),
     })
   }
 
@@ -364,31 +416,6 @@ export function evaluateAccount({
       usable: true,
       reason: 'weekly_split_regular',
     })
-  }
-
-  const accountId = account.account_id || account.accountId || vm.id || null
-  const maxSessions = Number(pol.max_sessions ?? account.max_sessions ?? 0)
-  const idleMin = Number(pol.session_idle_min ?? account.session_idle_min ?? 5)
-  let sessions = null
-  if (sessionLimit && typeof sessionLimit.snapshot === 'function') {
-    sessions = sessionLimit.snapshot(accountId, { max: maxSessions, idleMin, now })
-  }
-  if (maxSessions > 0 && sessionLimit) {
-    const gate =
-      typeof sessionLimit.canAccept === 'function'
-        ? sessionLimit.canAccept(accountId, sessionKey, { max: maxSessions, idleMin, now })
-        : { ok: !(sessions && sessions.active >= maxSessions) }
-    const atCap = sessions && sessions.active >= maxSessions && !sessionKey
-    if (!gate.ok || atCap) {
-      return finish(base, {
-        key: 'sessions',
-        text: '会话已满',
-        accept: false,
-        usable: true,
-        reason: 'session_limit',
-        sessions: gate.detail || sessions,
-      })
-    }
   }
 
   const tempUntil = Number(claude.temp_unschedulable_until || vm.temp_unschedulable_until || 0)
@@ -428,8 +455,22 @@ export function evaluateAccount({
         accept: false,
         usable: true,
         reason: authCool ? 'auth_cooldown' : 'cooldown',
+        until: coolUntil,
       })
     }
+  }
+  // Near the gate: still admitted (one call at a time, no new seats while an open
+  // VM exists), but the console must not paint it as plain 可用.
+  const drainWindow = z5 === GATE_DRAINING ? '5h' : z7 === GATE_DRAINING ? '7d' : null
+  if (drainWindow) {
+    return finish(base, {
+      key: 'drain',
+      text: `${drainWindow} 临近闸线`,
+      accept: true,
+      usable: true,
+      reason: `gate_${drainWindow}_draining`,
+      window: drainWindow,
+    })
   }
 
   return finish(base, {
@@ -438,13 +479,70 @@ export function evaluateAccount({
     accept: true,
     usable: true,
     reason: null,
-    sessions,
   })
 }
 
-/** Extra 5h/7d reject reasons that auto-toggle 调度关. */
+/** Extra 5h/7d reject reasons that write restriction, not 调度关. */
 export function isQuotaWindowReason(reason) {
   return /^(quota_5h|quota_7d)/.test(String(reason || ''))
+}
+
+/** Account-scope quota / 429 parks stored on temp_unschedulable_* + runtime cooldown. */
+export function isAccountRestrictionReason(reason) {
+  return isQuotaWindowReason(reason) || /^(account_quota_exhausted|rate_limited)$/i.test(String(reason || ''))
+}
+
+/** Old Extra auto-off that is not an operator lock. */
+export function isLeftoverQuotaScheduleOff(vm = {}, scheduleDisabledReason = null) {
+  if (vm?.schedule_manual === true) return false
+  if (vm?.schedulable !== false) return false
+  return isQuotaWindowReason(scheduleDisabledReason ?? vm.schedule_disabled_reason)
+}
+
+/**
+ * Operator switch stays a boolean. Quota / cooldown / leftover Extra-off
+ * collapse to restricted so the panel never paints them as 调度关.
+ */
+export function resolveScheduleState({
+  schedulable,
+  scheduleManual,
+  scheduleDisabledReason,
+  availability = {},
+  restrictionUntil = null,
+  restrictionReason = null,
+  now = Date.now(),
+} = {}) {
+  const leftover = isLeftoverQuotaScheduleOff(
+    {
+      schedulable,
+      schedule_manual: scheduleManual,
+      schedule_disabled_reason: scheduleDisabledReason,
+    },
+    scheduleDisabledReason,
+  )
+  if (schedulable === false && !leftover) {
+    return { schedule_state: 'off', restriction_reason: null, restriction_until: null }
+  }
+  const until = Number(restrictionUntil) || Number(availability.until) || 0
+  const liveRestriction = until > now
+  // Rest is a scheduled shift, not a cooldown: stale cooldown fields must not mask it.
+  if (!liveRestriction && availability.key === 'rest') {
+    return {
+      schedule_state: 'restricted',
+      restriction_reason: availability.reason || 'rest_period',
+      restriction_until: Number(availability.until) || null,
+    }
+  }
+  const restricted = liveRestriction || availability.key === 'quota' || availability.key === 'cool'
+  if (restricted) {
+    return {
+      schedule_state: 'restricted',
+      restriction_reason:
+        restrictionReason || availability.reason || (leftover ? scheduleDisabledReason : null) || null,
+      restriction_until: liveRestriction ? until : availability.until || null,
+    }
+  }
+  return { schedule_state: 'on', restriction_reason: null, restriction_until: null }
 }
 
 /** True when 5h/7d is in 限制 and the account must not be scheduled or probed. */
@@ -480,9 +578,9 @@ export function credStatusFromAvailability(av = {}) {
   const tone =
     key === 'ok'
       ? 'ok'
-      : key === 'quota' || key === 'sessions' || key === 'warn'
+      : key === 'quota' || key === 'warn'
         ? 'warn'
-        : key === 'cool' || key === 'caution'
+        : key === 'cool' || key === 'caution' || key === 'drain' || key === 'rest'
           ? 'caution'
           : key === 'off'
             ? 'off'
@@ -501,12 +599,12 @@ export function credStatusFromAvailability(av = {}) {
             ? '5h 限制'
             : key === 'warn'
               ? '5h 警告'
-              : key === 'sessions'
-                ? '会话已满'
-                : key === 'cool'
-                  ? av.reason === 'auth_cooldown'
-                    ? AUTH_COOLDOWN_TEXT
-                    : '冷却中'
+              : key === 'cool'
+                ? av.reason === 'auth_cooldown'
+                  ? AUTH_COOLDOWN_TEXT
+                  : '冷却中'
+                : key === 'rest'
+                  ? '休息时段'
                   : av.reason === 'oauth_revoked'
                     ? REVOKE_TEXT
                     : INVALID_CREDENTIAL_TEXT)

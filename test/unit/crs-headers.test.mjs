@@ -111,7 +111,6 @@ test('official sonnet-5 keeps context-1m; others and unofficial drop it', () => 
   )
   assert.doesNotMatch(String(unofficial['anthropic-beta'] || ''), /context-1m-2025-08-07/)
   assert.match(String(unofficial['anthropic-beta'] || ''), /context-management-2025-06-27/)
-  assert.match(String(unofficial['anthropic-beta'] || ''), /effort-2025-11-24/)
   const unofficial1m = resolveCrsHeaders(
     {
       'user-agent': 'Go-http-client/2.0',
@@ -158,7 +157,6 @@ test('official empty beta uses sub2api DefaultBetaHeader; unofficial uses full m
   assert.match(String(official['anthropic-beta'] || ''), /oauth-2025-04-20/)
   assert.match(String(official['anthropic-beta'] || ''), /thinking-token-count-2026-05-13/)
   assert.match(String(official['anthropic-beta'] || ''), /mid-conversation-system-2026-04-07/)
-  assert.match(String(official['anthropic-beta'] || ''), /advanced-tool-use-2025-11-20/)
   assert.match(String(official['anthropic-beta'] || ''), /context-management-2025-06-27/)
   assert.doesNotMatch(String(official['anthropic-beta'] || ''), /fine-grained-tool-streaming/)
   assert.doesNotMatch(String(official['anthropic-beta'] || ''), /context-1m/)
@@ -176,7 +174,6 @@ test('official empty beta uses sub2api DefaultBetaHeader; unofficial uses full m
   assert.match(String(unofficial['anthropic-beta'] || ''), /claude-code-20250219/)
   assert.match(String(unofficial['anthropic-beta'] || ''), /thinking-token-count-2026-05-13/)
   assert.match(String(unofficial['anthropic-beta'] || ''), /mid-conversation-system-2026-04-07/)
-  assert.match(String(unofficial['anthropic-beta'] || ''), /advanced-tool-use-2025-11-20/)
   assert.match(String(unofficial['anthropic-beta'] || ''), /context-management-2025-06-27/)
   assert.doesNotMatch(String(unofficial['anthropic-beta'] || ''), /context-1m-2025-08-07/)
   assert.equal(unofficial['anthropic-dangerous-direct-browser-access'], 'true')
@@ -215,7 +212,6 @@ test('unofficial inbound two-token beta does not leak; UA is Claude Code', () =>
   assert.doesNotMatch(out['user-agent'], /Go-http-client/)
   assert.equal(out['x-stainless-os'], 'Linux')
   assert.equal(out['x-stainless-runtime-version'], 'v26.3.0')
-  assert.equal(out['x-stainless-package-version'], '0.112.1')
   assert.match(String(out['anthropic-beta'] || ''), /oauth-2025-04-20/)
   assert.match(String(out['anthropic-beta'] || ''), /context-management-2025-06-27/)
   const tokens = String(out['anthropic-beta'] || '')
@@ -347,6 +343,32 @@ test('unofficial Haiku uses short beta set without context-management', () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('gateway and wiggly Claude headers never reach outbound', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-drop-'))
+  const inbound = {
+    'user-agent': 'claude-cli/2.1.303 (external, cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
+    'x-stainless-lang': 'js',
+    'x-stainless-runtime': 'node',
+    'x-stainless-package-version': '0.128.0',
+    'x-claude-code-session-id': '3218348e-644b-49c0-a2d1-6d40d5eba9dc',
+    'x-claude-code-wiggly-dove': 'drop-me',
+    cc_gateway: 'drop-me',
+  }
+  const out = resolveCrsHeaders(
+    inbound,
+    dir,
+    { userAgent: 'claude-cli/2.1.296 (external, cli)', callerSessionId: 'slot-session' },
+    'claude-opus-5-5',
+  )
+  assert.equal(out['x-claude-code-wiggly-dove'], undefined)
+  assert.equal(out.cc_gateway, undefined)
+  assert.equal(out['x-claude-code-session-id'], 'slot-session')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('guest locale and amd64 arch map onto outbound /v1 headers', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-guest-'))
   const merged = mergeGuestFingerprint(
@@ -379,7 +401,6 @@ test('guest locale and amd64 arch map onto outbound /v1 headers', () => {
   assert.equal(out['x-stainless-arch'], 'x64')
   assert.equal(out['x-stainless-os'], 'Linux')
   assert.equal(out['x-stainless-runtime-version'], 'v26.3.0')
-  assert.equal(out['x-stainless-package-version'], '0.112.1')
   assert.equal(out['x-stainless-retry-count'], '0')
   assert.equal(out['x-stainless-timeout'], '600')
   assert.equal(out['accept-language'], 'en-US')

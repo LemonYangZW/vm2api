@@ -70,14 +70,42 @@ export function kindFromModel(
   return 'claude'
 }
 
+/** Account line on rack cards: credential presence is independent of the email. */
+export function slotCredentialLabel(
+  vm?: Pick<Vm, 'email' | 'has_token' | 'has_refresh'>,
+  compact = false
+): string {
+  const email = String(vm?.email || '').trim()
+  if (email) return compact ? email.split('@')[0] : email
+  return vm?.has_token || vm?.has_refresh ? '已导入账号 · 邮箱未知' : '空槽'
+}
+
 export function slotAccountLabel(
   vm?: Vm,
-  fallback?: { email?: string | null; vmId?: string | null }
+  fallback?: {
+    email?: string | null
+    vmId?: string | null
+    /** Shown when there is no VM at all, e.g. a request that never got an execution seat. */
+    emptyLabel?: string
+  }
 ): string {
   const email = String(vm?.email || fallback?.email || '').trim()
   if (email) return email
   const id = String(fallback?.vmId || vm?.id || '').trim()
-  return id || '未绑定账号'
+  return id || fallback?.emptyLabel || '未绑定账号'
+}
+
+/** `vm-01` without an email is unbound. A custom slot id is the name and stays visible. */
+export function slotNameLabel(vm?: {
+  id?: string | null
+  name?: string | null
+  email?: string | null
+}): string {
+  const name = String(vm?.name || vm?.id || '').trim()
+  const email = String(vm?.email || '').trim()
+  if (email || (name && !/^vm-\d+$/i.test(String(vm?.id || '').trim())))
+    return name || '未绑定账号'
+  return '未绑定账号'
 }
 
 /** 卡片 / 表格用：本地段优先，域名过长只留尾标。完整地址走 title。 */

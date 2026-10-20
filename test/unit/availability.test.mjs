@@ -6,8 +6,9 @@ import {
   isUsageRefreshSuccess,
   isQuotaLimitedAccount,
   isQuotaWindowReason,
+  isLeftoverQuotaScheduleOff,
+  resolveScheduleState,
 } from '../../src/lib/pool/availability.mjs'
-import { SessionLimitRegistry } from '../../src/lib/pool/session-limit.mjs'
 
 const usageOk = { ok: true, source: 'vm-oauth-usage', at: '2026-08-24T00:00:00.000Z' }
 const officialOk = { ok: true, source: 'official-cc-usage', at: '2026-08-24T00:00:00.000Z' }
@@ -169,6 +170,60 @@ test('credential refresh failure is 无效凭证 even if usage snapshot exists',
   assert.equal(av.reason, 'credential_refresh_failed')
 })
 
+test('expired access with worker_output_invalid is 无效凭证', () => {
+  const now = Date.now()
+  const av = evaluateAccount({
+    vm: {
+      has_token: true,
+      has_refresh: true,
+      expires_at: Math.floor((now - 6 * 3600_000) / 1000),
+      refresh_error: 'worker_output_invalid',
+    },
+    hasToken: true,
+    hasRefresh: true,
+    schedulable: true,
+    expiresAt: now - 6 * 3600_000,
+    workerCredential: {
+      has_access: true,
+      has_refresh: true,
+      needs_refresh: true,
+      expires_at: now - 6 * 3600_000,
+    },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.equal(av.key, 'bad')
+  assert.equal(av.text, '无效凭证')
+  assert.equal(av.reason, 'credential_refresh_failed')
+  assert.equal(av.accept, false)
+})
+
+test('live access is kept despite a transient refresh error', () => {
+  const now = Date.now()
+  const av = evaluateAccount({
+    vm: {
+      has_token: true,
+      has_refresh: true,
+      expires_at: Math.floor((now + 3600_000) / 1000),
+      refresh_error: 'worker_output_invalid',
+    },
+    hasToken: true,
+    hasRefresh: true,
+    schedulable: true,
+    expiresAt: now + 3600_000,
+    workerCredential: {
+      has_access: true,
+      has_refresh: true,
+      needs_refresh: false,
+      expires_at: now + 3600_000,
+    },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.notEqual(av.key, 'bad')
+  assert.equal(av.accept, true)
+})
+
 test('leftover invalid_grant after a live refresh does not block the pool', () => {
   const now = Date.now()
   const av = evaluateAccount({
@@ -228,6 +283,43 @@ test('调度关 plus fatal refresh is 无效凭证', () => {
   assert.equal(av.reason, 'credential_refresh_failed')
   assert.equal(av.accept, false)
   assert.equal(av.usable, false)
+})
+
+test('leftover quota-off is restricted, not 调度关', () => {
+  const reset = new Date(Date.now() + 3600_000).toISOString()
+  const av = evaluateAccount({
+    vm: { schedulable: false, schedule_disabled_reason: 'quota_5h_header' },
+    hasRefresh: true,
+    schedulable: false,
+    scheduleDisabledReason: 'quota_5h_header',
+    lastProbe: usageOk,
+    quota: { utilization_5h: 1, status_5h: 'rejected', reset_5h: reset },
+  })
+  assert.equal(av.key, 'quota')
+  assert.equal(av.in_pool, true)
+  assert.equal(av.accept, false)
+  assert.equal(isLeftoverQuotaScheduleOff({ schedulable: false, schedule_disabled_reason: 'quota_5h_header' }), true)
+  const triad = resolveScheduleState({
+    schedulable: true,
+    availability: av,
+    restrictionUntil: av.until,
+    restrictionReason: av.reason,
+  })
+  assert.equal(triad.schedule_state, 'restricted')
+  assert.equal(triad.restriction_reason, 'quota_5h_header')
+})
+
+test('schedule_manual leftover quota-off stays 调度关', () => {
+  const av = evaluateAccount({
+    vm: { schedulable: false, schedule_manual: true, schedule_disabled_reason: 'quota_5h_header' },
+    hasRefresh: true,
+    schedulable: false,
+    scheduleDisabledReason: 'quota_5h_header',
+    lastProbe: usageOk,
+    quota: { utilization_5h: 1, status_5h: 'rejected' },
+  })
+  assert.equal(av.key, 'off')
+  assert.equal(av.text, '调度关')
 })
 
 test('disabled slot is 调度关 not 不可用', () => {
@@ -452,34 +544,15 @@ test('availabilityFromQuotaRefresh still aliases evaluateAccount', () => {
   assert.equal(av.key, 'ok')
 })
 
-test('session cap refuses a new key and renews an existing one', () => {
-  const sessions = new SessionLimitRegistry()
-  sessions.touch('acc-1', 's1')
-  sessions.touch('acc-1', 's2')
-  const full = evaluateAccount({
-    hasRefresh: true,
+test('rest stays restricted even with a stale cooldown left on the slot', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const until = Date.parse('2026-09-17T20:00:00.000Z')
+  const triad = resolveScheduleState({
     schedulable: true,
-    lastProbe: usageOk,
-    account: { account_id: 'acc-1' },
-    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
-    policy: { limit_5h: 0.85, limit_7d: 0.8, max_sessions: 2, session_idle_min: 5 },
-    sessionKey: 's-new',
-    sessionLimit: sessions,
+    availability: { key: 'rest', reason: 'rest_period', until },
+    restrictionUntil: now - 60_000,
+    restrictionReason: 'rate_limited',
+    now,
   })
-  assert.equal(full.key, 'sessions')
-  assert.equal(full.text, '会话已满')
-  assert.equal(full.accept, false)
-
-  const renew = evaluateAccount({
-    hasRefresh: true,
-    schedulable: true,
-    lastProbe: usageOk,
-    account: { account_id: 'acc-1' },
-    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
-    policy: { limit_5h: 0.85, limit_7d: 0.8, max_sessions: 2, session_idle_min: 5 },
-    sessionKey: 's1',
-    sessionLimit: sessions,
-  })
-  assert.equal(renew.key, 'ok')
-  assert.equal(renew.accept, true)
+  assert.deepEqual(triad, { schedule_state: 'restricted', restriction_reason: 'rest_period', restriction_until: until })
 })

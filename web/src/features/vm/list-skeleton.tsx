@@ -1,25 +1,32 @@
 import { Skeleton } from '@/components/ui/skeleton'
-import { CardGridSkeleton } from '@/components/page-skeletons'
 
-/** 对应：4 张 StatCard → 视图/排序筹码 → 状态筹码 → 卡片网格。 */
+/** 对应：状态分区总览 → 工具行 → 一台机架（头部 + 一段刀片）。默认视图是机架·大。 */
 export function VmListSkeleton() {
   return (
     <div>
-      <CardGridSkeleton
-        cards={4}
-        className='mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4'
-      />
-      <div className='mb-3 flex flex-wrap gap-2'>
-        {Array.from({ length: 8 }).map((_, i) => (
-          <Skeleton key={`view-${i}`} className='h-8 w-16 rounded-md' />
-        ))}
+      <Skeleton className='mb-3 h-[92px] w-full rounded-xl' />
+      <div className='mb-4 flex flex-wrap items-center gap-2'>
+        <Skeleton className='h-8 w-16 rounded-md' />
+        <Skeleton className='h-8 w-16 rounded-md' />
+        <Skeleton className='h-8 w-64 rounded-md' />
+        <div className='ms-auto flex gap-2'>
+          <Skeleton className='h-8 w-28 rounded-md' />
+          <Skeleton className='h-8 w-24 rounded-md' />
+          <Skeleton className='h-8 w-20 rounded-md' />
+        </div>
       </div>
-      <div className='mb-4 flex flex-wrap gap-2'>
-        {Array.from({ length: 7 }).map((_, i) => (
-          <Skeleton key={`filter-${i}`} className='h-8 w-16 rounded-md' />
-        ))}
+      <div className='rounded-xl border'>
+        <div className='flex items-center gap-6 border-b px-4 py-3'>
+          <Skeleton className='h-9 w-40 rounded-md' />
+          <Skeleton className='h-3 flex-1 rounded-full' />
+          <Skeleton className='h-9 w-48 rounded-md' />
+        </div>
+        <div className='grid grid-cols-[repeat(auto-fill,minmax(min(100%,380px),1fr))] gap-2 p-3'>
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className='h-[268px] rounded-[10px]' />
+          ))}
+        </div>
       </div>
-      <CardGridSkeleton cards={6} />
     </div>
   )
 }

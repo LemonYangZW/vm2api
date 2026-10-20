@@ -1,31 +1,32 @@
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
+import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
+import { consumeClaudeSSEData } from '../protocol/convert.mjs'
+import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
+import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
+import { messagesUrl, normalizeProtocol, resolvePreset, responsesUrl, upstreamAuthHeaders } from './api-presets.mjs'
+import { claudeToOpenAIResponsesRequest } from './api-openai.mjs'
 import {
-  chatCompletionsUrl,
-  messagesUrl,
-  normalizeProtocol,
-  resolvePreset,
-  upstreamAuthHeaders,
-} from './api-presets.mjs'
-import {
-  applyOpenAIChatSSELine,
-  claudeSSEFromOpenAIDelta,
-  claudeToOpenAIChatRequest,
-  createOpenAIChatAssembler,
-  openAIAssemblerToClaude,
-} from './api-openai.mjs'
+  assembleCodexBodyFromSse,
+  codexBodyToAnthropicMessage,
+  createAnthropicSseState,
+  createChatSseState,
+  responsesSseToAnthropicEvents,
+  isToolArgumentsError,
+  responsesSseToChatChunk,
+} from '../protocol/codex-convert.mjs'
+import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 
 export function resolveInferenceBackend(req) {
-  if (req?.apiKeyKind === 'managed') {
-    return String(req.apiKeyRecord?.category || 'oauth').toLowerCase() === 'api' ? 'api' : 'oauth'
-  }
-  if (req?.apiKeyKind === 'master') {
-    return String(req.headers?.['x-kin-backend'] || '').toLowerCase() === 'api' ? 'api' : 'oauth'
-  }
-  return 'oauth'
+  if (req?.apiKeyKind !== 'managed') return 'oauth'
+  return String(req.apiKeyRecord?.category || '')
+    .trim()
+    .toLowerCase() === 'api'
+    ? 'api'
+    : 'oauth'
 }
 
-export { messagesUrl } from './api-presets.mjs'
+export { messagesUrl, responsesUrl } from './api-presets.mjs'
 
 function joinHeaderMap(headers = {}) {
   const out = {}
@@ -66,6 +67,7 @@ export async function runApiInference({
   personaHideTokens,
   cacheTtl,
   converters,
+  requestContext = null,
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
@@ -84,9 +86,25 @@ export async function runApiInference({
   const protocolKind = normalizeProtocol(picked.endpoint.protocol || preset.protocol, preset.kind)
   const extraHeaders = joinHeaderMap(picked.endpoint.headers)
   const isOpenAI = protocolKind === 'openai'
+  if (requestContext && (isOpenAI || picked.upstream_model !== canonical.model)) {
+    return {
+      ok: false,
+      status: 400,
+      terminalState: 'rejected',
+      body: {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          code: 'classifier_model_incompatible',
+          message: 'Classifier requests require the selected Anthropic model without endpoint model substitution.',
+        },
+      },
+    }
+  }
   const body = isOpenAI
-    ? { ...claudeToOpenAIChatRequest({ ...canonical, model: picked.upstream_model }), stream: true }
+    ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
     : { ...canonical, model: picked.upstream_model, stream: true }
+  if (requestContext) Object.assign(body, prepareClassifierBody(body))
   const headers = {
     'content-type': 'application/json',
     accept: 'text/event-stream',
@@ -100,7 +118,7 @@ export async function runApiInference({
   try {
     upstream = await forwardApi({
       cfg,
-      url: isOpenAI ? chatCompletionsUrl(preset.base_url) : messagesUrl(preset.base_url),
+      url: isOpenAI ? responsesUrl(preset.base_url) : messagesUrl(preset.base_url),
       headers,
       body,
       proxyUrl: picked.key.proxy_url,
@@ -149,16 +167,27 @@ export async function runApiInference({
   if (status >= 400) {
     const payload = await readApiJson(upstream).catch(() => ({}))
     const message = payload?.error?.message || payload?.message || `upstream ${status}`
+    const upstreamCode = String(payload?.error?.code || payload?.code || '').trim()
+    const contentCode = isContentPolicyErrorCode(upstreamCode) ? upstreamCode.toLowerCase() : ''
     return {
       ...resultBase,
       ok: false,
-      body: { type: 'error', error: { type: 'api_error', message: String(message).slice(0, 300) } },
+      body: {
+        type: 'error',
+        error: {
+          ...(requestContext ? payload?.error : {}),
+          ...(requestContext && payload?.error?.code ? { upstream_code: payload.error.code } : {}),
+          ...(!requestContext && contentCode ? { code: contentCode } : {}),
+          type: requestContext ? payload?.error?.type || 'api_error' : 'api_error',
+          message: String(message).slice(0, 300),
+        },
+      },
       terminalState: 'rejected',
     }
   }
 
   if (isOpenAI) {
-    return await runOpenAIUpstream({
+    return await runOpenAIResponsesUpstream({
       upstream,
       resultBase,
       protocol,
@@ -171,21 +200,121 @@ export async function runApiInference({
     })
   }
 
+  const classifierSseState = { dataBuf: '' }
+  let classifierError = null
+  let classifierStopped = false
+  const readUpstreamLines = async (onLine) => {
+    try {
+      await readLines(upstream, async (line) => {
+        if (requestContext) {
+          const event = consumeClaudeSSEData(line, classifierSseState)
+          if (event?.type === 'error')
+            classifierError = {
+              ...event,
+              error: { ...event.error, ...(event.error?.code ? { upstream_code: event.error.code } : {}) },
+            }
+          if (event?.type === 'message_stop') classifierStopped = true
+        }
+        await onLine(line)
+      })
+    } catch (error) {
+      if (!requestContext) throw error
+      classifierError = {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          code: 'upstream_stream_interrupted',
+          status: 502,
+          message: String(error.message || 'Classifier stream interrupted').slice(0, 300),
+        },
+      }
+    }
+  }
+  const classifierFailure = () => {
+    if (!requestContext || (!classifierError && classifierStopped)) return null
+    const body = classifierError || {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'upstream_stream_interrupted',
+        status: 502,
+        message: 'Classifier stream ended before message_stop',
+      },
+    }
+    const declared = Number(body.error?.status)
+    const status = declared >= 400 && declared < 600 ? declared : mapUpstreamError(200, body).status
+    return {
+      ...resultBase,
+      ok: false,
+      status,
+      body,
+      headers: {
+        ...resultBase.headers,
+        ...(body.error?.retry_after ? { 'retry-after': String(body.error.retry_after) } : {}),
+      },
+      terminalState: 'rejected',
+    }
+  }
+
   if (!clientStream) {
     const assembler = converters.createClaudeMessageAssembler()
     let committed = false
-    await readLines(upstream, async (line) => {
+    let sawMessageStop = false
+    let terminalError = null
+    await readUpstreamLines(async (line) => {
       applyMaybeUsageHide(line, personaHideTokens, cacheTtl, converters)
       converters.applyClaudeSSELineToMessage(line, assembler)
-      if (!committed && String(line).startsWith('data:')) committed = true
+      const raw = String(line || '')
+      if (raw.startsWith('data:')) {
+        if (!committed) committed = true
+        const piece = raw.slice(5).trim()
+        if (piece && piece !== '[DONE]') {
+          try {
+            const evt = JSON.parse(piece)
+            if (evt?.type === 'message_stop') sawMessageStop = true
+            if (evt?.type === 'error') terminalError = evt
+          } catch {}
+        }
+      }
     })
+    const failure = classifierFailure()
+    if (failure) return { ...failure, committed: false }
+    if (terminalError) {
+      const declared = Number(terminalError.error?.status)
+      const status = declared >= 400 && declared < 600 ? declared : mapUpstreamError(200, terminalError).status
+      return {
+        ...resultBase,
+        ok: false,
+        status,
+        body: terminalError,
+        usage: assembler.message?.usage || null,
+        terminalState: 'rejected',
+        committed,
+        sawMessageStop,
+      }
+    }
+    const assembled = assembler.message
+    if (!sawMessageStop) {
+      return {
+        ...resultBase,
+        ok: false,
+        body: assembled || { type: 'error', error: { message: 'empty api upstream' } },
+        usage: assembled?.usage || null,
+        terminalState: assembled || committed ? 'incomplete' : 'rejected',
+        committed,
+        sawMessageStop: false,
+      }
+    }
+    const hop = { body: assembled, stopReason: assembled?.stop_reason, sawMessageStop: true }
+    const complete = resultBase.ok && isCompleteAssistantMessage(hop)
     return {
       ...resultBase,
-      ok: resultBase.ok && !!assembler.message,
-      body: assembler.message || assembler.error || { type: 'error', error: { message: 'empty api upstream' } },
-      usage: assembler.message?.usage || null,
-      terminalState: resultBase.ok ? 'verified' : 'rejected',
+      ok: complete,
+      body: assembled || { type: 'error', error: { message: 'empty api upstream' } },
+      usage: assembled?.usage || null,
+      terminalState: complete ? 'verified' : 'incomplete',
       committed,
+      sawMessageStop: true,
     }
   }
 
@@ -201,7 +330,7 @@ export async function runApiInference({
   let sawStop = false
   const started = Date.now()
   let ttftMs = null
-  await readLines(upstream, async (line) => {
+  await readUpstreamLines(async (line) => {
     if (personaHideTokens) line = converters.hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl) || line
     if (String(line).startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
     if (String(line).includes('message_stop')) sawStop = true
@@ -225,6 +354,9 @@ export async function runApiInference({
     else writeChunks(converters.claudeSSELineToResponsesEvents(line, state))
   })
 
+  const failure = classifierFailure()
+  if (failure) return { ...failure, committed, ttftMs }
+
   return {
     ...resultBase,
     ok: resultBase.ok && (deliveryMode !== 'verified' || sawStop),
@@ -234,7 +366,7 @@ export async function runApiInference({
   }
 }
 
-async function runOpenAIUpstream({
+async function runOpenAIResponsesUpstream({
   upstream,
   resultBase,
   protocol,
@@ -245,78 +377,104 @@ async function runOpenAIUpstream({
   converters,
   body,
 }) {
-  const assembler = createOpenAIChatAssembler()
-  const flags = { started: false, closed: false }
+  const chunks = []
+  const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
+  const chatSse = createChatSseState()
+  let conversionError = null
   let committed = false
+  let completed = false
+  let sawTerminal = false
   let ttftMs = null
+  let streamedUsage = null
   const started = Date.now()
 
-  if (protocol === 'openai.chat' && clientStream) {
-    await readLines(upstream, async (line) => {
-      applyOpenAIChatSSELine(line, assembler)
-      if (String(line).startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-      if (!committed && String(line).startsWith('data:')) {
-        committed = true
-        if (!res.headersSent) converters.writeSSEHeaders(res)
-      }
-      if (!res.headersSent) converters.writeSSEHeaders(res)
-      res.write(String(line).endsWith('\n') ? String(line) : `${line}\n`)
-    })
-    return {
-      ...resultBase,
-      ok: resultBase.ok && (deliveryMode !== 'verified' || assembler.done || !!assembler.finish),
-      terminalState: assembler.done || assembler.finish ? 'verified' : committed ? 'incomplete' : 'rejected',
-      committed,
-      ttftMs,
-    }
-  }
-
-  let convertState = null
-  if (protocol === 'openai.completions')
-    convertState = converters.createOpenAICompletionStreamState(inbound.model || body.model, resultBase.endpointId)
-  else if (protocol === 'openai.responses')
-    convertState = converters.createResponsesStreamState(inbound.model || body.model, resultBase.endpointId)
-
   await readLines(upstream, async (line) => {
-    const delta = applyOpenAIChatSSELine(line, assembler)
-    if (String(line).startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-    if (!clientStream) return
-    const events = claudeSSEFromOpenAIDelta(delta, assembler, flags)
-    if (!events.length) return
-    if (!committed) committed = true
-    if (protocol === 'anthropic.messages') {
-      if (!res.headersSent) converters.writeSSEHeaders(res)
-      for (const evt of events) res.write(`event: ${evt.type}\ndata: ${JSON.stringify(evt)}\n\n`)
+    if (conversionError) return
+    const raw = String(line || '')
+    const seen = usageFromSseLine(raw)
+    if (seen) streamedUsage = seen
+    if (raw.startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
+    if (!committed && raw.startsWith('data:')) committed = true
+    if (!clientStream) {
+      chunks.push(raw)
+      if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
       return
     }
-    const writeChunks = (chunks) => {
-      if (!chunks.length) return
-      if (!res.headersSent) converters.writeSSEHeaders(res)
-      for (const chunk of chunks) res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+    if (!res.headersSent) converters.writeSSEHeaders(res)
+    if (protocol === 'openai.responses') {
+      res.write(raw.endsWith('\n') ? raw : `${raw}\n`)
+      if (/response\.(completed|done)/.test(raw)) completed = true
+      return
     }
-    for (const evt of events) {
-      const fake = `data: ${JSON.stringify(evt)}`
-      if (protocol === 'openai.completions')
-        writeChunks(converters.claudeSSELineToOpenAICompletionChunks(fake, convertState))
-      else writeChunks(converters.claudeSSELineToResponsesEvents(fake, convertState))
+    try {
+      const mapped =
+        protocol === 'anthropic.messages'
+          ? responsesSseToAnthropicEvents(raw, anthropicSse)
+          : responsesSseToChatChunk(raw, 'codex', chatSse)
+      if (mapped) {
+        res.write(mapped)
+        if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
+      }
+    } catch (error) {
+      if (error.code !== 'tool_arguments_mismatch') throw error
+      conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+      res.write(
+        protocol === 'anthropic.messages'
+          ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+          : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+      )
     }
   })
 
-  const claude = openAIAssemblerToClaude(assembler)
   if (!clientStream) {
+    let assembled
+    let outBody
+    try {
+      assembled = assembleCodexBodyFromSse(chunks, {})
+      outBody =
+        protocol === 'anthropic.messages'
+          ? codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
+          : assembled
+    } catch (error) {
+      if (!isToolArgumentsError(error)) throw error
+      return {
+        ...resultBase,
+        ok: false,
+        status: 502,
+        body: { error: { type: 'upstream_protocol_error', code: error.code, message: error.message } },
+        terminalState: 'incomplete',
+        committed: true,
+        usage: streamedUsage,
+      }
+    }
+    const hasBody = !!(assembled && (assembled.output || assembled.id || outBody))
+    const complete = resultBase.ok && sawTerminal && hasBody
     return {
       ...resultBase,
-      ok: resultBase.ok && !!claude.content?.length,
-      body: claude,
-      usage: claude.usage || null,
-      terminalState: resultBase.ok ? 'verified' : 'rejected',
+      ok: complete,
+      body: outBody,
+      usage: assembled?.usage || streamedUsage || outBody?.usage || null,
+      terminalState: complete ? 'verified' : hasBody ? 'incomplete' : 'rejected',
       committed: true,
     }
   }
+  if (conversionError)
+    return {
+      ...resultBase,
+      ok: false,
+      status: 502,
+      body: { error: conversionError },
+      terminalState: 'incomplete',
+      committed,
+      usage: streamedUsage,
+      ttftMs,
+    }
+
   return {
     ...resultBase,
-    ok: resultBase.ok && (deliveryMode !== 'verified' || flags.closed || assembler.done),
-    terminalState: flags.closed || assembler.done ? 'verified' : committed ? 'incomplete' : 'rejected',
+    ok: resultBase.ok && (deliveryMode !== 'verified' || completed || committed),
+    usage: streamedUsage,
+    terminalState: completed ? 'verified' : committed ? 'incomplete' : 'rejected',
     committed,
     ttftMs,
   }

@@ -114,7 +114,7 @@ func TestAPIKeyNeverNeedsRefresh(t *testing.T) {
 }
 
 func TestSetupTokenWithoutRefreshNeverNeedsRefresh(t *testing.T) {
-	cred := Credential{Type: TypeSetupToken, AccessToken: "sk-ant-oat01-live"}
+	cred := Credential{Type: TypeOfficialSetupToken, AccessToken: "sk-ant-oat01-live"}
 	if cred.NeedsRefresh(time.Now(), time.Hour) {
 		t.Fatal("official setup-token without refresh must not refresh")
 	}
@@ -134,7 +134,7 @@ func TestSaveSetupTokenClearsRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current.Type = TypeSetupToken
+	current.Type = TypeOfficialSetupToken
 	current.AccessToken = "sk-ant-oat01-setup"
 	current.RefreshToken = ""
 	current.ExpiresAt = time.Now().Add(365 * 24 * time.Hour).UnixMilli()
@@ -150,12 +150,27 @@ func TestSaveSetupTokenClearsRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Type != TypeSetupToken || loaded.RefreshToken != "" {
+	if loaded.Type != TypeOfficialSetupToken || loaded.RefreshToken != "" {
 		t.Fatalf("loaded = %#v", loaded)
 	}
 	oauth := nestedMap(document, "claudeAiOauth")
 	if _, ok := oauth["refreshToken"]; ok {
 		t.Fatalf("refreshToken should be deleted: %#v", oauth)
+	}
+}
+
+func TestFullScopeSetupTokenLabelPreservesExplicitType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	seed := `{"type":"setup-token","claudeAiOauth":{"accessToken":"full","refreshToken":"refresh","scopes":["user:profile","user:inference","user:sessions:claude_code"]}}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Type != TypeSetupToken || loaded.RefreshToken != "refresh" {
+		t.Fatalf("loaded = %#v, want setup-token with refresh", loaded)
 	}
 }
 

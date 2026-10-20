@@ -2,7 +2,16 @@
  * Resolve a usable SOCKS5 URL for sessionKey conversion.
  * Prefer the pool's internal credentials; never read username/password
  * from the redacted public snapshot.
+ *
+ * Local egress (`px-local`) is a bound exit with no SOCKS URL: the route of
+ * the VPS that runs the slot. A local slot's import and host hops use the
+ * control-plane default route (`direct: true`, a Codex slot carries the
+ * deployment proxy its kernel also uses); a node slot's leave from that node
+ * through its SSH link. That is not "unbound".
  */
+import { boundProxyUrl, isLocalEgressProxy } from './egress.mjs'
+import { slotHost } from './slot-host.mjs'
+import { configuredIpv6Enabled, proxyBlockedReason } from './proxy-policy.mjs'
 
 function poolHitForVm(proxyPool, vm) {
   if (!proxyPool || typeof proxyPool.snapshot !== 'function') return null
@@ -22,25 +31,41 @@ function poolHitForVm(proxyPool, vm) {
 function socksUrlFromVm(vm) {
   const px = vm?.proxy
   if (!px) return null
-  if (px.url) return String(px.url)
-  if (px.host && px.port) return `socks5h://${px.host}:${px.port}`
-  return null
+  return boundProxyUrl(px) || null
 }
 
 export function poolProxyUnavailable(hit) {
   if (!hit) return false
+  if (hit.blocked_reason) return true
+  // Direct exit. A stale fail/dead from the old kin-egress probe is not "no proxy".
+  if (isLocalEgressProxy(hit)) return hit.enabled === false
   return !hit.enabled || hit.status === 'dead' || hit.status === 'fail'
 }
 
 export function resolveImportProxy({ vm, proxyPool, overrideUrl = null } = {}) {
   const hit = poolHitForVm(proxyPool, vm)
+  const ipv6Enabled = proxyPool?.snapshot?.().config?.ipv6_enabled ?? configuredIpv6Enabled()
+  const blocked = proxyBlockedReason(overrideUrl ? { url: overrideUrl } : hit || vm?.proxy, ipv6Enabled)
+  if (blocked || hit?.blocked_reason) {
+    return { ok: false, proxyUrl: null, blocked: true, reason: blocked || hit.blocked_reason }
+  }
   if (poolProxyUnavailable(hit)) {
     return { ok: false, proxyUrl: null, blocked: true, reason: 'proxy_unavailable' }
   }
   if (overrideUrl) {
-    return { ok: true, proxyUrl: String(overrideUrl), blocked: false, reason: null }
+    return { ok: true, proxyUrl: boundProxyUrl({ url: overrideUrl }), blocked: false, reason: null }
   }
   const allocated = vm?.id && typeof proxyPool?.getProxyForVm === 'function' ? proxyPool.getProxyForVm(vm.id) : null
+  if (isLocalEgressProxy(hit) || isLocalEgressProxy(allocated) || isLocalEgressProxy(vm?.proxy)) {
+    let proxyUrl
+    try {
+      proxyUrl = slotHost(vm).localExitProxyUrl(vm)
+    } catch {
+      // A node exit without its forwarder must not quietly become the control plane's route.
+      return { ok: false, proxyUrl: null, blocked: true, reason: 'proxy_unavailable' }
+    }
+    return { ok: true, proxyUrl, blocked: false, reason: null, direct: true }
+  }
   if (allocated?.url) {
     return {
       ok: true,

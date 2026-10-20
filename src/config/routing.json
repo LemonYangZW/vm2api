@@ -4,7 +4,8 @@
     "mode": "conversation",
     "ttl_seconds": 86400,
     "header_keys": ["x-session-id", "x-conversation-id", "x-claude-code-session-id", "session-id", "thread-id"],
-    "body_keys": ["conversation_id", "session_id", "thread_id", "prompt_cache_key"]
+    "body_keys": ["conversation_id", "session_id", "thread_id", "prompt_cache_key"],
+    "outbound_session": "rebuild"
   },
   "concurrency": {
     "default_max_per_account": 2,
@@ -18,6 +19,10 @@
     "warn_ratio": 0.75,
     "block_on_5h": true,
     "block_on_7d": true,
+    "critical_band": 0.05,
+    "gate_overshoot": 0.05,
+    "large_cold_uncached_tokens": 100000,
+    "guard_large_cold": true,
     "weekly_split": {
       "enabled": false,
       "fable_share": 0.5
@@ -29,8 +34,6 @@
       "max_rpm": 0,
       "limit_5h": 0.85,
       "limit_7d": 0.8,
-      "max_sessions": 0,
-      "session_idle_min": 5,
       "safety_ratio": 0.85,
       "weekly_safety_ratio": 0.8,
       "warn_ratio": 0.75
@@ -40,8 +43,6 @@
       "max_rpm": 0,
       "limit_5h": 0.85,
       "limit_7d": 0.8,
-      "max_sessions": 0,
-      "session_idle_min": 5,
       "safety_ratio": 0.85,
       "weekly_safety_ratio": 0.8,
       "warn_ratio": 0.75
@@ -51,8 +52,6 @@
       "max_rpm": 0,
       "limit_5h": 0.95,
       "limit_7d": 0.95,
-      "max_sessions": 0,
-      "session_idle_min": 5,
       "safety_ratio": 0.95,
       "weekly_safety_ratio": 0.95,
       "warn_ratio": 0.85
@@ -65,39 +64,85 @@
     "max_mb": 2048
   },
   "pool": {
-    "strategy": "weighted-round-robin",
+    "strategy": "balanced",
     "manual_schedule_wins": true,
-    "max_waiters_per_account": 32,
+    "queue_max": 50,
+    "seat_grace_ms": 30000,
+    "seat_budget_reserve_pct": 0.02,
     "fallback_wait_timeout_ms": 30000,
     "sticky_wait_timeout_ms": 45000,
     "worker_health_ttl_ms": 5000,
-    "heartbeat_stale_ms": 15000
+    "heartbeat_stale_ms": 15000,
+    "circuit_failure_threshold": 3,
+    "circuit_open_ms": 30000
   },
   "failover": {
-    "max_total_attempts": 12
+    "max_total_attempts": 12,
+    "max_account_switches": 3,
+    "max_same_account_retries": 3,
+    "same_account_retry_delay_ms": 500,
+    "total_retry_deadline_ms": 120000,
+    "stream_idle_timeout_ms": 180000,
+    "queue_keepalive_delay_ms": 60000,
+    "session_queue_timeout_ms": 900000,
+    "eager_tool_streaming": true
+  },
+  "websocket": {
+    "enabled": true
   },
   "inference": {
     "engine": "rust",
-    "fallback_to_go": false
+    "fallback_to_go": false,
+    "session_slots": 20
+  },
+  "codex": {
+    "enabled": true,
+    "catalog_client_version": "auto",
+    "user_agent": "codex_cli_rs/0.160.0 (linux x86_64)",
+    "upstream_transport": "prefer_websocket",
+    "websocket": { "enabled": true },
+    "client_features": { "enabled": false },
+    "analytics": { "enabled": false },
+    "protocols": {
+      "openai.responses": { "mode": "native", "enabled": true },
+      "openai.chat": { "mode": "convert", "enabled": true },
+      "openai.completions": { "mode": "convert", "enabled": true },
+      "anthropic.messages": { "mode": "reject", "enabled": false }
+    },
+    "convert": {
+      "chat_to_codex": true,
+      "completions_to_codex": true,
+      "anthropic_to_codex": false
+    },
+    "clients": {
+      "official_codex": "allow",
+      "openai_compatible": "allow",
+      "claude_code": "reject",
+      "unknown": "allow"
+    },
+    "quota": {
+      "limit_5h": 1,
+      "limit_7d": 1,
+      "max_concurrency": 2,
+      "max_rpm": 0,
+      "max_sessions": 0
+    }
   },
 
   "compatibility": {
     "persona_preset": "official_full",
     "overlay_preset": "off",
     "persona_park": false,
-    "cache_ttl": "5m"
+    "cache_ttl": "1h",
+    "min_max_tokens": { "enabled": true, "value": 128 }
   },
   "official_cc": {
     "enabled": true,
     "wipe": true,
     "apply_seed": true,
     "reconcile_fingerprint": true,
-    "sync_telemetry": true,
-    "quota_via": "usage-api",
-    "cli_stats": false,
-    "usage_fallback": false,
+    "sync_telemetry": false,
     "hello_prompt": "hello",
-    "stats_prompt": "/stats",
     "timeout_ms": 240000,
     "memory": "500m",
     "resident": false,
@@ -105,7 +150,7 @@
   },
 
   "usage_probe": {
-    "enabled": true,
+    "enabled": false,
     "interval_sec": 60,
     "stale_sec": 300,
     "run_on_start": true,
@@ -120,6 +165,7 @@
     "cache_models": [],
     "cache_model": "",
     "intercept_unofficial": true,
+    "intercept_warmup": true,
     "fail_closed": true,
     "run_on_start": true,
     "real": {
@@ -148,7 +194,7 @@
     "digest_sec": 21600,
     "min_available": 1,
     "run_on_start": true,
-    "console_url": "https://ccmax20.cc",
+    "console_url": "",
     "events": {
       "pool_empty": true,
       "pool_low": true,
@@ -173,26 +219,26 @@
       "enabled": false,
       "bot_token": "",
       "chat_id": ""
+    },
+    "wecom": {
+      "enabled": false,
+      "webhook": "",
+      "mention_all": false
     }
   },
-  "codex": {
-    "enabled": true,
-    "protocols": {
-      "openai.responses": { "mode": "native", "enabled": true },
-      "openai.chat": { "mode": "convert", "enabled": true },
-      "openai.completions": { "mode": "convert", "enabled": true },
-      "anthropic.messages": { "mode": "reject", "enabled": false }
+  "vm": {
+    "default_runtime": "docker",
+    "memory": "512m",
+    "vcpus": 2,
+    "disk_gb": 20,
+    "cpu_model": "host",
+    "smbios": {
+      "manufacturer": "Dell Inc.",
+      "product": "OptiPlex 7090",
+      "version": "1.0",
+      "family": "OptiPlex"
     },
-    "convert": {
-      "chat_to_codex": true,
-      "completions_to_codex": true,
-      "anthropic_to_codex": false
-    },
-    "clients": {
-      "official_codex": "allow",
-      "openai_compatible": "allow",
-      "claude_code": "reject",
-      "unknown": "allow"
-    }
+    "mac_oui": "52:54:00",
+    "allow_tcg": false
   }
 }

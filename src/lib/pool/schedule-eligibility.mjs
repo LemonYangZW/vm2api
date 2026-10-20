@@ -2,8 +2,12 @@
  * Single schedulability gate shared by the pool picker and the panel.
  * Green on the console must mean the scheduler will actually select the slot.
  */
+import { hasBoundExit, isLocalEgressProxy } from '../vm/egress.mjs'
 import { isVmScheduleReady, vmHasClaudeCredential, isCodexVm } from '../vm/vm-registry.mjs'
 import { expiresAtToMs, hasRefreshPresence } from '../oauth/oauth-credentials.mjs'
+import { rustKernelBusy } from '../transport/rust-kernel-client.mjs'
+import { socksProxyEndpoint } from '../vm/socks-address.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 
 // Only a dead grant / operator disable should keep the slot out of the pool.
 // Stale access 401 (`authentication_failed_after_refresh`) is not fatal when
@@ -11,8 +15,8 @@ import { expiresAtToMs, hasRefreshPresence } from '../oauth/oauth-credentials.mj
 export const AUTH_COOLDOWN_REASON = /authentication_failed_after_refresh|permission_denied/i
 const FATAL_CREDENTIAL_COOLDOWN =
   /oauth_invalid_grant|invalid_grant|refresh_token_missing|organization_disabled|oauth_revoked|token has been revoked/i
-/** Panel test / loadtest probes are not grant-death. Stale access 401 must not eject a live ticket. */
-export const TEST_PROBE_SOURCES = new Set(['test-chat', 'kin-console-test', 'kin-console-loadtest'])
+/** Panel VM test probes are not grant-death. Stale access 401 must not eject a live ticket. */
+export const TEST_PROBE_SOURCES = new Set(['test-chat', 'kin-console-test'])
 
 export function isTestProbeSource(probe = null, source = null) {
   return TEST_PROBE_SOURCES.has(String(probe?.source || source || ''))
@@ -22,13 +26,22 @@ export function isAuthCooldownReason(reason) {
   return AUTH_COOLDOWN_REASON.test(String(reason || ''))
 }
 const REFRESH_FAILURE =
-  /credential_refresh_failed|oauth_refresh|refresh_token_missing|invalid_grant|token has been revoked/i
+  /credential_refresh_failed|oauth_refresh|refresh_token_missing|refresh_token_invalid|invalid_grant|token has been revoked|worker_output_invalid|refresh_rejected|refresh_denied/i
 const GRANT_REVOKED = /access token has been revoked|token has been revoked|oauth_revoked/i
 
 export function isRefreshFailure(workerStatus) {
   if (String(workerStatus?.last_error_class || workerStatus?.refresh_class || '').toLowerCase() === 'retryable')
     return false
-  const err = String(workerStatus?.last_error || workerStatus?.error || workerStatus?.code || '')
+  const credential = workerStatus?.credential || {}
+  const err = String(
+    workerStatus?.last_error ||
+      workerStatus?.error ||
+      workerStatus?.code ||
+      credential.last_error ||
+      credential.refresh_error ||
+      credential.credential_state ||
+      '',
+  )
   return REFRESH_FAILURE.test(err)
 }
 
@@ -76,14 +89,13 @@ export function isCredentialRuntimeBlocked(state, now = Date.now(), vm = null) {
 
 export function slotHasBoundProxy(vm) {
   if (!vm?.proxy_cli_enabled || !vm?.proxy) return false
-  const scheme = String(vm.proxy.scheme || vm.proxy.kind || '').toLowerCase()
-  const host = String(vm.proxy.host || '').toLowerCase()
-  if (vm.proxy.id === 'px-local' || scheme === 'local' || host === 'local') return true
-  return !!(vm.proxy.url || (vm.proxy.host && vm.proxy.port))
+  return hasBoundExit(vm.proxy)
 }
 
 export function evaluateSlotGate(vm) {
   if (isCodexVm(vm)) return { ok: false, reason: 'codex_vm' }
+  const blocked = proxyBlockedReason(vm?.proxy)
+  if (blocked) return { ok: false, reason: blocked }
   const oauthProjection = /^oauth_/.test(String(vm?.schedule_disabled_reason || ''))
   if (!isVmScheduleReady(vm, { allowMissingCredential: oauthProjection })) {
     if (!oauthProjection) return { ok: false, reason: 'vm_unschedulable' }
@@ -97,16 +109,9 @@ export function evaluateSlotGate(vm) {
 export const WORKER_PROXY_UNKNOWN = undefined
 
 export function evaluateProxySync({ vm, workerProxyEndpoint = WORKER_PROXY_UNKNOWN, egressMode = '' } = {}) {
+  if (isLocalEgressProxy(vm?.proxy)) return { ok: true }
   if (String(egressMode || '').trim() === 'transparent') return { ok: true }
-  const wantHost = vm?.proxy?.host
-  const wantPort = vm?.proxy?.port
-  let want = null
-  if (wantHost && wantPort) want = `${wantHost}:${Number(wantPort)}`
-  else {
-    const url = String(vm?.proxy?.url || '')
-    const m = url.match(/^[a-z0-9+.-]+:\/\/(?:[^/@]+@)?([^:/?#]+):(\d+)/i)
-    if (m) want = `${m[1]}:${Number(m[2])}`
-  }
+  const want = socksProxyEndpoint(vm?.proxy)
   if (!want) return { ok: true }
   if (workerProxyEndpoint === WORKER_PROXY_UNKNOWN) return { ok: true }
   if (!workerProxyEndpoint) return { ok: false, reason: 'worker_proxy_missing' }
@@ -185,7 +190,14 @@ export function evaluateCredentialEligibility({ vm, workerStatus = null, now = D
   if (leftoverRevoke && !accessFresh && !workerLive) {
     return { ok: false, reason: 'oauth_revoked' }
   }
-  if (!workerLive && (isRefreshFailure(workerStatus) || isRefreshFailure({ last_error: vm?.claude?.refresh_error }))) {
+  const refreshFailure = isRefreshFailure(workerStatus) || isRefreshFailure({ last_error: vm?.claude?.refresh_error })
+  // Expired access is only a short "refresh pending" window while the refresh
+  // channel is healthy. Once the worker has recorded a refresh failure, the
+  // slot would answer every request with 401: take it out until re-login.
+  if (expMs && expMs <= now && refreshFailure) {
+    return { ok: false, reason: 'oauth_invalid_grant' }
+  }
+  if (!workerLive && refreshFailure) {
     return { ok: false, reason: 'oauth_invalid_grant' }
   }
   if (expMs && expMs <= now && !refreshPresent) {
@@ -193,6 +205,9 @@ export function evaluateCredentialEligibility({ vm, workerStatus = null, now = D
   }
   if (!expMs && workerStatus && !cred.has_access && !refreshPresent) {
     return { ok: false, reason: 'oauth_unconfirmed' }
+  }
+  if (rustKernelBusy(workerStatus)) {
+    return { ok: true, reason: 'slot_busy' }
   }
   if (workerStatus && workerStatus.ok !== true && !refreshPresent) {
     return { ok: false, reason: 'worker_unhealthy' }
@@ -223,6 +238,11 @@ export function credPanelUnavailable(extras = {}, expiresAt = null, now = Date.n
       extras.runtime?.worker_status?.error ||
       '',
   )
+  const refreshFailure = isRefreshFailure({
+    last_error: `${extras.refresh_error || ''} ${err}`,
+    last_error_class: extras.worker_credential?.last_error_class || extras.runtime?.worker_status?.last_error_class,
+  })
+  if (refreshFailure && !isLiveAccess({ extras, expiresAt, now, requireTtl: true })) return true
   const fatalGrant = /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh token not found/i.test(
     `${reason} ${err}`,
   )

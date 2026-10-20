@@ -1,7 +1,6 @@
 /**
- * Host-side slot lifecycle. Docker is implemented; KVM is a same-shaped
- * adapter that refuses until a hypervisor is wired. Guest identity / SOCKS
- * / TLS stay inside the rust kernel and must not branch here.
+ * Host-side slot lifecycle. Docker and KVM share slotHost(vm); guest identity
+ * / SOCKS / TLS stay inside the rust kernel and must not branch here.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,71 +11,75 @@ import {
   writeKernelConfig,
 } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
-import { runtimeKind, RUNTIME_KVM } from './runtime-kind.mjs'
-import { getVm, listVms, isCodexVm } from './vm-registry.mjs'
+import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
+import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { resolveInferenceEngine } from './slot-engine.mjs'
 import {
   containerHasKernelMount,
   containerName,
   inspectContainer,
   startVmRuntime,
-  stopVmRuntime,
   reloadSlotWorker,
-  destroyVmRuntime,
 } from './vm-runtime.mjs'
 import { inspectWrapCliDir, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
-import { boundProxyUrl } from './egress.mjs'
+import { isLocalEgressProxy } from './egress.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
+import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
 
 export { runtimeKind }
 
-const KVM_NOT_CONFIGURED = {
-  ok: false,
-  code: 'kvm_not_configured',
-  error: 'kvm runtime adapter is not configured',
-}
-
-function kvmRefuse(action) {
-  return { ...KVM_NOT_CONFIGURED, action, runtime: RUNTIME_KVM }
+function unsupportedOnHost(action) {
+  return { ok: false, code: 'remote_unsupported', error: `集群节点上的槽位不支持：${action}` }
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('start')
-  return startVmRuntime(vm, projectRoot, opts)
+  return slotHost(vm).start(vm, projectRoot, opts)
+}
+
+/**
+ * A node slot's sockets are relay paths that the local vms/<id>/run fallback cannot
+ * rebuild, so the record must carry them. Callers that only patch status after
+ * start (create, import, recreate) would otherwise leave runtime as {type}.
+ */
+function persistNodeRuntime(vm, projectRoot, boot) {
+  if (vmNodeId(vm) && boot?.runtime) persistVmRuntime(projectRoot, vm.id, boot.runtime)
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm)) {
-    const boot = startSlot(vm, projectRoot, opts)
+    if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
+    const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
+    if (!boot?.ok) return boot
+    persistNodeRuntime(vm, projectRoot, boot)
     const kernel = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
     if (!kernel.ok) return kernel
     return { ok: true, engine: 'codex', docker: boot, kernel }
   }
-  const boot = startSlot(vm, projectRoot, opts)
+  const boot = await startSlot(vm, projectRoot, opts)
   if (!boot?.ok) return boot
+  persistNodeRuntime(vm, projectRoot, boot)
   return attachInferenceRuntime(boot, vm, projectRoot, opts)
 }
 
-export function stopSlot(vm) {
+export async function stopSlot(vm) {
   if (isCodexVm(vm)) stopCodexKernel(vm.id)
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('stop')
-  return stopVmRuntime(vm)
+  return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
-export function destroySlot(vm) {
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('destroy')
-  return destroyVmRuntime(vm)
+export async function destroySlot(vm) {
+  return slotHost(vm).destroy(vm)
 }
 
-/** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Never docker rm. */
-export function reloadSlot(vm, projectRoot) {
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('reload')
-  return reloadSlotWorker(vm, projectRoot)
+/** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
+export async function reloadSlot(vm, projectRoot, opts = {}) {
+  return slotHost(vm).reload(vm, projectRoot, opts)
 }
 
 export async function reloadSlotReady(vm, projectRoot, opts = {}) {
-  const boot = reloadSlot(vm, projectRoot)
+  const boot = await reloadSlot(vm, projectRoot, opts)
   if (!boot?.ok) return boot
+  persistVmRuntime(projectRoot, vm.id, boot.runtime)
   return attachInferenceRuntime(boot, vm, projectRoot, opts)
 }
 
@@ -108,9 +111,15 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
     if (!eager) return { ok: true, skipped: true, reason: 'eager_start_off', engine: 'codex' }
     const write = opts.ops?.writeCodexKernelConfig || writeCodexKernelConfig
     const start = opts.ops?.ensureCodexKernel || ensureCodexKernel
+    const localExit = isLocalEgressProxy(vm?.proxy)
+    // Local egress on this host is the deployment proxy (empty URL). A node
+    // slot's local egress is the node's own route, reached through the
+    // control-plane forwarder; an empty URL would leave from here instead.
+    const proxyUrl = localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm)
     write(projectRoot, vm, {
-      proxyUrl: boundProxyUrl(vm?.proxy),
-      proxyRequired: true,
+      proxyUrl,
+      proxyRequired: !localExit || !!proxyUrl,
+      routing,
     })
     const kernel = await start(slotExec(projectRoot, vm), { timeoutMs: opts.timeoutMs })
     if (!kernel?.ok) {
@@ -130,32 +139,33 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   if (!slotHasCredential(vm, projectRoot)) {
     return { ok: true, skipped: true, reason: 'no_credential', engine: 'rust' }
   }
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('ensure-rust')
-  const dest = wrapCliHomeDir(projectRoot, vm.id)
-  let wrap = inspectWrapCliDir(dest)
-  if (!wrap?.ok) {
-    wrap = (opts.ops?.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
-  }
-  if (!wrap?.ok) {
-    return {
-      ok: false,
-      code: wrap?.code || 'wrap_cli_missing',
-      error: wrap?.error || 'wrap CLI is not installed in the slot home',
+  // A baked slot image ships kernel and CLIs; there is no .kin to materialize or kernel to mount.
+  // KVM bind-mounts payload at /opt/kin-guest, not /usr/local/bin/kin-kernel.
+  if (!slotHost(vm).bakedKernel) {
+    const dest = wrapCliHomeDir(projectRoot, vm.id)
+    let wrap = inspectWrapCliDir(dest)
+    if (!wrap?.ok) {
+      wrap = (opts.ops?.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
     }
-  }
-
-  const slotKernel = wrapUsesSlotKernel(wrap)
-  if (!slotKernel) {
-    const kernelBin = (opts.ops?.kernelBinPath || kernelBinPath)()
-    const binaryError = kernelBinaryError(kernelBin)
-    if (binaryError) return binaryError
-    const name = containerName(vm.id)
-    const hasMount = (opts.ops?.containerHasKernelMount || containerHasKernelMount)(name)
-    if (!hasMount) {
+    if (!wrap?.ok) {
       return {
         ok: false,
-        code: 'kernel_mount_missing',
-        error: 'Rust kernel binary is not mounted in the slot container',
+        code: wrap?.code || 'wrap_cli_missing',
+        error: wrap?.error || 'wrap CLI is not installed in the slot home',
+      }
+    }
+    if (!wrapUsesSlotKernel(wrap) && !isKvmRuntime(vm)) {
+      const kernelBin = (opts.ops?.kernelBinPath || kernelBinPath)()
+      const binaryError = kernelBinaryError(kernelBin)
+      if (binaryError) return binaryError
+      const name = containerName(vm.id)
+      const hasMount = (opts.ops?.containerHasKernelMount || containerHasKernelMount)(name)
+      if (!hasMount) {
+        return {
+          ok: false,
+          code: 'kernel_mount_missing',
+          error: 'Rust kernel binary is not mounted in the slot container',
+        }
       }
     }
   }
@@ -218,6 +228,7 @@ function kernelBinaryError(bin) {
  */
 export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeoutMs = 8000, ops = {} } = {}) {
   if (!vm?.id || !projectRoot) return { ok: false, code: 'vm_required', error: 'vm required' }
+  if (!slotHost(vm).supports('engine_switch')) return unsupportedOnHost('engine_switch')
   if (isCodexVm(vm)) {
     return { ok: false, code: 'gpt_engine_forbidden', error: 'GPT slots do not use rust inference engines' }
   }
@@ -255,7 +266,9 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const name = containerName(vm.id)
   const existing = inspect(name)
   const needsKernelMount = engine === 'rust' && !!existing && !hasKernelMount(name) && !wrapUsesSlotKernel(wrap)
-  const boot = needsKernelMount ? start(vm, projectRoot, { recreate: true }) : reload(vm, projectRoot)
+  const boot = needsKernelMount
+    ? await start(vm, projectRoot, { recreate: true, routing: ops.routing })
+    : await reload(vm, projectRoot, { routing: ops.routing })
   if (!boot?.ok) {
     return {
       ok: false,
@@ -272,7 +285,7 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const rust = await startRust(exec, { timeoutMs })
   if (!rust?.ok) {
     const code = rust?.reason === 'health_timeout' ? 'kernel_health_timeout' : 'kernel_start_failed'
-    const rollback = reload(vm, projectRoot)
+    const rollback = await reload(vm, projectRoot, { routing: ops.routing })
     return {
       ok: false,
       code,
@@ -312,7 +325,13 @@ export async function switchInheritedInferenceEngines({
 }) {
   const inherited = listVms(projectRoot)
     .map(({ id }) => getVm(projectRoot, id))
-    .filter((vm) => vm && !isCodexVm(vm) && !Object.prototype.hasOwnProperty.call(vm, 'inference_engine'))
+    .filter(
+      (vm) =>
+        vm &&
+        !isCodexVm(vm) &&
+        slotHost(vm).supports('engine_switch') &&
+        !Object.prototype.hasOwnProperty.call(vm, 'inference_engine'),
+    )
   const switched = []
   for (const vm of inherited) {
     const result = await switchEngine(vm, projectRoot, targetEngine)

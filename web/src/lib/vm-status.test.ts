@@ -3,8 +3,21 @@ import { describe, expect, it } from 'vitest'
 import {
   accountStatus,
   accountUsable,
+  claudeTier,
+  openaiPlanLabel,
   credentialStatus,
+  fleetCounts,
+  fleetGroup,
+  isRestrictedSchedule,
+  localProxyOptsFromProxy,
+  localProxyText,
   poolStatus,
+  proxyHostLabel,
+  proxyNamedLabel,
+  restrictionCopy,
+  scheduleStateLabel,
+  vmCircuit,
+  vmCircuitTitle,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -208,8 +221,478 @@ describe('health probe must not paint a live ticket unavailable', () => {
     })
     expect(accountStatus(vm)).toMatchObject({
       key: 'revoke',
-      text: '无效凭证',
+      text: '已吊销',
     })
-    expect(poolStatus(vm).text).toBe('无效凭证')
+    expect(poolStatus(vm).text).toBe('已吊销')
+  })
+})
+
+describe('claudeTier follows usage Fable presence', () => {
+  it('treats usage Fable as Max even when stored Pro and hop denied', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          usage_has_fable: true,
+          fable: { plan_denied: true, ok: false, status: 403 },
+        })
+      ).key
+    ).toBe('max')
+  })
+
+  it('treats a real 7d_oi window as Max over stored Pro', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          utilization_7d_oi: 0.21,
+          reset_7d_oi: '2026-08-24T00:00:00Z',
+        })
+      ).key
+    ).toBe('max')
+  })
+
+  it('keeps Pro when usage has no Fable evidence', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          fable: { plan_denied: true, status: 403 },
+        })
+      ).key
+    ).toBe('pro')
+  })
+
+  it('defaults token accounts to Pro until Max evidence appears', () => {
+    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('pro')
+    expect(claudeTier(liveVm({})).key).toBe('pro')
+    expect(claudeTier(liveVm({ account_tier: 'max' })).key).toBe('max')
+  })
+
+  it('does not paint quota restriction as 调度关', () => {
+    const vm = liveVm({
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_5h_header',
+      restriction_until: Date.now() + 3600_000,
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '5h 限制',
+        reason: 'quota_5h_header',
+      },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'quota',
+      text: '5h 限制',
+      cls: 'warn',
+    })
+    expect(accountStatus(vm)).toMatchObject({ key: 'quota', cls: 'warn' })
+  })
+
+  it('paints leftover quota-off as restriction, not 调度关', () => {
+    const vm = liveVm({
+      schedulable: false,
+      schedule_disabled_reason: 'quota_5h_header',
+      availability: {
+        key: 'off',
+        usable: false,
+        text: '调度关',
+        reason: 'quota_5h_header',
+      },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'quota',
+      text: '5h 限制',
+      cls: 'warn',
+    })
+    expect(poolStatus(vm).text).not.toBe('调度关')
+    expect(accountStatus(vm).cls).not.toBe('off')
+    expect(accountStatus(vm).text).not.toBe('调度关')
+  })
+})
+
+describe('fleetGroup splits 受限 from 在池 and 关闭调用', () => {
+  it('returns restricted when poolStatus is cool or quota', () => {
+    const cool = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'rate_limited',
+      restriction_until: Date.now() + 300_000,
+      availability: { key: 'cool', usable: true, text: '冷却中' },
+    })
+    const quota = liveVm({
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_5h_header',
+      restriction_until: Date.now() + 3600_000,
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '5h 限制',
+        reason: 'quota_5h_header',
+      },
+    })
+    expect(fleetGroup(cool)).toBe('restricted')
+    expect(fleetGroup(quota)).toBe('restricted')
+    expect(isRestrictedSchedule(quota)).toBe(true)
+    expect(scheduleStateLabel(quota)).toBe('受限')
+    expect(restrictionCopy(quota)).toBe('5h 限制')
+  })
+
+  it('does not count restricted into 在池', () => {
+    const pool = liveVm({ schedule_state: 'on', schedulable: true })
+    const restricted = liveVm({
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_7d_safety',
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '7d 限制',
+        reason: 'quota_7d_safety',
+      },
+    })
+    const counts = fleetCounts([pool, restricted])
+    expect(fleetGroup(pool)).toBe('pool')
+    expect(counts.pool).toBe(1)
+    expect(counts.restricted).toBe(1)
+    expect(counts.off).toBe(0)
+  })
+
+  it('keeps 关闭调用 as operator off only', () => {
+    const off = liveVm({
+      schedulable: false,
+      schedule_state: 'off',
+      schedule_manual: true,
+      availability: {
+        key: 'off',
+        usable: false,
+        text: '调度关',
+        reason: 'disabled',
+      },
+    })
+    const leftoverQuota = liveVm({
+      schedulable: false,
+      schedule_disabled_reason: 'quota_5h_header',
+      availability: {
+        key: 'off',
+        usable: false,
+        text: '调度关',
+        reason: 'quota_5h_header',
+      },
+    })
+    expect(fleetGroup(off)).toBe('off')
+    expect(scheduleStateLabel(off)).toBe('关')
+    expect(fleetGroup(leftoverQuota)).toBe('restricted')
+    expect(scheduleStateLabel(leftoverQuota)).toBe('受限')
+    expect(fleetCounts([off, leftoverQuota])).toMatchObject({
+      off: 1,
+      restricted: 1,
+      pool: 0,
+    })
+  })
+
+  it('keeps 5h/7d warning in 在池, not 受限', () => {
+    const withAvailability = liveVm({
+      schedulable: true,
+      schedule_state: 'on',
+      near_limit: true,
+      utilization_5h: 0.86,
+      status_5h: 'allowed_warning',
+    })
+    const fallback5h = liveVm({
+      schedulable: true,
+      schedule_state: 'on',
+      near_limit: true,
+      utilization_5h: 0.86,
+      status_5h: 'allowed_warning',
+      availability: undefined,
+    })
+    const fallback7d = liveVm({
+      schedulable: true,
+      schedule_state: 'on',
+      utilization_7d: 0.9,
+      status_7d: 'allowed_warning',
+      availability: undefined,
+    })
+    expect(fleetGroup(withAvailability)).toBe('pool')
+    expect(isRestrictedSchedule(withAvailability)).toBe(false)
+    expect(poolStatus(fallback5h)).toMatchObject({
+      key: 'quota',
+      text: '5h 警告',
+    })
+    expect(fleetGroup(fallback5h)).toBe('pool')
+    expect(poolStatus(fallback7d)).toMatchObject({
+      key: 'quota',
+      text: '7d 警告',
+    })
+    expect(fleetGroup(fallback7d)).toBe('pool')
+  })
+})
+
+describe('unit circuit', () => {
+  const circuit = (over: Partial<NonNullable<Vm['circuit']>> = {}) => ({
+    state: 'closed' as const,
+    failures: 0,
+    threshold: 3,
+    open_until: null,
+    open_ms: 30000,
+    ...over,
+  })
+
+  it('closed circuit leaves pool status alone', () => {
+    const vm = liveVm({ circuit: circuit() })
+    expect(vmCircuit(vm)).toBeNull()
+    expect(poolStatus(vm).cls).toBe('ok')
+  })
+
+  it('open circuit paints the pool status and counts down', () => {
+    const now = 1_000_000
+    const vm = liveVm({
+      circuit: circuit({
+        state: 'open',
+        failures: 3,
+        open_until: now + 12_000,
+      }),
+    })
+    expect(vmCircuit(vm, now)).toMatchObject({ state: 'open', left: 12_000 })
+    expect(vmCircuitTitle(vm, now)).toBe(
+      '熔断中 · 连续 3/3 次 5xx · 12s 后放行探测'
+    )
+    expect(
+      poolStatus({
+        ...vm,
+        circuit: { ...vm.circuit!, open_until: Date.now() + 5000 },
+      })
+    ).toMatchObject({
+      key: 'circuit',
+      text: '熔断中',
+      cls: 'bad',
+    })
+  })
+
+  it('expired open reads as half-open probe', () => {
+    const vm = liveVm({
+      circuit: circuit({ state: 'open', failures: 3, open_until: 10 }),
+    })
+    expect(vmCircuit(vm, 20)?.state).toBe('half_open')
+    expect(poolStatus(vm)).toMatchObject({ text: '熔断探测', cls: 'caution' })
+  })
+
+  it('operator off wins over circuit', () => {
+    const vm = liveVm({
+      schedule_state: 'off',
+      schedulable: false,
+      availability: { key: 'off', usable: false, text: '调度关' },
+      circuit: circuit({
+        state: 'open',
+        failures: 3,
+        open_until: Date.now() + 5000,
+      }),
+    })
+    expect(poolStatus(vm).key).toBe('off')
+  })
+
+  it('quota limit and gate win over an open circuit', () => {
+    const open = circuit({
+      state: 'open',
+      failures: 3,
+      open_until: Date.now() + 5000,
+    })
+    const hard = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_7d_header',
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '7d 限制',
+        reason: 'quota_7d_header',
+      },
+      circuit: open,
+    })
+    expect(poolStatus(hard)).toMatchObject({ key: 'quota', text: '7d 限制' })
+    const gate = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_5h_safety',
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '5h 限制',
+        reason: 'quota_5h_safety',
+      },
+      circuit: open,
+    })
+    expect(poolStatus(gate)).toMatchObject({ key: 'quota', text: '5h 限制' })
+  })
+
+  it('open circuit wins over near-gate and seats full', () => {
+    const vm = liveVm({
+      availability: { key: 'drain', usable: true, text: '7d 临近闸线' },
+      seats_used: 4,
+      seats_max: 4,
+      circuit: circuit({
+        state: 'open',
+        failures: 3,
+        open_until: Date.now() + 5000,
+      }),
+    })
+    expect(poolStatus(vm).key).toBe('circuit')
+  })
+})
+
+describe('near-gate and seats-full are not restrictions', () => {
+  it('paints near-gate as caution, keeps it in the pool group', () => {
+    const vm = liveVm({
+      schedule_state: 'on',
+      availability: { key: 'drain', usable: true, text: '7d 临近闸线' },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'drain',
+      text: '7d 临近闸线',
+      cls: 'caution',
+    })
+    expect(accountStatus(vm).cls).toBe('caution')
+    expect(fleetGroup(vm)).toBe('pool')
+  })
+
+  it('shows seats full last and keeps the VM in the pool group', () => {
+    const full = liveVm({
+      schedule_state: 'on',
+      availability: { key: 'ok', usable: true, text: '可用' },
+      seats_used: 4,
+      seats_max: 4,
+    })
+    expect(poolStatus(full)).toMatchObject({ key: 'seats', text: '席位满' })
+    expect(fleetGroup(full)).toBe('pool')
+    expect(poolStatus({ ...full, seats_used: 3 }).key).toBe('pool')
+    const drainFull = {
+      ...full,
+      availability: {
+        key: 'drain' as const,
+        usable: true,
+        text: '5h 临近闸线',
+      },
+    }
+    expect(poolStatus(drainFull).key).toBe('drain')
+  })
+})
+
+describe('GPT plan label follows OpenAI plan_type', () => {
+  it('maps plan_type like codex-proxy-rs', () => {
+    expect(openaiPlanLabel('team')).toBe('Business')
+    expect(openaiPlanLabel('plus')).toBe('Plus')
+    expect(openaiPlanLabel('prolite')).toBe('Pro')
+    expect(openaiPlanLabel(null)).toBe('GPT')
+    expect(openaiPlanLabel('future_plan')).toBe('future_plan')
+  })
+  it('keeps codex tier key and shows the plan label', () => {
+    const tone = claudeTier(
+      liveVm({
+        platform: 'openai',
+        family: 'codex',
+        codex_kernel: true,
+        plan_type: 'team',
+      })
+    )
+    expect(tone.key).toBe('codex')
+    expect(tone.label).toBe('Business')
+  })
+})
+
+describe('proxyNamedLabel', () => {
+  it('shows the slot proxy name in front of the endpoint', () => {
+    expect(
+      proxyNamedLabel({ host: '127.0.0.1', port: 20881, label: '台湾彰化' })
+    ).toBe('台湾彰化 · 127.0.0.1:20881')
+  })
+
+  it('keeps the bare endpoint for unnamed or missing proxies', () => {
+    expect(proxyNamedLabel({ host: '127.0.0.1', port: 20881 })).toBe(
+      '127.0.0.1:20881'
+    )
+    expect(proxyNamedLabel(undefined)).toBe('—')
+  })
+})
+
+describe('localProxyText', () => {
+  it('hides node names from tenants', () => {
+    expect(localProxyText()).toBe('local代理')
+    expect(localProxyText({ revealNode: false, nodeName: '东京-01' })).toBe(
+      'local代理'
+    )
+    expect(
+      proxyHostLabel({ id: 'px-local', kind: 'local', host: 'local' })
+    ).toBe('local代理')
+  })
+
+  it('labels the control plane and extension nodes for admin', () => {
+    expect(localProxyText({ revealNode: true })).toBe('当前VPS local代理')
+    expect(localProxyText({ revealNode: true, nodeName: null })).toBe(
+      '当前VPS local代理'
+    )
+    expect(localProxyText({ revealNode: true, nodeName: '东京-01' })).toBe(
+      '东京-01local代理'
+    )
+  })
+
+  it('uses node_name on the proxy when the API revealed it', () => {
+    expect(
+      localProxyOptsFromProxy({
+        id: 'px-local',
+        kind: 'local',
+        node_name: '东京-01',
+        node_id: 'node-a',
+      })
+    ).toEqual({
+      nodeName: '东京-01',
+      nodeId: 'node-a',
+      revealNode: true,
+    })
+    expect(
+      proxyHostLabel({
+        id: 'px-local',
+        kind: 'local',
+        host: 'local',
+        node_name: null,
+      })
+    ).toBe('当前VPS local代理')
+    expect(
+      proxyHostLabel({
+        id: 'px-local',
+        kind: 'local',
+        host: 'local',
+        node_name: '东京-01',
+      })
+    ).toBe('东京-01local代理')
+  })
+})
+
+describe('rest period (working window) is scheduling, not cooldown or credential', () => {
+  const resting = liveVm({
+    schedule_state: 'restricted',
+    restriction_reason: 'rest_period',
+    availability: {
+      key: 'rest',
+      usable: true,
+      text: '休息时段',
+      reason: 'rest_period',
+    },
+  })
+
+  it('pool status shows rest with the caution tone, not cool', () => {
+    expect(poolStatus(resting)).toMatchObject({
+      key: 'rest',
+      text: '休息时段',
+      cls: 'caution',
+    })
+    expect(accountStatus(resting).cls).toBe('caution')
+  })
+
+  it('groups as restricted', () => {
+    expect(fleetGroup(resting)).toBe('restricted')
+  })
+
+  it('credential cell still answers the credential question', () => {
+    expect(credentialStatus(resting).key).not.toBe('rest')
   })
 })

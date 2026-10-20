@@ -5,7 +5,7 @@
  *   manifest.json   {version, created_at, kind, includes, sha256s}
  *   db/kin.db       VACUUM INTO online-consistent snapshot (credentials
  *                   already mirrored into the `vms` table)
- *   vms/            vm-*.json + active.json (double safety)
+ *   vms/            slot *.json + active.json (double safety)
  *   config/         routing.json / intercept-rules.json …
  *
  * When `tar` is unavailable the service degrades to a gzipped DB snapshot
@@ -41,6 +41,8 @@ import { getDb, getDbPath, closeDatabase, openDatabase, vacuumInto } from '../db
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
 import { reconcileVms } from '../vm/vm-db-sync.mjs'
+import { repairSlotSmbios, repairVmProxyCliEnabled } from '../vm/vm-registry.mjs'
+import { invalidateReadCache, isVmRecordFile } from '../vm/vm-file.mjs'
 
 const SCHEDULE_KEY = 'backup_schedule'
 
@@ -413,7 +415,7 @@ export class BackupService {
         fs.mkdirSync(vmsDir, { recursive: true })
         // replace vm json records with archive state (cli-home dirs untouched)
         for (const f of fs.readdirSync(vmsDir)) {
-          if (/^vm-.*\.json$/.test(f) || f === 'active.json') {
+          if (isVmRecordFile(f) || f === 'active.json') {
             try {
               fs.rmSync(path.join(vmsDir, f), { force: true })
             } catch {}
@@ -439,8 +441,15 @@ export class BackupService {
 
       // 5. db-only backups: rebuild vm files from the credential mirror
       if (this.projectRoot) {
+        invalidateReadCache()
         try {
           reconcileVms(this.projectRoot)
+          try {
+            repairVmProxyCliEnabled(this.projectRoot)
+          } catch {}
+          try {
+            repairSlotSmbios(this.projectRoot)
+          } catch {}
         } catch {}
       }
 

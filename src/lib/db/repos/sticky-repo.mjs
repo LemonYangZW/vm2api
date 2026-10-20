@@ -10,9 +10,12 @@ function rowToEntry(row) {
     account_id: row.account_id,
     vm_id: row.vm_id,
     session_id: row.session_id,
+    device_id: row.device_id || null,
     bound_at: row.bound_at,
     expires_at: row.expires_at,
     hits: row.hits || 0,
+    generation: Number(row.generation) || 0,
+    slot_index: row.slot_index == null ? null : Number(row.slot_index),
   }
 }
 
@@ -21,19 +24,31 @@ export class StickyRepo {
     this.db = db
     this._get = db.prepare('SELECT * FROM sticky_sessions WHERE key = ?')
     this._upsert = db.prepare(`
-      INSERT INTO sticky_sessions (key, account_id, vm_id, session_id, bound_at, expires_at, hits)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO sticky_sessions (key, account_id, vm_id, session_id, device_id, bound_at, expires_at, hits, generation, slot_index)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET
         account_id = excluded.account_id,
         vm_id = excluded.vm_id,
         session_id = excluded.session_id,
+        device_id = COALESCE(excluded.device_id, sticky_sessions.device_id),
         bound_at = excluded.bound_at,
         expires_at = excluded.expires_at,
-        hits = excluded.hits
+        hits = excluded.hits,
+        generation = excluded.generation,
+        slot_index = excluded.slot_index
     `)
     this._delete = db.prepare('DELETE FROM sticky_sessions WHERE key = ?')
     this._deleteByAccount = db.prepare('DELETE FROM sticky_sessions WHERE account_id = ? OR vm_id = ?')
     this._purge = db.prepare('DELETE FROM sticky_sessions WHERE expires_at < ?')
+    this._dropAlias = db.prepare(`
+      DELETE FROM sticky_sessions
+      WHERE key = 'envelope'
+        OR key LIKE 'ch:%'
+        OR key LIKE 'dev:%'
+        OR key LIKE '%:envelope'
+        OR key LIKE '%:ch:%'
+        OR key LIKE '%:dev:%'
+    `)
     this._all = db.prepare('SELECT * FROM sticky_sessions')
     this._count = db.prepare('SELECT COUNT(*) c FROM sticky_sessions')
   }
@@ -48,9 +63,12 @@ export class StickyRepo {
       ent.account_id ?? null,
       ent.vm_id ?? null,
       ent.session_id ?? null,
+      ent.device_id ?? null,
       ent.bound_at ?? Date.now(),
       ent.expires_at ?? null,
       ent.hits ?? 0,
+      Number(ent.generation) || 0,
+      ent.slot_index == null ? null : Number(ent.slot_index),
     )
   }
 
@@ -65,6 +83,11 @@ export class StickyRepo {
 
   purgeExpired(now = Date.now()) {
     return this._purge.run(now).changes
+  }
+
+  /** Content fingerprints and device aliases are not conversation slots. */
+  dropAliasKeys() {
+    return this._dropAlias.run().changes
   }
 
   all() {

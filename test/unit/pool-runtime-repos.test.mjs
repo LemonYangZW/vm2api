@@ -57,7 +57,10 @@ test('account cooldown mirrors structured rate-limit columns (sub2api style)', (
 
     repo.markCooldown('account-rl', { vmId: 'vm-01', until: until + 1000, reason: 'provider_overloaded' })
     state = repo.get('account-rl')
-    assert.equal(state.overload_until, until + 1000)
+    assert.equal(state.overload_until, null)
+    assert.equal(state.cooldown_until, until + 1000)
+    assert.equal(state.cooldown_reason, 'provider_overloaded')
+    assert.equal(state.rate_limit_reset_at, until)
   } finally {
     db.close()
     fs.rmSync(dir, { recursive: true, force: true })
@@ -149,7 +152,7 @@ test('request attempt ledger records final state and commit boundary', () => {
       vmId: 'vm-01',
       accountId: 'account-1',
       model: 'claude-test',
-      selectionReason: 'weighted-round-robin',
+      selectionReason: 'balanced',
       waitMs: 4,
     })
     repo.complete('req-1', 1, {

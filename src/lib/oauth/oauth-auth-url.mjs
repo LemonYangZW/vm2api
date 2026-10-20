@@ -1,14 +1,17 @@
 /**
  * Browser OAuth-link import.
  * CAI (sub2api) and official Claude Code share PKCE + paste-code,
- * then exchange via the slot SOCKS5. Never dials Anthropic without a proxy.
+ * then exchange via the current VM's SOCKS5 egress. A slot bound to local
+ * egress (`px-local`) arrives as `proxyUrl: ''`: its exit is the host default
+ * route, so the exchange goes direct. `null` still means unbound and is refused.
  */
 import crypto from 'node:crypto'
-import { exchangeTokenViaCffi } from '../../../scripts/session-to-oauth.mjs'
+import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
+import { enrichOauthIdentity, flattenOauthIdentity } from './oauth-identity.mjs'
+import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const SESSION_TTL_MS = 30 * 60 * 1000
-export const SCOPE_INFERENCE = 'user:inference'
 
 export const OAUTH_FLAVORS = Object.freeze({
   cai: {
@@ -16,7 +19,7 @@ export const OAUTH_FLAVORS = Object.freeze({
     authorizeUrl: 'https://claude.com/cai/oauth/authorize',
     redirectUri: 'https://platform.claude.com/oauth/code/callback',
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
-    scope: 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+    scope: FULL_OAUTH_SCOPE,
     source: 'oauth-auth-url',
   },
   claude_code: {
@@ -28,7 +31,7 @@ export const OAUTH_FLAVORS = Object.freeze({
       'https://api.anthropic.com/v1/oauth/token',
       'https://console.anthropic.com/v1/oauth/token',
     ],
-    scope: 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers',
+    scope: FULL_OAUTH_SCOPE,
     source: 'oauth-claude-code',
   },
   setup_token: {
@@ -36,7 +39,7 @@ export const OAUTH_FLAVORS = Object.freeze({
     authorizeUrl: 'https://claude.com/cai/oauth/authorize',
     redirectUri: 'https://platform.claude.com/oauth/code/callback',
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
-    scope: SCOPE_INFERENCE,
+    scope: FULL_OAUTH_SCOPE,
     source: 'oauth-setup-token',
   },
 })
@@ -80,12 +83,10 @@ function fail(code, message) {
 }
 
 function normalizeSocks(proxyUrl) {
-  if (!proxyUrl) return null
-  const s = String(proxyUrl)
-  if (s.startsWith('socks5://') && !s.startsWith('socks5h://')) {
-    return 'socks5h://' + s.slice('socks5://'.length)
-  }
-  return s
+  if (proxyUrl === '') return ''
+  const s = String(proxyUrl || '').trim()
+  if (!s) return null
+  return s.replace(/^socks5:\/\//i, 'socks5h://')
 }
 
 export function normalizeOauthFlavor(raw) {
@@ -120,8 +121,11 @@ export function buildAuthorizationURL(state, codeChallenge, scope = SCOPE_OAUTH,
 
 export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
   sweepExpired()
+  if (normalizeOauthFlavor(flavor) === 'claude_code') {
+    throw fail('claude_code_in_slot', '官方 Claude Code 登录必须由槽内 cli-node 执行，不能由宿主机生成授权链接')
+  }
   if (!vmId) throw fail('vm_required', 'vm_id required (先创建虚拟机)')
-  if (!proxyUrl) {
+  if (normalizeSocks(proxyUrl) == null) {
     throw fail('proxy_required', '虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接')
   }
   const spec = oauthFlavorSpec(flavor)
@@ -138,7 +142,7 @@ export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
     redirectUri: spec.redirectUri,
     tokenUrls: spec.tokenUrls.slice(),
     source: spec.source,
-    proxyUrl: String(proxyUrl),
+    proxyUrl: proxyUrl === '' ? '' : String(proxyUrl),
     vmId: String(vmId),
     createdAt,
   })
@@ -160,8 +164,8 @@ function parseAuthCode(fullCode) {
 
 async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session) {
   const px = normalizeSocks(proxyUrl)
-  if (!px) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
-  return exchangeTokenViaCffi({
+  if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  return exchangeTokenViaCookieAuth({
     code: authCode,
     codeVerifier,
     state,
@@ -171,7 +175,7 @@ async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, ses
   })
 }
 
-export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId } = {}) {
+export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl = null } = {}) {
   sweepExpired()
   const session = sessions.get(sessionId)
   if (!session || Date.now() - session.createdAt > SESSION_TTL_MS) {
@@ -183,8 +187,10 @@ export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId } = {})
   }
   const parsed = parseAuthCode(code)
   if (!parsed.code) throw fail('code_required', '请粘贴授权码')
-  const px = proxyUrl || session.proxyUrl
-  if (!px) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
+    throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
+  const px = proxyUrl ?? session.proxyUrl
+  if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
 
   if (process.env.KIN_FAKE_SESSION_OAUTH === '1' || process.env.KIN_FAKE_SESSION_OAUTH === 'true') {
     sessions.delete(sessionId)
@@ -204,27 +210,30 @@ export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId } = {})
     }
   }
 
-  const token = await exchangeCodeForToken(
-    parsed.code,
-    session.codeVerifier,
-    parsed.state || session.state,
-    px,
-    session,
-  )
+  // Full OAuth paste codes carry the provider's exchange state, not necessarily
+  // the authorize nonce. PKCE still binds the code to this VM's live session.
+  const exchangeState = session.flavor === 'setup_token' ? parsed.state || session.state : parsed.state
+  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, px, session)
   sessions.delete(sessionId)
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
-  return {
-    access_token: token.access_token,
-    refresh_token: token.refresh_token || '',
-    token_type: token.token_type || 'Bearer',
-    expires_in: expiresIn,
-    expires_at: token.expires_at || now + expiresIn,
-    scope: token.scope || session.scope,
-    org_uuid: token.organization?.uuid || token.org_uuid || '',
-    account_uuid: token.account?.uuid || token.account_uuid || '',
-    email_address: token.account?.email_address || token.email_address || '',
-    source: session.source || 'oauth-auth-url',
-    flavor: session.flavor || 'cai',
-  }
+  const identity = flattenOauthIdentity(token)
+  return enrichOauthIdentity(
+    {
+      access_token: token.access_token,
+      refresh_token: token.refresh_token || '',
+      token_type: token.token_type || 'Bearer',
+      expires_in: expiresIn,
+      expires_at: token.expires_at || now + expiresIn,
+      scope: token.scope || session.scope,
+      email: identity.email,
+      email_address: identity.email,
+      account_uuid: identity.account_uuid,
+      org_uuid: identity.org_uuid,
+      subscription_type: identity.subscription_type,
+      source: session.source || 'oauth-auth-url',
+      flavor: session.flavor || 'cai',
+    },
+    { proxyUrl: px, fetchImpl },
+  )
 }

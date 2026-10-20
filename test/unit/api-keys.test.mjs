@@ -129,6 +129,26 @@ test('rpm window blocks then recovers', () => {
   assert.equal(gate.code, 'api_key_rate_limit')
 })
 
+test('user concurrency caps regular users but never the admin operator', () => {
+  const store = tmpStore()
+  const now = new Date().toISOString()
+  for (const [id, role] of [
+    ['u-admin', 'admin'],
+    ['u-user', 'user'],
+  ]) {
+    store.users.insert({ id, username: id, password_hash: 'x', role, concurrency: 1, created_at: now, updated_at: now })
+  }
+  const admin = store.create({ name: 'admin-key', max_concurrency: 0, user_id: 'u-admin' })
+  const user = store.create({ name: 'user-key', max_concurrency: 0, user_id: 'u-user' })
+
+  for (let i = 0; i < 3; i++) assert.equal(store.acquire(admin).ok, true)
+
+  assert.equal(store.acquire(user).ok, true)
+  const blocked = store.canAccept(user)
+  assert.equal(blocked.code, 'user_concurrency_limit')
+  assert.deepEqual(blocked.detail, { inflight: 1, max: 1 })
+})
+
 test('update reset_quota and remove', () => {
   const store = tmpStore()
   const rec = store.create({ name: 'x', quota_requests: 5 })
@@ -180,4 +200,26 @@ test('keys persist in sqlite across store re-open (same dataDir)', () => {
   assert.equal(again.tokens_out, 22)
   assert.equal(store2.authenticate(rec.key).ok, true)
   assert.ok(fs.existsSync(path.join(dir, 'kin.db')), 'kin.db file exists')
+})
+
+test('group_type all is the default and a platform group keeps its VM list', () => {
+  const store = tmpStore()
+  const open = store.create({ name: 'global' })
+  assert.equal(store.list()[0].group_type, 'all')
+  assert.deepEqual(store.list()[0].allowed_vms, [])
+  const scoped = store.create({ name: 'claude', group_type: 'anthropic', allowed_vms: ['vm-01', 'vm-03'] })
+  assert.equal(store.getById(scoped.id).group_type, 'anthropic')
+  assert.equal(
+    store
+      .list()
+      .find((k) => k.id === scoped.id)
+      .allowed_vms.join(','),
+    'vm-01,vm-03',
+  )
+  const widened = store.update(scoped.id, { group_type: 'all' })
+  assert.equal(widened.group_type, 'all')
+  assert.equal(widened.allowed_vms, '[]')
+  assert.throws(() => store.create({ name: 'bare', group_type: 'openai' }), /至少勾选一台 VM/)
+  store.update(open.id, { status: 'disabled' })
+  assert.equal(store.getById(open.id).group_type, 'all')
 })

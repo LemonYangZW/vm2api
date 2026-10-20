@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 export type ConvertOauthResult = {
   official_cc_bootstrap?: { scheduled?: boolean; reason?: string } | null
@@ -25,6 +26,7 @@ export function ConvertOauthToSetupButton({
 }) {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
+  const perms = useVmPerms()
   const convert = useMutation({
     mutationFn: () =>
       api<ConvertOauthResult>(
@@ -44,7 +46,9 @@ export function ConvertOauthToSetupButton({
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
 
-  if (isCodexVm(vm) || credTypeOf(vm) !== 'oauth') return null
+  if (!perms.credential || isCodexVm(vm) || credTypeOf(vm) !== 'oauth') {
+    return null
+  }
 
   return (
     <>
@@ -61,7 +65,7 @@ export function ConvertOauthToSetupButton({
         open={open}
         onOpenChange={setOpen}
         title='转为 Setup Token'
-        desc='保留当前 oat/refresh 和真实过期时间。推理改走 user:inference，不再当完整 OAuth / 官方 Claude Code 入站。不跑官方初装。'
+        desc='保留当前 access token、refresh token、真实过期时间及全部已授权 scope。仅切换为 Setup Token 运行模式，不跑官方初装；不会增加或删减 profile / usage 权限。'
         confirmText='确认转换'
         cancelBtnText='取消'
         isLoading={convert.isPending}

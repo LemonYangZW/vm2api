@@ -1,5 +1,18 @@
 import { normalizeThinkingForModel } from '../protocol/thinking.mjs'
 import { flattenSearchResultHistory, rectifyUnofficialRequestForRetry } from '../protocol/request-rectifier.mjs'
+import {
+  assistantStopReason,
+  assistantVisibleOutput,
+  isCompleteAssistantMessage,
+  isClientCancelledResult,
+  isIncompleteAssistantMessage,
+  isUsagePolicyErrorMessage,
+  isWrapConnectionError,
+  ErrorCode,
+} from '../core/errors.mjs'
+import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
+import { isPlanLimitMessage, parseLimitResetFromMessage, parseResetMs } from './quota-window.mjs'
+import { attachFailureDecision } from './unit-decision.mjs'
 
 const ENTITLEMENT_PATTERNS = [
   /extra usage required/i,
@@ -80,14 +93,44 @@ function resetFromHeaders(headers, now = Date.now()) {
   return resets.length ? Math.min(...resets) : null
 }
 
+function usageWindowReset(usage, now = Date.now()) {
+  if (!usage || typeof usage !== 'object') return null
+  const candidates = [usage.reset_5h, usage.reset_7d, usage['5h']?.reset, usage['7d']?.reset]
+    .map((value) => parseResetMs(value))
+    .filter((value) => Number.isFinite(value) && value > now)
+  return candidates.length ? Math.min(...candidates) : null
+}
+
+function accountLimitUntil(reset, usage, now, message = '') {
+  return reset || parseLimitResetFromMessage(message, now) || usageWindowReset(usage, now) || now + 30 * 60_000
+}
+
 export const FABLE_FAMILY_KEY = 'fable'
 
-function modelFamily(model) {
-  const value = String(model || '').toLowerCase()
+/** A model family the upstream text itself names; the request model does not count. */
+function modelFamilyInMessage(message) {
+  const value = String(message || '').toLowerCase()
   for (const family of ['opus', 'sonnet', 'haiku', 'fable']) {
-    if (value.includes(family)) return family
+    if (new RegExp(`\\b${family}\\b`).test(value)) return family
   }
   return null
+}
+
+const SHORT_WINDOW_MESSAGE = /per[- ]minute|\brpm\b|\btpm\b/i
+const SHORT_WINDOW_HEADERS = [
+  'anthropic-ratelimit-requests-remaining',
+  'anthropic-ratelimit-tokens-remaining',
+  'anthropic-ratelimit-input-tokens-remaining',
+  'anthropic-ratelimit-output-tokens-remaining',
+]
+
+/** Per-minute limit evidence. Retry-After alone only says when, not which window. */
+function isShortWindowLimit(message, headers) {
+  if (SHORT_WINDOW_MESSAGE.test(String(message || ''))) return true
+  return SHORT_WINDOW_HEADERS.some((name) => {
+    const value = header(headers, name)
+    return value != null && String(value).trim() === '0'
+  })
 }
 
 export function isFableModel(model) {
@@ -177,21 +220,18 @@ function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}
 }
 
 function claudeStopReasonOf(result) {
-  return String(result?.stopReason || result?.body?.stop_reason || '')
+  return assistantStopReason(result)
 }
 
 function claudeHasVisibleOutput(body) {
-  const content = body?.content || body?.message?.content
-  if (!Array.isArray(content)) return false
-  for (const block of content) {
-    if (block?.type === 'text' && String(block.text || '').trim()) return true
-    if (block?.type === 'tool_use') return true
-    if (block?.type === 'refusal' && String(block.refusal || block.text || '').trim()) return true
-  }
-  return false
+  return assistantVisibleOutput(body)
 }
 
 /** 200 + stop_reason=refusal with no visible text — not a successful empty reply. */
+function isContentFilterRefusal(result = {}) {
+  return isSilentClaudeRefusal(result)
+}
+
 export function isSilentClaudeRefusal(result = {}) {
   if (claudeStopReasonOf(result) !== 'refusal') return false
   return !claudeHasVisibleOutput(result.body)
@@ -199,6 +239,8 @@ export function isSilentClaudeRefusal(result = {}) {
 
 export const DEFAULT_OAUTH_401_COOLDOWN_MS = 120_000
 export const MAX_OAUTH_401_COOLDOWN_MS = 600_000
+/** Upstream 5xx: stop the account and the same prompt. Do not open another slot. */
+export const PROVIDER_PAUSE_MS = 60 * 60 * 1000
 
 export function clampOauth401CooldownMs(ms) {
   const n = Number(ms)
@@ -206,7 +248,48 @@ export function clampOauth401CooldownMs(ms) {
   return Math.min(MAX_OAUTH_401_COOLDOWN_MS, Math.max(5_000, n))
 }
 
-export function classifyUpstreamResult(
+const GRANT_DEAD = /token has been revoked|oauth_revoked|invalid_grant/i
+
+function classifyOAuth401(hasRefresh, hay) {
+  if (hasRefresh === false) {
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'oauth_no_refresh',
+      cooldownUntil: Number.MAX_SAFE_INTEGER,
+      retrySameAccount: false,
+    }
+  }
+  if (GRANT_DEAD.test(String(hay || ''))) {
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'oauth_revoked',
+      cooldownUntil: Number.MAX_SAFE_INTEGER,
+      retrySameAccount: false,
+    }
+  }
+  return {
+    scope: 'credential',
+    action: 'continue',
+    reason: 'oauth_refresh_required',
+    cooldownUntil: null,
+    retrySameAccount: true,
+  }
+}
+
+function overloadedUnit(now) {
+  return {
+    scope: 'provider',
+    action: 'continue',
+    reason: 'provider_overloaded',
+    cooldownUntil: null,
+    retrySameAccount: false,
+    circuit: true,
+  }
+}
+
+function classifyUpstreamResultRaw(
   result = {},
   {
     model = null,
@@ -217,12 +300,35 @@ export function classifyUpstreamResult(
     credentialGeneration = null,
     priorAuth401Generation = null,
     signatureRepair = false,
+    usage = null,
   } = {},
 ) {
-  if (isSilentClaudeRefusal(result) && !result.committed) {
+  if (isClientCancelledResult(result)) {
+    return {
+      scope: 'client_lifecycle',
+      action: 'stop',
+      reason: 'client_cancelled',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  if (isContentFilterRefusal(result) && !result.committed) {
     return { scope: 'request', action: 'stop', reason: 'content_filter_refusal', cooldownUntil: null }
   }
-  if (result.ok && result.terminalState !== 'incomplete') {
+  const completeAssistant = isCompleteAssistantMessage(result)
+  const malformedSuccess =
+    !completeAssistant &&
+    (result.ok === true || result.terminalState === 'verified') &&
+    Number(result.status || 200) >= 200 &&
+    Number(result.status || 200) < 300
+  if ((isIncompleteAssistantMessage(result) || malformedSuccess) && !result.committed) {
+    return continueWithoutCooldown({
+      scope: 'stream',
+      reason: 'incomplete_assistant',
+      retrySameAccount: true,
+    })
+  }
+  if (completeAssistant) {
     return { scope: 'success', action: 'complete', cooldownUntil: null }
   }
   const status = Number(result.status) || 0
@@ -231,10 +337,30 @@ export function classifyUpstreamResult(
   const workerCode = resultErrorCode(result)
   const reset = resetFromHeaders(result.headers, now)
 
-  if (workerCode === 'selection_cancelled' || /aborted|cancelled|canceled/i.test(workerCode)) {
-    return { scope: 'client_lifecycle', action: 'stop', reason: 'client_cancelled', cooldownUntil: null }
-  }
   const hay = `${code} ${message} ${workerCode}`
+  // Claude Code wraps an AUP refusal as "API Error" and the kernel often
+  // surfaces it as HTTP 400. That is the prompt, not a repairable request
+  // and not an account failure: stop, do not hop again, cache forever.
+  if (isUsagePolicyErrorMessage(message) || isUsagePolicyErrorMessage(hay)) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'usage_policy_refusal',
+      cooldownUntil: null,
+      retrySameAccount: false,
+      rememberRefusal: true,
+      refusalTtlMs: 0,
+    }
+  }
+  if (isContentPolicyErrorCode(code) || isContentPolicyErrorCode(workerCode)) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'content_policy_refusal',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (/token has been revoked|oauth_revoked|invalid_grant|authentication_error/i.test(hay) || status === 401) {
     if (isUnconfirmedAuthFailure(result)) {
       return {
@@ -244,20 +370,7 @@ export function classifyUpstreamResult(
         cooldownUntil: null,
       }
     }
-    if (hasRefresh === false) {
-      return {
-        scope: 'account',
-        action: 'continue-and-cooldown',
-        reason: 'oauth_no_refresh',
-        cooldownUntil: Number.MAX_SAFE_INTEGER,
-      }
-    }
-    return {
-      scope: 'account',
-      action: 'continue-and-cooldown',
-      reason: 'oauth_revoked',
-      cooldownUntil: Number.MAX_SAFE_INTEGER,
-    }
+    return classifyOAuth401(hasRefresh, hay)
   }
 
   if (result.committed) {
@@ -267,6 +380,55 @@ export function classifyUpstreamResult(
       reason: 'downstream_committed_or_incomplete',
       cooldownUntil: null,
     }
+  }
+  // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
+  // as 200 + SSE error. The text decides, not the status (sub2api handle429).
+  if (isPlanLimitMessage(message)) {
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'account_quota_exhausted',
+      cooldownUntil: accountLimitUntil(reset, usage, now, message),
+      retrySameAccount: false,
+    }
+  }
+  if (workerCode === 'empty_response' || workerCode === ErrorCode.UPSTREAM_EMPTY_STREAM) {
+    return {
+      scope: 'account',
+      action: 'continue',
+      reason: 'empty_response',
+      cooldownUntil: null,
+      retrySameAccount: true,
+    }
+  }
+  // Kernel / cli-node named the cause; none of these is the account's fault.
+  if (workerCode === ErrorCode.UPSTREAM_NETWORK) {
+    if (isProxyFailure('', message)) {
+      return {
+        scope: 'proxy',
+        action: 'continue-and-cooldown',
+        reason: 'proxy_transport_failure',
+        cooldownUntil: now + 60_000,
+      }
+    }
+    return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: false })
+  }
+  if (workerCode === ErrorCode.UPSTREAM_STREAM_INTERRUPTED) {
+    return continueWithoutCooldown({ scope: 'stream', reason: 'stream_interrupted' })
+  }
+  if (
+    workerCode === ErrorCode.KERNEL_UNAVAILABLE ||
+    workerCode === ErrorCode.CLI_ERROR ||
+    workerCode === ErrorCode.KERNEL_ERROR
+  ) {
+    return continueWithoutCooldown({ scope: 'worker', reason: workerCode, retrySameAccount: false })
+  }
+  if (isWrapConnectionError(message) || isWrapConnectionError(hay)) {
+    return continueWithoutCooldown({
+      scope: 'worker',
+      reason: 'wrap_connection_error',
+      retrySameAccount: true,
+    })
   }
   if (result.transportError || status === 0) {
     if (isProxyFailure(workerCode, message)) {
@@ -338,24 +500,7 @@ export function classifyUpstreamResult(
     }
     return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
   }
-  if (status === 401) {
-    if (hasRefresh === false) {
-      return {
-        scope: 'account',
-        action: 'continue-and-cooldown',
-        reason: 'oauth_no_refresh',
-        cooldownUntil: Number.MAX_SAFE_INTEGER,
-      }
-    }
-    // Worker Ensure already ran on this hop. One 401 is enough — do not park
-    // 120s and send the same access token again.
-    return {
-      scope: 'account',
-      action: 'continue-and-cooldown',
-      reason: 'oauth_revoked',
-      cooldownUntil: Number.MAX_SAFE_INTEGER,
-    }
-  }
+  if (status === 401) return classifyOAuth401(hasRefresh, hay)
   if (status === 403) {
     if (ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(message))) {
       return {
@@ -399,7 +544,7 @@ export function classifyUpstreamResult(
         scope: 'account',
         action: 'continue-and-cooldown',
         reason: 'account_quota_exhausted',
-        cooldownUntil: reset || now + 5 * 60_000,
+        cooldownUntil: accountLimitUntil(reset, usage, now, message),
       }
     }
     if (isFableWindowLimit(result.headers) || isFableModel(model)) {
@@ -412,32 +557,56 @@ export function classifyUpstreamResult(
         cooldownUntil: fableReset || now + 60_000,
       }
     }
-    const family = modelFamily(model)
-    if (family) {
+    // The model name alone never decides scope (#163): only upstream text
+    // naming a model family proves a model limit, and only a per-minute
+    // limit proves RPM. A bare 429 stays unknown: this unit steps aside for
+    // this request and a bounded usage probe decides the real scope.
+    const namedFamily = modelFamilyInMessage(message)
+    if (namedFamily) {
       return {
         scope: 'model',
         action: 'continue-and-cooldown',
-        reason: `${family}_rate_limited`,
-        model: family === 'fable' ? FABLE_FAMILY_KEY : normalizeModelKey(model),
+        reason: `${namedFamily}_rate_limited`,
+        model: namedFamily === 'fable' ? FABLE_FAMILY_KEY : normalizeModelKey(model),
         cooldownUntil: reset || now + 60_000,
+        retrySameAccount: false,
+      }
+    }
+    if (isShortWindowLimit(message, result.headers)) {
+      return {
+        scope: 'account',
+        action: 'continue-and-cooldown',
+        reason: 'rpm_limited',
+        cooldownUntil: reset || now + 60_000,
+        retrySameAccount: false,
       }
     }
     return {
       scope: 'account',
       action: 'continue-and-cooldown',
-      reason: 'rate_limited',
+      reason: 'rate_limited_unknown',
       cooldownUntil: reset || now + 60_000,
+      retrySameAccount: false,
     }
   }
   if (status === 529) {
+    // Original gate: RateLimitService writes overload_until. Do not also open the unit circuit.
     return {
       scope: 'provider',
-      action: 'continue-and-cooldown',
+      action: 'continue',
       reason: 'provider_overloaded',
-      cooldownUntil: now + 15_000,
+      cooldownUntil: null,
+      retrySameAccount: false,
     }
   }
   if (status === 408 || status === 502 || status === 503 || status === 504 || status >= 500) {
+    if (workerCode === 'slot_busy' || /no free slot|slot_busy/i.test(hay)) {
+      return continueWithoutCooldown({
+        scope: 'worker',
+        reason: 'slot_busy',
+        retrySameAccount: false,
+      })
+    }
     if (isFableModel(model) && (status === 408 || status === 504 || /timeout/i.test(message))) {
       return {
         scope: 'model',
@@ -447,12 +616,29 @@ export function classifyUpstreamResult(
         cooldownUntil: now + 30_000,
       }
     }
-    return continueWithoutCooldown({
-      scope: 'provider',
-      reason: isTimeoutFailure(workerCode, message) ? 'provider_timeout' : 'provider_transient_error',
-    })
+    if (status === 408 || isTimeoutFailure(workerCode, message)) {
+      return continueWithoutCooldown({
+        scope: 'provider',
+        reason: 'provider_timeout',
+      })
+    }
+
+    // A 2xx stream that died before visible output used to be rewritten to 502.
+    // Kernel may also send that 502 with terminal incomplete. Neither is overload.
+    if (result.terminalState === 'incomplete' && !result.committed && !/overload/i.test(message)) {
+      return continueWithoutCooldown({
+        scope: 'stream',
+        reason: 'empty_response',
+        retrySameAccount: true,
+      })
+    }
+    return overloadedUnit(now)
   }
   return { scope: 'request', action: 'stop', reason: `http_${status}`, cooldownUntil: null }
+}
+
+export function classifyUpstreamResult(result, opts) {
+  return attachFailureDecision(classifyUpstreamResultRaw(result, opts))
 }
 
 export function shouldContinue(policy) {

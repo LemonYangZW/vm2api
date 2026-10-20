@@ -1,7 +1,9 @@
 /**
  * Convert OpenAI Chat/Completions (and optional Anthropic) bodies to Codex Responses.
  * Native openai.responses bodies pass through after identity strip.
+ * Request/usage shapes follow codex-proxy-rs (system→developer, extract_usage).
  */
+import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFromExtract } from './openai-usage.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -40,17 +42,131 @@ function textParts(content) {
     .join('\n')
 }
 
-function chatMessageToInput(message) {
-  const role = message.role === 'assistant' ? 'assistant' : message.role === 'system' ? 'system' : 'user'
-  const text = textParts(message.content)
-  if (role === 'system') {
-    return { type: 'message', role: 'user', content: [{ type: 'input_text', text: `System:\n${text}` }] }
+function imageUrlOf(part) {
+  if (typeof part?.image_url === 'string') return part.image_url
+  if (typeof part?.image_url?.url === 'string') return part.image_url.url
+  if (typeof part?.url === 'string') return part.url
+  return ''
+}
+
+function userContentParts(content) {
+  if (typeof content === 'string') return content ? [{ type: 'input_text', text: content }] : []
+  if (!Array.isArray(content)) {
+    const text = content?.text || ''
+    return text ? [{ type: 'input_text', text }] : []
   }
-  return {
-    type: 'message',
-    role: role === 'assistant' ? 'assistant' : 'user',
-    content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }],
+  const parts = []
+  for (const part of content) {
+    if (typeof part === 'string') {
+      if (part) parts.push({ type: 'input_text', text: part })
+      continue
+    }
+    if (!part || typeof part !== 'object') continue
+    if (part.type === 'image_url' || part.type === 'image' || part.type === 'input_image') {
+      const url = imageUrlOf(part)
+      if (url) parts.push({ type: 'input_image', image_url: url })
+      continue
+    }
+    const text = part.text || ''
+    if (text) parts.push({ type: 'input_text', text })
   }
+  return parts
+}
+
+function toolArguments(call) {
+  const raw = call?.function?.arguments ?? call?.arguments ?? '{}'
+  return typeof raw === 'string' ? raw : JSON.stringify(raw ?? {})
+}
+
+/** Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text. */
+function chatMessageToItems(message) {
+  if (!message || typeof message !== 'object') return []
+  if (message.role === 'tool') {
+    const output = typeof message.content === 'string' ? message.content : textParts(message.content)
+    return [
+      {
+        type: 'function_call_output',
+        call_id: message.tool_call_id || message.id || 'call_unknown',
+        output: output || '',
+      },
+    ]
+  }
+  if (message.role === 'assistant') {
+    const items = []
+    const text = textParts(message.content)
+    if (text) {
+      items.push({
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text }],
+      })
+    }
+    for (const call of message.tool_calls || []) {
+      const name = call?.function?.name || call?.name
+      if (!name) continue
+      items.push({
+        type: 'function_call',
+        call_id: call.id || call.call_id || `call_${name}`,
+        name,
+        arguments: toolArguments(call),
+      })
+    }
+    return items
+  }
+  const role = message.role === 'system' || message.role === 'developer' ? 'developer' : 'user'
+  const parts = userContentParts(message.content)
+  if (!parts.length) return []
+  return [{ type: 'message', role, content: parts }]
+}
+
+const RESPONSES_CHOICE_MODES = new Set(['none', 'auto', 'required'])
+
+/** Responses requires tool_choice.name at the top level. Chat nests it under function.name. */
+export function responsesToolChoice(choice) {
+  if (choice == null || choice === false || choice === '') return undefined
+  if (typeof choice === 'string') {
+    const mode = choice.trim().toLowerCase()
+    if (mode === 'any') return 'required'
+    if (RESPONSES_CHOICE_MODES.has(mode)) return mode
+    return undefined
+  }
+  if (typeof choice !== 'object' || Array.isArray(choice)) return undefined
+
+  const type = String(choice.type || '').toLowerCase()
+  const name = String(choice.name || choice.function?.name || '').trim()
+
+  if (type === 'none' || type === 'auto' || type === 'required') return type
+  if (type === 'any') return 'required'
+
+  if (type === 'allowed_tools') {
+    const tools = (Array.isArray(choice.tools) ? choice.tools : [])
+      .map((tool) => {
+        if (!tool || typeof tool !== 'object') return null
+        const toolName = String(tool.name || tool.function?.name || '').trim()
+        if (tool.type === 'function' || tool.function) {
+          return toolName ? { type: 'function', name: toolName } : null
+        }
+        return tool
+      })
+      .filter(Boolean)
+    const mode = String(choice.mode || 'auto').toLowerCase() === 'required' ? 'required' : 'auto'
+    return tools.length ? { type: 'allowed_tools', mode, tools } : mode
+  }
+
+  if (type === 'function' || type === 'tool' || type === 'custom') {
+    if (!name) return type === 'custom' ? undefined : 'required'
+    return { type: type === 'tool' ? 'function' : type, name }
+  }
+
+  if (type === 'mcp') {
+    if (!choice.server_label) return name ? { type: 'function', name } : undefined
+    const out = { type: 'mcp', server_label: choice.server_label }
+    if (name) out.name = name
+    return out
+  }
+
+  if (name && !choice.name) return { type: type || 'function', name }
+  return choice
 }
 
 function toolsToCodex(tools) {
@@ -78,7 +194,7 @@ function toolsToCodex(tools) {
 
 export function chatToCodexResponses(body = {}) {
   const messages = Array.isArray(body.messages) ? body.messages : []
-  const input = messages.map(chatMessageToInput)
+  const input = messages.flatMap(chatMessageToItems)
   const out = {
     model: body.model,
     input,
@@ -87,22 +203,27 @@ export function chatToCodexResponses(body = {}) {
   }
   const tools = toolsToCodex(body.tools)
   if (tools) out.tools = tools
-  if (body.tool_choice) out.tool_choice = body.tool_choice
+  const choice = responsesToolChoice(body.tool_choice)
+  if (choice) out.tool_choice = choice
   if (body.reasoning) out.reasoning = body.reasoning
+  if (body.reasoning_effort) out.reasoning_effort = body.reasoning_effort
   if (body.max_tokens || body.max_completion_tokens) {
     out.max_output_tokens = body.max_tokens || body.max_completion_tokens
   }
+  if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
   return out
 }
 
 export function completionsToCodexResponses(body = {}) {
   const prompt = Array.isArray(body.prompt) ? body.prompt.join('\n') : String(body.prompt || '')
-  return {
+  const out = {
     model: body.model,
     input: codexTextInput(prompt),
     stream: body.stream !== false,
     store: false,
   }
+  if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
+  return out
 }
 
 /** Official Codex Responses user turn. ChatGPT Codex rejects string `input`. */
@@ -130,9 +251,14 @@ export function normalizeCodexReasoningEffort(raw) {
 
 function stripUnsupportedCodexFields(body = {}) {
   const next = { ...body }
+  // Official Codex wire uses `priority`. Public API alias `fast` is rejected upstream.
+  if (typeof next.service_tier === 'string' && next.service_tier.trim().toLowerCase() === 'fast') {
+    next.service_tier = 'priority'
+  }
   delete next.max_output_tokens
   delete next.max_tokens
   delete next.temperature
+  delete next.prompt_cache_retention
   const effort = normalizeCodexReasoningEffort(next.reasoning?.effort || next.reasoning_effort)
   delete next.reasoning_effort
   if (effort) {
@@ -142,6 +268,19 @@ function stripUnsupportedCodexFields(body = {}) {
     }
   } else {
     delete next.reasoning
+  }
+  if (next.tool_choice != null) {
+    const choice = responsesToolChoice(next.tool_choice)
+    if (choice) next.tool_choice = choice
+    else delete next.tool_choice
+  }
+  if (Array.isArray(next.input)) {
+    next.input = next.input.map((item) => {
+      if (item && typeof item === 'object' && item.type === 'message' && item.role === 'system') {
+        return { ...item, role: 'developer' }
+      }
+      return item
+    })
   }
   return next
 }
@@ -162,6 +301,7 @@ export function anthropicToCodexResponses(body = {}) {
     model: body.model,
     messages: [...system, ...messages],
     tools: body.tools,
+    tool_choice: body.tool_choice,
     stream: body.stream,
     max_tokens: body.max_tokens,
   })
@@ -188,49 +328,118 @@ export function toCodexResponses(protocol, body, convert = {}) {
   return { ok: false, code: 'protocol_not_allowed' }
 }
 
-export function responsesSseToChatChunk(line, id = 'codex') {
-  const trimmed = String(line || '').trim()
-  if (!trimmed.startsWith('data:')) return null
-  const data = trimmed.slice(5).trim()
-  if (!data || data === '[DONE]') return 'data: [DONE]\n\n'
-  let event
-  try {
-    event = JSON.parse(data)
-  } catch {
-    return null
-  }
-  const type = event.type || ''
-  if (
-    type === 'response.output_text.delta' ||
-    (event.delta && type !== 'response.completed' && type !== 'response.done')
-  ) {
-    const content = event.delta || event.text || ''
-    return `data: ${JSON.stringify({
-      id,
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content }, finish_reason: null }],
-    })}\n\n`
-  }
-  if (type === 'response.completed' || type === 'response.done') {
-    const usage = openaiChatUsage(event.response?.usage || event.usage)
-    return `data: ${JSON.stringify({
-      id,
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      ...(usage ? { usage } : {}),
-    })}\n\ndata: [DONE]\n\n`
-  }
-  return null
+export function createChatSseState(id = 'codex') {
+  return { id, seq: 0, tools: new Map(), sawTool: false, finished: false }
 }
 
-function openaiChatUsage(usage) {
-  if (!usage || typeof usage !== 'object') return null
-  const prompt = Number(usage.input_tokens ?? usage.prompt_tokens)
-  const completion = Number(usage.output_tokens ?? usage.completion_tokens)
-  if (!Number.isFinite(prompt) && !Number.isFinite(completion)) return null
-  const p = Number.isFinite(prompt) ? prompt : 0
-  const c = Number.isFinite(completion) ? completion : 0
-  return { prompt_tokens: p, completion_tokens: c, total_tokens: p + c }
+function chatChunk(id, delta, finish, extra = {}) {
+  return `data: ${JSON.stringify({
+    id,
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    ...extra,
+  })}\n\n`
+}
+
+function bindTool(state, keys, fields = {}) {
+  const names = keys.filter((key) => key != null && key !== '').map(String)
+  const existing = names.map((key) => state.tools.get(key)).find(Boolean)
+  const slot = existing || { index: state.seq++, id: '', name: '', header: false, args: '' }
+  if (fields.id) slot.id = fields.id
+  if (fields.name) slot.name = fields.name
+  for (const key of names) state.tools.set(key, slot)
+  state.sawTool = true
+  return slot
+}
+
+function toolHeaderDelta(slot) {
+  if (slot.header) return null
+  slot.header = true
+  return {
+    index: slot.index,
+    id: slot.id,
+    type: 'function',
+    function: { name: slot.name, arguments: '' },
+  }
+}
+
+function toolDoneDeltas(slot, full) {
+  const calls = []
+  const header = toolHeaderDelta(slot)
+  if (header) calls.push(header)
+  if (typeof full !== 'string' || full === slot.args) return calls
+  if (!full.startsWith(slot.args)) {
+    const error = new Error('Upstream tool arguments disagree with the streamed prefix')
+    error.code = 'tool_arguments_mismatch'
+    throw error
+  }
+  const piece = full.slice(slot.args.length)
+  slot.args = full
+  if (piece) calls.push({ index: slot.index, function: { arguments: piece } })
+  return calls
+}
+
+export function responsesSseToChatChunk(line, id = 'codex', state = null) {
+  const session = state || createChatSseState(id)
+  if (session.finished) return null
+  const parsed = parseSseData(line)
+  if (parsed.skip) return null
+  if (parsed.done) {
+    session.finished = true
+    return 'data: [DONE]\n\n'
+  }
+  const event = parsed.event || {}
+  const type = event.type || ''
+  if (
+    (type === 'response.output_item.added' || type === 'response.output_item.done') &&
+    (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')
+  ) {
+    const item = event.item
+    const slot = bindTool(session, [event.output_index, event.item_id, item.call_id, item.id], {
+      id: item.call_id || item.id,
+      name: item.name,
+    })
+    const calls = toolDoneDeltas(slot, item.arguments ?? item.input)
+    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
+  }
+  if (type === 'response.function_call_arguments.delta' || type === 'response.custom_tool_call_input.delta') {
+    const slot = bindTool(session, [event.output_index, event.item_id])
+    const calls = []
+    const header = toolHeaderDelta(slot)
+    if (header) calls.push(header)
+    if (typeof event.delta === 'string' && event.delta) {
+      slot.args += event.delta
+      calls.push({ index: slot.index, function: { arguments: event.delta } })
+    }
+    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
+  }
+  if (type === 'response.function_call_arguments.done' || type === 'response.custom_tool_call_input.done') {
+    const slot = bindTool(session, [event.output_index, event.item_id], { name: event.name })
+    const calls = toolDoneDeltas(slot, event.arguments ?? event.input)
+    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
+  }
+  if (type.startsWith('response.reasoning_') && typeof event.delta === 'string' && event.delta) {
+    return chatChunk(session.id, { reasoning_content: event.delta })
+  }
+  if (
+    type === 'response.output_text.delta' ||
+    (typeof event.delta === 'string' && event.delta && type !== 'response.completed' && type !== 'response.done')
+  ) {
+    return chatChunk(session.id, { content: event.delta || event.text || '' })
+  }
+  if (type === 'response.completed' || type === 'response.done') {
+    const calls = []
+    for (const [index, item] of (event.response?.output || []).entries()) {
+      if (item?.type !== 'function_call' && item?.type !== 'custom_tool_call') continue
+      const slot = bindTool(session, [index, item.call_id, item.id], { id: item.call_id || item.id, name: item.name })
+      calls.push(...toolDoneDeltas(slot, item.arguments ?? item.input))
+    }
+    const usage = openaiChatUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage))
+    const repaired = calls.length ? chatChunk(session.id, { tool_calls: calls }) : ''
+    session.finished = true
+    return `${repaired}${chatChunk(session.id, {}, session.sawTool ? 'tool_calls' : 'stop', usage ? { usage } : {})}data: [DONE]\n\n`
+  }
+  return null
 }
 
 function parseSseData(line) {
@@ -242,6 +451,30 @@ function parseSseData(line) {
     return { event: JSON.parse(data) }
   } catch {
     return { skip: true }
+  }
+}
+
+/**
+ * kin-codex-kernel labels every Responses SSE frame `event: response`. OpenAI names each
+ * frame after its payload (`event: response.created`, `event: response.output_text.delta`,
+ * ...), and relays such as claude-code-hub classify frames by that name, so a kernel stream
+ * reads to them as one with no content and no completion. Returns a per-stream mapper from
+ * one raw kernel line to the text to write: the kernel's event line is held and re-emitted
+ * as `event: <data.type>` in front of its data line ('' while held).
+ */
+export function createResponsesSseEventNamer() {
+  let held = null
+  return (line) => {
+    const raw = String(line ?? '')
+    if (raw.startsWith('event:')) {
+      held = raw
+      return ''
+    }
+    if (!raw.startsWith('data:')) return `${raw}\n`
+    const type = parseSseData(raw).event?.type
+    const name = typeof type === 'string' && type ? `event: ${type}` : held
+    held = null
+    return name ? `${name}\n${raw}\n` : `${raw}\n`
   }
 }
 
@@ -270,7 +503,7 @@ function outputTextFromCodex(body = {}) {
 }
 
 export function createAnthropicSseState() {
-  return { started: false, id: 'msg_codex', model: '', text: '' }
+  return { ...createChatSseState('msg_codex'), started: false, model: '', text: '', textIndex: null }
 }
 
 function anthropicEvent(type, payload) {
@@ -279,7 +512,7 @@ function anthropicEvent(type, payload) {
 
 export function responsesSseToAnthropicEvents(line, state = createAnthropicSseState()) {
   const parsed = parseSseData(line)
-  if (parsed.skip) return null
+  if (parsed.skip || state.finished) return null
   const event = parsed.event || {}
   const type = event.type || ''
   if (event.response?.id) state.id = event.response.id
@@ -301,89 +534,225 @@ export function responsesSseToAnthropicEvents(line, state = createAnthropicSseSt
         },
       }),
     )
-    frames.push(
-      anthropicEvent('content_block_start', {
-        index: 0,
-        content_block: { type: 'text', text: '' },
-      }),
-    )
+  }
+  const emitTool = (slot, calls) => {
+    ensureStart()
+    for (const call of calls) {
+      if (call.type === 'function') {
+        frames.push(
+          anthropicEvent('content_block_start', {
+            index: slot.index,
+            content_block: { type: 'tool_use', id: slot.id, name: slot.name, input: {} },
+          }),
+        )
+        if (slot.custom)
+          frames.push(
+            anthropicEvent('content_block_delta', {
+              index: slot.index,
+              delta: { type: 'input_json_delta', partial_json: '{"input":"' },
+            }),
+          )
+      } else {
+        const piece = call.function.arguments
+        frames.push(
+          anthropicEvent('content_block_delta', {
+            index: slot.index,
+            delta: { type: 'input_json_delta', partial_json: slot.custom ? JSON.stringify(piece).slice(1, -1) : piece },
+          }),
+        )
+      }
+    }
+  }
+  const closeTool = (slot) => {
+    if (slot.closed) return
+    if (slot.custom)
+      frames.push(
+        anthropicEvent('content_block_delta', {
+          index: slot.index,
+          delta: { type: 'input_json_delta', partial_json: '"}' },
+        }),
+      )
+    frames.push(anthropicEvent('content_block_stop', { index: slot.index }))
+    slot.closed = true
+  }
+  const fullItem = (item, index) => {
+    if (item?.type !== 'function_call' && item?.type !== 'custom_tool_call') return
+    const slot = bindTool(state, [index, item.call_id, item.id], { id: item.call_id || item.id, name: item.name })
+    slot.custom = item.type === 'custom_tool_call'
+    emitTool(slot, toolDoneDeltas(slot, item.arguments ?? item.input))
+    closeTool(slot)
   }
   if (
-    type === 'response.output_text.delta' ||
-    (event.delta && type !== 'response.completed' && type !== 'response.done')
+    (type === 'response.output_item.added' || type === 'response.output_item.done') &&
+    (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')
   ) {
+    const item = event.item
+    const slot = bindTool(state, [event.output_index, event.item_id, item.call_id, item.id], {
+      id: item.call_id || item.id,
+      name: item.name,
+    })
+    slot.custom = item.type === 'custom_tool_call'
+    emitTool(slot, toolDoneDeltas(slot, item.arguments ?? item.input))
+    if (type === 'response.output_item.done') closeTool(slot)
+    return frames.join('') || null
+  }
+  if (type === 'response.function_call_arguments.delta' || type === 'response.custom_tool_call_input.delta') {
+    const slot = bindTool(state, [event.output_index, event.item_id])
+    slot.custom = type === 'response.custom_tool_call_input.delta'
+    const calls = []
+    const header = toolHeaderDelta(slot)
+    if (header) calls.push(header)
+    if (typeof event.delta === 'string' && event.delta) {
+      slot.args += event.delta
+      calls.push({ index: slot.index, function: { arguments: event.delta } })
+    }
+    emitTool(slot, calls)
+    return frames.join('') || null
+  }
+  if (type === 'response.function_call_arguments.done' || type === 'response.custom_tool_call_input.done') {
+    const slot = bindTool(state, [event.output_index, event.item_id], { name: event.name })
+    slot.custom = type === 'response.custom_tool_call_input.done'
+    emitTool(slot, toolDoneDeltas(slot, event.arguments ?? event.input))
+    closeTool(slot)
+    return frames.join('') || null
+  }
+  if (type === 'response.output_text.delta' || (type.startsWith('response.reasoning_') && event.delta)) {
     const content = event.delta || event.text || ''
     if (!content) return null
     ensureStart()
+    if (state.textIndex == null) {
+      state.textIndex = state.seq++
+      frames.push(
+        anthropicEvent('content_block_start', { index: state.textIndex, content_block: { type: 'text', text: '' } }),
+      )
+    }
     state.text += content
     frames.push(
-      anthropicEvent('content_block_delta', {
-        index: 0,
-        delta: { type: 'text_delta', text: content },
-      }),
+      anthropicEvent('content_block_delta', { index: state.textIndex, delta: { type: 'text_delta', text: content } }),
     )
     return frames.join('')
   }
   if (type === 'response.completed' || type === 'response.done' || parsed.done) {
     ensureStart()
-    const usage = event.response?.usage || event.usage || {}
-    const output = Number(usage.output_tokens ?? usage.completion_tokens) || 0
-    frames.push(anthropicEvent('content_block_stop', { index: 0 }))
+    for (const [index, item] of (event.response?.output || []).entries()) fullItem(item, index)
+    for (const slot of new Set(state.tools.values())) closeTool(slot)
+    if (state.textIndex != null) frames.push(anthropicEvent('content_block_stop', { index: state.textIndex }))
     frames.push(
       anthropicEvent('message_delta', {
-        delta: { stop_reason: 'end_turn' },
-        usage: { output_tokens: output },
+        delta: { stop_reason: state.sawTool ? 'tool_use' : 'end_turn' },
+        usage: openaiAnthropicUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage)),
       }),
     )
     frames.push(anthropicEvent('message_stop', {}))
+    state.finished = true
     return frames.join('')
   }
   return null
 }
 
 export function assembleCodexBodyFromSse(chunks = [], fallback = {}) {
-  let text = outputTextFromCodex(fallback)
-  let usage = fallback.usage || fallback.response?.usage || {}
-  let id = fallback.id || fallback.response?.id
-  let model = fallback.model || fallback.response?.model
+  let response = fallback.response || fallback
+  let usage = response.usage || {}
+  const state = createChatSseState()
   const deltas = []
+  let output = response.output || []
   for (const line of chunks) {
-    const parsed = parseSseData(line)
-    if (parsed.skip || !parsed.event) continue
-    const ev = parsed.event
-    if (ev.response?.id) id = ev.response.id
-    if (ev.response?.model) model = ev.response.model
+    const event = parseSseData(line).event
+    if (!event) continue
+    if (event.response) response = { ...response, ...event.response }
+    if (event.response?.usage || event.usage) usage = event.response?.usage || event.usage
+    if (event.type === 'response.output_text.delta') deltas.push(event.delta || '')
+    const item = event.item
     if (
-      ev.type === 'response.output_text.delta' ||
-      (ev.delta && ev.type !== 'response.completed' && ev.type !== 'response.done')
+      (event.type === 'response.output_item.added' || event.type === 'response.output_item.done') &&
+      (item?.type === 'function_call' || item?.type === 'custom_tool_call')
     ) {
-      const piece = ev.delta || ev.text || ''
-      if (piece) deltas.push(piece)
+      const slot = bindTool(state, [event.output_index, event.item_id, item.call_id, item.id], {
+        id: item.call_id || item.id,
+        name: item.name,
+      })
+      slot.type = item.type
+      slot.itemId = item.id
+      toolDoneDeltas(slot, item.arguments ?? item.input)
+    } else if (
+      event.type === 'response.function_call_arguments.delta' ||
+      event.type === 'response.custom_tool_call_input.delta'
+    ) {
+      const slot = bindTool(state, [event.output_index, event.item_id])
+      slot.type = event.type === 'response.custom_tool_call_input.delta' ? 'custom_tool_call' : 'function_call'
+      slot.args += event.delta || ''
+    } else if (
+      event.type === 'response.function_call_arguments.done' ||
+      event.type === 'response.custom_tool_call_input.done'
+    ) {
+      const slot = bindTool(state, [event.output_index, event.item_id], { name: event.name })
+      slot.type = event.type === 'response.custom_tool_call_input.done' ? 'custom_tool_call' : 'function_call'
+      toolDoneDeltas(slot, event.arguments ?? event.input)
     }
-    if (ev.response?.usage || ev.usage) usage = ev.response?.usage || ev.usage
+    if (event.response?.output) output = event.response.output
   }
-  if (deltas.length) text = deltas.join('')
-  return {
-    ...fallback,
-    id: id || fallback.id,
-    model: model || fallback.model,
-    output: [{ content: [{ type: 'output_text', text }] }],
-    usage,
+  const tools = [...new Set(state.tools.values())].map((slot) => ({
+    type: slot.type,
+    ...(slot.itemId ? { id: slot.itemId } : {}),
+    call_id: slot.id,
+    name: slot.name,
+    [slot.type === 'custom_tool_call' ? 'input' : 'arguments']: slot.args,
+  }))
+  // Complete output is authoritative; only repair tools absent from it.
+  const known = new Set(
+    output
+      .filter((item) => item?.type === 'function_call' || item?.type === 'custom_tool_call')
+      .map((item) => item.call_id || item.id),
+  )
+  output = [...output, ...tools.filter((item) => !known.has(item.call_id || item.id))]
+  if (!output.some((item) => item?.type === 'message' || item?.content?.length)) {
+    const text = deltas.length ? deltas.join('') : outputTextFromCodex(response)
+    if (text || !output.length)
+      output.unshift({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] })
   }
+  return { ...response, output, usage }
+}
+
+/** Conversion errors a client should see as a structured 502, not a crash. */
+export function isToolArgumentsError(error) {
+  return error?.code === 'tool_arguments_mismatch' || error?.code === 'tool_arguments_invalid'
+}
+
+function toolUseInput(item) {
+  if (item.type === 'custom_tool_call') return { input: item.input || '' }
+  const args = item.arguments
+  if (args && typeof args === 'object' && !Array.isArray(args)) return args
+  let parsed = null
+  try {
+    parsed = JSON.parse(args || '{}')
+  } catch {}
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+  const error = new Error(`Codex tool ${item.name || item.call_id || ''} arguments are not a JSON object`)
+  error.code = 'tool_arguments_invalid'
+  throw error
 }
 
 export function codexBodyToAnthropicMessage(body = {}, model = '') {
   const resp = body?.response && typeof body.response === 'object' ? body.response : body
-  const usage = resp?.usage || body?.usage || {}
-  const input = Number(usage.input_tokens ?? usage.prompt_tokens) || 0
-  const output = Number(usage.output_tokens ?? usage.completion_tokens) || 0
+  const content = []
+  for (const item of resp.output || []) {
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      content.push({ type: 'tool_use', id: item.call_id || item.id, name: item.name, input: toolUseInput(item) })
+    } else {
+      for (const block of item.content || []) {
+        if (block.type === 'output_text' || block.type === 'text')
+          content.push({ type: 'text', text: block.text || '' })
+      }
+    }
+  }
+  if (!content.length) content.push({ type: 'text', text: outputTextFromCodex(resp) })
   return {
     id: resp?.id || 'msg_codex',
     type: 'message',
     role: 'assistant',
     model: resp?.model || model || 'gpt',
-    content: [{ type: 'text', text: outputTextFromCodex(resp) }],
-    stop_reason: 'end_turn',
-    usage: { input_tokens: input, output_tokens: output },
+    content,
+    stop_reason: content.some((block) => block.type === 'tool_use') ? 'tool_use' : 'end_turn',
+    usage: openaiAnthropicUsageFromExtract(extractOpenaiUsage(resp?.usage || body?.usage || {})),
   }
 }

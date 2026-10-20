@@ -34,7 +34,21 @@ test('fingerprint ignores stream and max_tokens, includes model', () => {
   assert.notEqual(a, c)
 })
 
-test('AUP and stop_reason=refusal count as upstream refusal; distill does not', () => {
+test('envelope persistable JSON bodies keep distinct fingerprints', () => {
+  const a = refusalFingerprint(
+    body(
+      'thread_id: 01a057ba-d606-7255-a932-a2cfad833afe\n\nPersistable response items (JSON):\n[{"role":"user","text":"再windows 重装 cli"}]',
+    ),
+  )
+  const b = refusalFingerprint(
+    body(
+      'thread_id: 01a0bb2c-a363-7707-8691-ba523befae35\n\nPersistable response items (JSON):\n[{"role":"user","text":"pull最新源码"}]',
+    ),
+  )
+  assert.notEqual(a, b)
+})
+
+test('stop_reason=refusal and Usage Policy API Error are cacheable; distill is not', () => {
   assert.equal(
     isUpstreamRefusal({
       body: {
@@ -46,8 +60,22 @@ test('AUP and stop_reason=refusal count as upstream refusal; distill does not', 
     }),
     true,
   )
+  assert.equal(
+    isUpstreamRefusal(
+      { status: 400, terminalState: 'rejected' },
+      {
+        error_message:
+          'API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup)',
+      },
+    ),
+    true,
+  )
   assert.equal(isUpstreamRefusal({ finalState: 'content_filter' }), true)
   assert.equal(isUpstreamRefusal({ body: { stop_reason: 'refusal' } }), true)
+  assert.equal(
+    isUpstreamRefusal({ body: { content: [{ type: 'refusal', refusal: 'I cannot help with that.' }] } }),
+    true,
+  )
   assert.equal(isUpstreamRefusal({ body: { error: { code: 'distill_blocked', message: '不允许蒸馏' } } }), false)
 })
 
@@ -87,13 +115,59 @@ test('remember then lookup hits the same prompt', () => {
   }
 })
 
-test('guard error is permission_error refusal_guard not distill_blocked', () => {
+test('timed refusal expires and no longer blocks', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refusal-'))
+  const db = createDatabase({ dataDir: dir })
+  try {
+    const repo = new RefusalGuardsRepo(db)
+    const req = body('pause this 500')
+    const fp = refusalFingerprint(req)
+    repo.remember({
+      fingerprint: fp,
+      model: req.model,
+      requestId: 'req-500',
+      errorMessage: 'upstream 503',
+      preview: 'pause this 500',
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    })
+    assert.equal(repo.get(fp), null)
+    assert.equal(repo.list().length, 0)
+  } finally {
+    db.close()
+  }
+})
+test('guard error is a non-retryable HTTP 400 request rejection, not a login error', () => {
   const err = refusalGuardError('abc')
-  assert.equal(err.status, 403)
+  assert.equal(err.status, 400)
   assert.equal(err.body.error.code, 'refusal_guard')
-  assert.equal(err.body.error.type, 'permission_error')
+  assert.equal(err.body.error.type, 'policy_blocked')
   assert.equal(err.body.error.message, REFUSAL_GUARD_MESSAGE)
-  assert.notEqual(err.body.error.code, 'distill_blocked')
+  assert.deepEqual(err.body.error.details, { blocked_by: 'exact', retryable: false })
+
+  const deviceSourceRequestId = '36e239bf-7e70-4a79-80fd-c8a717ff464b'
+  const device = refusalGuardError('abc', {
+    kind: 'device',
+    row: { reason: 'jev:safety', source_request_id: deviceSourceRequestId },
+  })
+  assert.equal(device.body.error.message, `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁（jev:safety）。`)
+  assert.deepEqual(device.body.error.details, {
+    reason: 'device',
+    ban_reason: 'jev:safety',
+    blocked_by: 'device',
+    retryable: false,
+    source_request_id: deviceSourceRequestId,
+  })
+  const exact = refusalGuardError('abc', { kind: 'exact' })
+  assert.equal(exact.body.error.message, `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容完全一致。`)
+  assert.deepEqual(exact.body.error.details, { reason: 'exact', blocked_by: 'exact', retryable: false })
+  const similar = refusalGuardError('abc', { kind: 'similar', score: 0.93 })
+  assert.equal(similar.body.error.message, `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似（相似度 93%）。`)
+  assert.deepEqual(similar.body.error.details, {
+    reason: 'similar',
+    score: 0.93,
+    blocked_by: 'similar',
+    retryable: false,
+  })
 })
 
 test('list remove and clear', () => {

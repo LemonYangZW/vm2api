@@ -15,6 +15,57 @@ import {
   CHATGPT_RESET_CONSUME_URL,
 } from '../../src/lib/oauth/openai-quota.mjs'
 import { persistCodexQuotaSnapshot } from '../../src/lib/vm/codex-slot.mjs'
+import {
+  evaluateOpenAIQuotaGate,
+  effectiveOpenAIPolicy,
+  mergeOpenAIQuotaPolicy,
+} from '../../src/lib/pool/openai-quota-policy.mjs'
+
+test('OpenAI local quota gate blocks equality without inventing a reset and recovers after reset', () => {
+  const now = Date.parse('2026-10-06T00:00:00.000Z')
+  const reset = new Date(now + 60_000).toISOString()
+  const vm = {
+    codex: {
+      extra: {
+        codex_5h_used_percent: 80,
+        codex_5h_reset_at: reset,
+        codex_7d_used_percent: 10,
+        codex_7d_reset_at: reset,
+      },
+    },
+  }
+  assert.equal(evaluateOpenAIQuotaGate(vm, { limit_5h: 0.8, limit_7d: 1 }, now).reason, 'quota_5h_local')
+  assert.equal(evaluateOpenAIQuotaGate(vm, { limit_5h: 0.81, limit_7d: 1 }, now).limited, false)
+  const unknownReset = evaluateOpenAIQuotaGate(
+    { codex: { extra: { codex_5h_used_percent: 80 } } },
+    { limit_5h: 0.8 },
+    now,
+  )
+  assert.equal(unknownReset.limited, true)
+  assert.equal(unknownReset.until, null)
+  assert.equal(
+    evaluateOpenAIQuotaGate(
+      { codex: { extra: { codex_5h_used_percent: 100, codex_5h_reset_at: new Date(now - 1).toISOString() } } },
+      { limit_5h: 0.8 },
+      now,
+    ).limited,
+    false,
+  )
+})
+
+test('OpenAI policy pins and null-reset inheritance remain platform-local', () => {
+  const global = mergeOpenAIQuotaPolicy({}, { max_concurrency: 8, max_rpm: 120, max_sessions: 4 })
+  assert.deepEqual(effectiveOpenAIPolicy({ policy: { maxConcurrency: 3, concurrencyOverride: true } }, global), {
+    max_concurrency: 3,
+    max_rpm: 120,
+    max_sessions: 4,
+    concurrency_override: true,
+    rpm_override: false,
+    sessions_override: false,
+  })
+  assert.equal(effectiveOpenAIPolicy({ policy: { maxSessions: 0, sessionsOverride: false } }, global).max_sessions, 4)
+  assert.equal(effectiveOpenAIPolicy({ policy: { maxSessions: 6, sessionsOverride: true } }, global).max_sessions, 6)
+})
 
 test('extraFromRateLimit maps shorter window to 5h', () => {
   const extra = extraFromRateLimit({
@@ -72,6 +123,20 @@ test('quota headers carry Codex originator and account id', () => {
   assert.equal(headers['chatgpt-account-id'], 'acc-1')
   assert.equal(headers.originator, 'Codex Desktop')
   assert.equal(headers['openai-beta'], 'codex-1')
+})
+
+test('quota headers use the access token account when imported metadata has no account id', () => {
+  const payload = Buffer.from(
+    JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'account-from-token' } }),
+  ).toString('base64url')
+  const headers = buildOpenaiQuotaHeaders({ accessToken: `header.${payload}.signature` })
+  assert.equal(headers['chatgpt-account-id'], 'account-from-token')
+  assert.equal(
+    buildOpenaiQuotaHeaders({ accessToken: `header.${payload}.signature`, accountId: 'stale-account' })[
+      'chatgpt-account-id'
+    ],
+    'account-from-token',
+  )
 })
 
 function writeGptSlot(root, id = 'vm-codex-01') {
@@ -220,4 +285,66 @@ test('persistCodexQuotaSnapshot keeps expiration list', () => {
   const vm = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-codex-01.json'), 'utf8'))
   assert.equal(vm.codex.extra.codex_5h_used_percent, 8)
   assert.equal(vm.codex.reset_credits.credits[0].expires_at, '2026-07-04T04:05:06Z')
+})
+
+test('persisted GPT quota survives summarizeVm and exposes plan_type', async () => {
+  const { getVm, summarizeVm } = await import('../../src/lib/vm/vm-registry.mjs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-summary-'))
+  writeGptSlot(root)
+  const result = await queryOpenaiQuota({
+    projectRoot: root,
+    vmId: 'vm-codex-01',
+    fetchImpl: async (url) => {
+      if (String(url).startsWith(CHATGPT_RESET_CREDITS_URL)) return { status: 200, json: async () => ({ credits: [] }) }
+      return {
+        status: 200,
+        json: async () => ({
+          plan_type: 'team',
+          rate_limit: {
+            allowed: false,
+            limit_reached: true,
+            primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_at: 1_790_449_975 },
+            secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_at: 1_791_012_272 },
+          },
+        }),
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.plan_type, 'team')
+  const s = summarizeVm(getVm(root, 'vm-codex-01'), root)
+  assert.equal(s.utilization_5h, 1)
+  assert.equal(s.utilization_7d, 0.16)
+  assert.equal(s.reset_5h, new Date(1_790_449_975_000).toISOString())
+  assert.equal(s.reset_7d, new Date(1_791_012_272_000).toISOString())
+  assert.equal(s.status_5h, 'limited')
+  assert.deepEqual(
+    s.codex_usage.windows.map((w) => [w.id, w.used_percent]),
+    [
+      ['5h', 100],
+      ['7d', 16],
+    ],
+  )
+  assert.equal(s.plan_type, 'team')
+})
+
+test('raw primary/secondary quota and normalized views agree at local boundaries', () => {
+  const now = Date.parse('2026-10-07T00:00:00Z')
+  const vm = {
+    codex: {
+      extra: {
+        codex_primary_used_percent: 50,
+        codex_primary_window_minutes: 300,
+        codex_secondary_used_percent: 70,
+        codex_secondary_window_minutes: 10080,
+      },
+    },
+  }
+  const gate = evaluateOpenAIQuotaGate(vm, { limit_5h: 0.5, limit_7d: 0.6 }, now)
+  assert.equal(gate.reason, 'quota_5h_local')
+  assert.equal(gate.until, null)
+  vm.codex.extra.codex_primary_reset_at = new Date(now - 1).toISOString()
+  assert.equal(evaluateOpenAIQuotaGate(vm, { limit_5h: 0.5, limit_7d: 0.6 }, now).reason, 'quota_7d_local')
+  assert.equal(evaluateOpenAIQuotaGate({ utilization_5h: 1.2 }, { limit_5h: 1 }, now).reason, 'quota_5h_local')
+  assert.equal(evaluateOpenAIQuotaGate({ utilization_5h: null }, { limit_5h: 0.3 }, now).limited, false)
 })

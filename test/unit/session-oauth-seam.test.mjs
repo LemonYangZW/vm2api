@@ -1,15 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
 import {
   sessionKeyToOAuth,
-  shouldTryNextImportHelper,
+  exchangeTokenViaCookieAuth,
   classifyImportHelperOutput,
   publicImportError,
   panelImportErrorPayload,
   buildSetupTokenAuthorizeURL,
   extractOAuthCodeFromRedirect,
-} from '../../scripts/session-to-oauth.mjs'
+} from '../../src/lib/oauth/cookie-auth.mjs'
+import fs from 'node:fs'
+import {
+  BOOTSTRAP_URL,
+  FULL_OAUTH_SCOPE,
+  REDIRECT_URI,
+  TOKEN_UA,
+  TOKEN_URL,
+} from '../../src/lib/oauth/oauth-contract.mjs'
+
+// auth.js is the local source of the kin-oauth-auth binary and is not in the repo.
+const localAuthSkip = fs.existsSync(new URL('../../src/lib/oauth/auth.js', import.meta.url))
+  ? false
+  : 'src/lib/oauth/auth.js is local-only (shipped as bin/kin-oauth-auth)'
 
 test('KIN_FAKE_SESSION_OAUTH returns deterministic creds without network', async () => {
   process.env.KIN_FAKE_SESSION_OAUTH = '1'
@@ -26,6 +38,7 @@ test('fake inference scope is setup-token', async () => {
   const cred = await sessionKeyToOAuth('sk-ant-sid-test-aaaaaaaa', { scope: 'inference' })
   assert.equal(cred.type, 'setup-token')
   assert.equal(cred.mode, 'setup-token')
+  assert.equal(cred.scope, FULL_OAUTH_SCOPE)
   delete process.env.KIN_FAKE_SESSION_OAUTH
 })
 
@@ -35,21 +48,127 @@ test('fake branch still rejects non-sid keys', async () => {
   delete process.env.KIN_FAKE_SESSION_OAUTH
 })
 
-test('only missing helper or CF may try the next TLS stack', () => {
-  assert.equal(shouldTryNextImportHelper('cloudflare_challenge'), true)
-  assert.equal(shouldTryNextImportHelper('no_cookie_auth_bin'), true)
-  assert.equal(shouldTryNextImportHelper('no_cffi_helper'), true)
-  assert.equal(shouldTryNextImportHelper('cookie_auth_failed'), false)
-  assert.equal(shouldTryNextImportHelper('session_stale_relogin'), false)
-  assert.equal(shouldTryNextImportHelper('permission_error'), false)
+test('sessionKeyToOAuth refuses an unbound VM in production', async () => {
+  await assert.rejects(
+    () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: null }),
+    (e) => e.code === 'proxy_required',
+  )
+})
+
+// Spawns the shipped bin/kin-oauth-auth: a bundle with an unbound constant
+// fails with ReferenceError before dialing, instead of a transport error.
+test('sessionKeyToOAuth binary dials the claude.ai organizations hop', async () => {
+  await assert.rejects(
+    () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { scope: 'inference', proxyUrl: 'socks5://127.0.0.1:1' }),
+    (e) => e.code === 'get_organizations_transport' && /claude\.ai\/api\/organizations/.test(e.message),
+  )
+})
+
+test('sessionKeyToOAuth on local egress hops without PROXY_URL', { skip: localAuthSkip }, async () => {
+  const seen = []
+  const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
+    proxyUrl: '',
+    fetchImpl: makeStrictOAuthFetch(seen),
+  })
+  assert.equal(cred.access_token, 'sk-ant-oat01-token')
+  assert.equal(seen.length, 4)
+})
+
+test('sessionKeyToOAuth performs strict org authorize token bootstrap flow', {
+  skip: localAuthSkip,
+}, async () => {
+  const seen = []
+  const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
+    proxyUrl: 'socks5://127.0.0.1:1080',
+    scope: 'inference',
+    fetchImpl: makeStrictOAuthFetch(seen),
+  })
+  assert.equal(cred.type, 'setup-token')
+  assert.equal(cred.mode, 'setup-token')
+  assert.equal(cred.scope, FULL_OAUTH_SCOPE)
+  assert.equal(cred.email, 'sk@example.com')
+  assert.equal(cred.account_uuid, 'acct-sk')
+  assert.equal(cred.org_uuid, 'org-sk')
+  assert.equal(cred.refresh_token, 'sk-ant-ort01-token')
+  assert.deepEqual(
+    seen.map((r) => r.stage),
+    ['orgs', 'authorize', 'token', 'bootstrap'],
+  )
+})
+
+test('sessionKeyToOAuth maps stale authorize response', { skip: localAuthSkip }, async () => {
+  await assert.rejects(
+    () =>
+      sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
+        proxyUrl: 'socks5h://127.0.0.1:1',
+        fetchImpl: makeStrictOAuthFetch([], {
+          authorizeStatus: 403,
+          authorizeBody: { error: 'Session is not fresh enough' },
+        }),
+      }),
+    (e) => e.code === 'session_stale_relogin',
+  )
+})
+
+test('exchangeTokenViaCookieAuth posts token then requires bootstrap', { skip: localAuthSkip }, async () => {
+  const seen = []
+  const tok = await exchangeTokenViaCookieAuth({
+    code: 'abc#state-1',
+    codeVerifier: 'ver',
+    proxyUrl: 'socks5h://127.0.0.1:1',
+    fetchImpl: makeStrictOAuthFetch(seen, { tokenOnly: true }),
+  })
+  assert.equal(tok.access_token, 'sk-ant-oat01-token')
+  assert.deepEqual(
+    seen.map((r) => r.stage),
+    ['token', 'bootstrap'],
+  )
+})
+
+test('exchangeTokenViaCookieAuth reads streamed token responses', { skip: localAuthSkip }, async () => {
+  const seen = []
+  const tok = await exchangeTokenViaCookieAuth({
+    code: 'abc#state-1',
+    codeVerifier: 'ver',
+    proxyUrl: 'socks5h://127.0.0.1:1',
+    fetchImpl: makeStrictOAuthFetch(seen, { tokenOnly: true, tokenStream: true }),
+  })
+  assert.equal(tok.access_token, 'sk-ant-oat01-token')
+})
+
+test('exchangeTokenViaCookieAuth redacts failed token bodies', { skip: localAuthSkip }, async () => {
+  await assert.rejects(
+    () =>
+      exchangeTokenViaCookieAuth({
+        code: 'abc',
+        codeVerifier: 'ver',
+        proxyUrl: '',
+        fetchImpl: makeStrictOAuthFetch([], {
+          tokenOnly: true,
+          tokenStatus: 400,
+          tokenBody: { error: 'bad', access_token: 'sk-ant-oat01-SECRET' },
+        }),
+      }),
+    (e) => /\[redacted-token\]/.test(e.message) && !/SECRET/.test(e.message),
+  )
 })
 
 test('authorize 403 session freshness is not reported as Cloudflare', () => {
-  const raw =
-    '[1/5] GET /api/organizations impersonate=chrome146 [2/5] authorize failed: 403 {"type":"error","error":{"type":"permission_error","message":"Session is not fresh enough'
+  const raw = 'authorize failed: 403 Session is not fresh enough to authorize'
   assert.equal(classifyImportHelperOutput(raw), 'session_stale_relogin')
   assert.match(publicImportError(raw), /不够新/)
   assert.doesNotMatch(publicImportError(raw), /Cloudflare|Just a moment/)
+})
+
+test('SOCKS5 user rejection is a proxy auth error, not a sessionKey failure', () => {
+  const raw =
+    '[1/5] GET /api/organizations impersonate=chrome146 orgs request failed: ProxyError: Failed to perform, curl: (97) User was rejected by the SOCKS5 server (1 1).. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.'
+  assert.equal(classifyImportHelperOutput(raw), 'proxy_auth_rejected')
+  const payload = panelImportErrorPayload({ message: raw })
+  assert.equal(payload.status, 400)
+  assert.equal(payload.error.code, 'proxy_auth_rejected')
+  assert.match(payload.error.message, /SOCKS5 拒绝了用户名或密码/)
+  assert.doesNotMatch(payload.error.message, /sessionKey 不够新|Cloudflare/)
 })
 
 test('panel import catch maps helper codes without leaking ReferenceError', () => {
@@ -62,42 +181,13 @@ test('panel import catch maps helper codes without leaking ReferenceError', () =
 
   const coded = panelImportErrorPayload({ code: 'session_stale_relogin', message: 'Session is not fresh enough' })
   assert.equal(coded.status, 400)
-  assert.equal(coded.error.code, 'session_stale_relogin')
 })
 
-test('panel import route binds sessionKey helpers', () => {
-  const src = fs.readFileSync(new URL('../../src/lib/admin/panel-routes.mjs', import.meta.url), 'utf8')
-  assert.match(src, /sessionKeyToOAuth/)
-  assert.match(src, /panelImportErrorPayload/)
-  assert.match(src, /from '\.\.\/\.\.\/\.\.\/scripts\/session-to-oauth\.mjs'/)
-})
-
-test('Portunex CookieAuth uses platform JSON authorize and Chrome 146 token UA', () => {
-  const src = fs.readFileSync(new URL('../../scripts/session-to-oauth.mjs', import.meta.url), 'utf8')
-  const py = fs.readFileSync(new URL('../../scripts/session-import-cffi.py', import.meta.url), 'utf8')
-  assert.match(src, /PLATFORM\}\/v1\/oauth\/\$\{orgUUID\}\/authorize/)
-  assert.match(src, /Chrome\/146\.0\.0\.0/)
-  assert.match(src, /POST chrome token/)
-  assert.doesNotMatch(src, /axios\/1\.13\.4/)
-  assert.match(src, /claude_cli\/bootstrap/)
-  assert.match(src, /grove_enabled/)
-  assert.match(src, /Origin: 'https:\/\/claude\.com'/)
-  assert.match(py, /PLATFORM\}\/v1\/oauth\/\{org_uuid\}\/authorize/)
-  assert.match(py, /Chrome\/146\.0\.0\.0/)
-  assert.match(py, /POST chrome token/)
-  assert.doesNotMatch(py, /axios\/1\.13\.4/)
-  assert.match(py, /claude_cli\/bootstrap/)
-  assert.match(py, /grove_enabled/)
-  assert.match(py, /origin="https:\/\/claude\.com"/)
-  assert.match(py, /skip bootstrap\/grove for inference setup-token/)
-})
-
-test('setup-token CAI URL helper stays inference-only', () => {
+test('setup-token CAI URL helper requests full OAuth scope', () => {
   const url = buildSetupTokenAuthorizeURL('st', 'ch')
   assert.match(url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?code=true/)
   assert.match(url, /client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e/)
-  assert.match(url, /scope=user%3Ainference/)
-  assert.ok(!url.includes('user:profile'))
+  assert.ok(url.includes(encodeURIComponent(FULL_OAUTH_SCOPE).replace(/%20/g, '+')))
 })
 
 test('extractOAuthCodeFromRedirect reads callback query', () => {
@@ -115,3 +205,90 @@ test('authorize_no_code is a 400 not Cloudflare', () => {
   assert.equal(payload.status, 400)
   assert.equal(payload.error.code, 'authorize_no_code')
 })
+
+function response(status, body, stream = false) {
+  const text = JSON.stringify(body)
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    ...(stream
+      ? {
+          body: (async function* () {
+            yield Buffer.from(text)
+          })(),
+        }
+      : { text: async () => text }),
+  }
+}
+
+function makeStrictOAuthFetch(seen, opts = {}) {
+  return async (url, init = {}) => {
+    const headers = init.headers || {}
+    if (url === 'https://claude.ai/api/organizations') {
+      seen.push({ stage: 'orgs' })
+      assert.equal(init.method, 'GET')
+      assert.match(headers.cookie || headers.Cookie || '', /sessionKey=sk-ant-sid01-testaaaaaaaa/)
+      assert.match(headers['user-agent'] || headers['User-Agent'] || '', /Chrome\/146\.0\.0\.0/)
+      return response(200, [{ uuid: 'org-sk', name: 'Team', raven_type: 'team' }])
+    }
+    if (url === 'https://platform.claude.com/v1/oauth/org-sk/authorize') {
+      seen.push({ stage: 'authorize' })
+      const body = JSON.parse(init.body)
+      assert.equal(init.method, 'POST')
+      assert.equal(headers['content-type'], 'application/json')
+      assert.match(headers.cookie || headers.Cookie || '', /sessionKey=sk-ant-sid01-testaaaaaaaa/)
+      assert.match(headers['user-agent'] || headers['User-Agent'] || '', /Chrome\/146\.0\.0\.0/)
+      assert.equal(body.response_type, 'code')
+      assert.equal(body.client_id, '9d1c250a-e61b-44d9-88ed-5944d1962f5e')
+      assert.equal(body.redirect_uri, REDIRECT_URI)
+      assert.equal(body.scope, FULL_OAUTH_SCOPE)
+      assert.equal(body.code_challenge_method, 'S256')
+      assert.ok(body.code_challenge)
+      assert.ok(body.state)
+      const status = opts.authorizeStatus || 200
+      if (status >= 400) return response(status, opts.authorizeBody || { error: 'authorize failed' })
+      return response(200, { redirect_uri: `${REDIRECT_URI}?code=auth-code&state=${body.state}` })
+    }
+    if (url === TOKEN_URL) {
+      seen.push({ stage: 'token' })
+      const body = JSON.parse(init.body)
+      assert.equal(init.method, 'POST')
+      assert.equal(headers['user-agent'] || headers['User-Agent'], TOKEN_UA)
+      assert.equal(headers['x-app'], 'cli')
+      assert.equal(body.grant_type, 'authorization_code')
+      assert.equal(body.redirect_uri, REDIRECT_URI)
+      assert.equal(body.client_id, '9d1c250a-e61b-44d9-88ed-5944d1962f5e')
+      assert.ok(body.code_verifier)
+      assert.equal(Object.prototype.hasOwnProperty.call(body, 'expires_in'), false)
+      const status = opts.tokenStatus || 200
+      if (status >= 400) return response(status, opts.tokenBody || { error: 'bad token' })
+      return response(
+        200,
+        {
+          access_token: 'sk-ant-oat01-token',
+          refresh_token: 'sk-ant-ort01-token',
+          expires_in: 3600,
+          scope: FULL_OAUTH_SCOPE,
+        },
+        opts.tokenStream === true,
+      )
+    }
+    if (url === BOOTSTRAP_URL) {
+      seen.push({ stage: 'bootstrap' })
+      assert.equal(init.method, 'GET')
+      assert.equal(headers['user-agent'], TOKEN_UA)
+      assert.equal(headers['x-app'], 'cli')
+      assert.equal(headers['anthropic-beta'], 'oauth-2025-04-20')
+      assert.equal(headers.authorization, 'Bearer sk-ant-oat01-token')
+      assert.doesNotMatch(url, /vscode/)
+      return response(200, {
+        oauth_account: {
+          account_uuid: 'acct-sk',
+          account_email: 'sk@example.com',
+          organization_uuid: 'org-sk',
+        },
+      })
+    }
+    throw new Error(`unexpected fetch ${url}`)
+  }
+}

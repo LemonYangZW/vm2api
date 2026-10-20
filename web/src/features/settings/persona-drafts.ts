@@ -70,16 +70,6 @@ export function overlayTemplatesPayload(drafts: OverlayDrafts) {
   return out
 }
 
-export const PERSONA_SCHEME_BLURB: Record<PersonaPreset, string> = {
-  official:
-    'billing / identity / 调用方 agent / leftover。无 Environment，默认不遮罩 usage。',
-  official_full:
-    '官方全文 + Environment。billing / identity / agent_official / env_official / leftover。',
-  zero: '与 official_full 同槽位；身份折进 prompt_version；identity/agent 零宽占位；强制关 overlay。',
-  custom:
-    '完全按 JSONL 组装。空数组会静默回落官方提示词，不是「什么都不注入」。',
-}
-
 export function personaDraftStoresEmpty(
   text: string,
   key: PersonaPreset
@@ -93,24 +83,9 @@ export function personaDraftStoresEmpty(
 
 export function personaSchemeSummary(text: string, key: PersonaPreset): string {
   const { blocks, errors } = parsePersonaTemplateLines(text)
-  if (errors.length) return `${errors.length} 处 JSONL 错误，点配置修复`
+  if (errors.length) return `${errors.length} 处错误`
   const stored = templateOrFollowPreset(blocks, DEFAULT_PERSONA_TEMPLATES, key)
-  const effective = stored.length
-    ? stored
-    : presetSeed(DEFAULT_PERSONA_TEMPLATES, key)
-  const ids = effective
-    .map((block) => String(block.id ?? '-'))
-    .filter(Boolean)
-    .join(' / ')
-  const hideN = effective.filter((block) => block.hide === true).length
-  if (key === 'custom' && stored.length === 0) {
-    return `空数组，保存后回落官方提示词（${ids}）`
-  }
-  const bits = [
-    stored.length === 0 ? '跟随内置预设' : '已改模板',
-    `${effective.length} 块`,
-  ]
-  if (ids) bits.push(ids)
-  if (hideN) bits.push(`${hideN} 块遮罩 usage`)
-  return bits.join(' · ')
+  if (key === 'custom' && stored.length === 0) return '空 · 回落官方'
+  if (stored.length === 0) return '内置'
+  return `已改 · ${stored.length} 块`
 }

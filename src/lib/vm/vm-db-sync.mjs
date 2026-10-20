@@ -21,7 +21,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { isDbOpen, getDb } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
-import { setVmWriteHook, atomicWriteJson } from './vm-file.mjs'
+import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
+import { reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
 
 let _repo = null
 let _watcher = null
@@ -38,7 +39,7 @@ export function isVmJsonPath(filePath) {
   const base = path.basename(String(filePath || ''))
   const dir = path.basename(path.dirname(String(filePath || '')))
   if (dir !== 'vms') return false
-  return (/^vm-.*\.json$/.test(base) && !base.endsWith('-chat.json')) || base === 'active.json'
+  return isVmRecordFile(base) || base === 'active.json'
 }
 
 /** Mirror one vms/*.json file into the DB (safe no-op without DB). */
@@ -69,6 +70,14 @@ export function removeVmFromDb(id) {
   return r.remove(id)
 }
 
+/** Forget settings.active_vm so startup reconcile does not rewrite active.json. */
+export function clearActiveVmFromDb() {
+  const r = repo()
+  if (!r) return false
+  r.clearActiveVmId()
+  return true
+}
+
 /**
  * Startup reconcile:
  *   - file newer than DB row (or row missing) → upsert from file
@@ -84,7 +93,7 @@ export function reconcileVms(projectRoot) {
 
   if (fs.existsSync(dir)) {
     for (const f of fs.readdirSync(dir)) {
-      if (!/^vm-.*\.json$/.test(f) || f.endsWith('-chat.json')) continue
+      if (!isVmRecordFile(f)) continue
       const file = path.join(dir, f)
       try {
         const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -143,6 +152,31 @@ export function initVmDbSync(projectRoot, { watch = true } = {}) {
     if (isVmJsonPath(filePath)) syncVmFile(filePath)
   })
   const result = reconcileVms(projectRoot)
+  // Older releases soft-deleted tenants without releasing their assigned slots.
+  // Only confirmed deletions qualify; disabled/missing users and private slots stay isolated.
+  const deletedOwners = isDbOpen()
+    ? new Set(
+        getDb()
+          .prepare('SELECT id FROM users WHERE deleted_at IS NOT NULL')
+          .all()
+          .map((row) => row.id),
+      )
+    : new Set()
+  result.reclaimed_vm_ids = reclaimAssignedVms(projectRoot, deletedOwners, {
+    onError: (error, name) => {
+      console.warn(`[vm] ownership recovery skipped ${name}: ${error.code || error.name}`)
+    },
+  })
+  try {
+    result.proxy_cli_repaired = repairVmProxyCliEnabled(projectRoot).length
+  } catch {
+    result.proxy_cli_repaired = 0
+  }
+  try {
+    result.smbios_repaired = repairSlotSmbios(projectRoot).length
+  } catch {
+    result.smbios_repaired = 0
+  }
   if (watch) startVmWatch(projectRoot)
   return result
 }
@@ -183,7 +217,7 @@ function reconcileVmsChangesOnly(projectRoot, r) {
   const dir = path.join(projectRoot, 'vms')
   if (!fs.existsSync(dir)) return
   for (const f of fs.readdirSync(dir)) {
-    if (!/^vm-.*\.json$/.test(f) || f.endsWith('-chat.json')) continue
+    if (!isVmRecordFile(f)) continue
     const file = path.join(dir, f)
     try {
       const st = fs.statSync(file)

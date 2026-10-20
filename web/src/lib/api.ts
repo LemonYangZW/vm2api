@@ -1,9 +1,17 @@
-import { apiBase, clearSession, hasSession, sessionToken } from '@/lib/session'
+import type { VmActiveHours, VmQuotaOverride } from '@/types/panel-vm'
+import {
+  apiBase,
+  expirePanelSession,
+  hasSession,
+  sessionToken,
+} from '@/lib/session'
 
 export type PanelErrorMetadata = {
   type?: string
   code?: string
   details?: unknown
+  /** 放置预检失败（`placement_preflight_failed`）时的 `error.checks`。 */
+  checks?: unknown
   data?: unknown
 }
 
@@ -17,6 +25,7 @@ export class ApiError extends Error {
   type?: string
   code: string
   details?: unknown
+  checks?: unknown
   data?: unknown
 
   constructor(
@@ -32,6 +41,7 @@ export class ApiError extends Error {
     this.type = normalized.type
     this.code = normalized.code || ''
     this.details = normalized.details
+    this.checks = normalized.checks
     this.data = normalized.data
   }
 }
@@ -75,6 +85,9 @@ export function normalizePanelError(
     ...(Object.prototype.hasOwnProperty.call(error || {}, 'details')
       ? { details: error?.details }
       : {}),
+    ...(Object.prototype.hasOwnProperty.call(error || {}, 'checks')
+      ? { checks: error?.checks }
+      : {}),
     ...(Object.prototype.hasOwnProperty.call(body || {}, 'data')
       ? { data: body?.data }
       : {}),
@@ -94,16 +107,22 @@ function unwrapEnvelope(payload: unknown, status: number): unknown {
   return body.data !== undefined ? body.data : payload
 }
 
+function isPanelApiPath(path: string): boolean {
+  return path.startsWith('/api/panel/') && path !== '/api/panel/login'
+}
+
 export async function panelFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
   const url = `${apiBase() || ''}${path}`
-  return fetch(url, {
+  const res = await fetch(url, {
     ...opts,
     credentials: 'include',
     headers: { ...authHeaders(), ...(opts.headers || {}) },
   })
+  if (res.status === 401 && isPanelApiPath(path)) expirePanelSession()
+  return res
 }
 
 export async function api<T = unknown>(
@@ -114,8 +133,7 @@ export async function api<T = unknown>(
   const res = await panelFetch(path, opts)
   const json = (await res.json().catch(() => ({}))) as Json
   if (res.status === 401) {
-    clearSession()
-    throw apiErrorFrom(json, res.status, '鉴权失效，请重新登录')
+    throw apiErrorFrom(json, res.status, '登录已过期')
   }
   if (!res.ok) {
     throw apiErrorFrom(json, res.status, res.statusText || '请求失败')
@@ -126,11 +144,21 @@ export async function api<T = unknown>(
 export type VmPatch = {
   inference_engine?: 'go' | 'rust' | ''
   persona_preset?: string
-  max_concurrency?: number
-  max_rpm?: number
+  /** null = 去掉本槽覆盖，跟随分档 / 全局。 */
+  max_concurrency?: number | null
+  max_rpm?: number | null
+  /** OpenAI only; null clears the pin and follows codex.quota.max_sessions. */
+  max_sessions?: number | null
+  session_slots?: number | null
+  quota_override?: VmQuotaOverride | null
   allowed_models?: string[]
   auth_scheme?: string
   schedule_level?: number | 'auto' | null
+  /** null = 清除工作时段，恢复 24h 接单。 */
+  active_hours?: VmActiveHours | null
+  /** Docker 槽在线提升内存（仅上调）。 */
+  memory?: string
+  machine?: { memory?: string }
 }
 
 export function patchVm<T = unknown>(id: string, body: VmPatch) {

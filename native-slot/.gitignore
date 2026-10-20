@@ -1,0 +1,4 @@
+# 构建产物
+/dist/
+# 由现网 cli-node 模块拼接的差分参考实现，只留在本地
+/testdata/jsref/

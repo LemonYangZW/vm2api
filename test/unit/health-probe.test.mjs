@@ -19,7 +19,7 @@ import {
   DEFAULT_HEALTH_PROBE,
 } from '../../src/lib/admin/health-probe.mjs'
 
-// The cache/intercept switch ships off, so the intercept cases opt in.
+// The cache switch ships off. Intercept cases opt in.
 const cfg = normalizeHealthProbeConfig({ enabled: true })
 
 const unofficial = { 'user-agent': 'Go-http-client/2.0' }
@@ -52,17 +52,16 @@ function cachedSnap(extra = {}) {
   }
 }
 
-test('probe cache is off until an operator enables it', () => {
+test('probe cache ships off and can be turned on', () => {
   assert.equal(DEFAULT_HEALTH_PROBE.enabled, false)
   assert.equal(normalizeHealthProbeConfig().enabled, false)
-  assert.equal(normalizeHealthProbeConfig({}).enabled, false)
-  assert.equal(normalizeHealthProbeConfig({ enabled: true }).enabled, true)
+  assert.equal(normalizeHealthProbeConfig({ enabled: false }).enabled, false)
   // Off means a third-party hello runs a real probe instead of a replay.
   assert.equal(
     decideHealthIntercept({
       headers: unofficial,
       body: hiBody,
-      cfg: normalizeHealthProbeConfig(),
+      cfg: normalizeHealthProbeConfig({ enabled: false }),
       snapshot: cachedSnap(),
     }).action,
     'pass',
@@ -72,6 +71,9 @@ test('probe cache is off until an operator enables it', () => {
 test('normalize fills defaults and clamps', () => {
   const n = normalizeHealthProbeConfig({ interval_sec: 5, real: { outbound_mode: 'rewrite', max_tokens: 0 } })
   assert.equal(n.interval_sec, 30)
+  assert.equal(n.probe_all_slots, false)
+  assert.equal(n.concurrency, 2)
+  assert.equal(normalizeHealthProbeConfig({ probe_all_slots: true, concurrency: 99 }).concurrency, 8)
   assert.equal(n.real.outbound_mode, 'official')
   assert.equal(n.real.prompt, 'hello')
   assert.equal(n.real.max_tokens, 64)
@@ -330,6 +332,99 @@ test('selectHealthProbeTargets uses summary credential flags', () => {
   assert.deepEqual(selectHealthProbeTargets(vms, pinned), [])
 })
 
+test('selectHealthProbeTargets skips slots outside their working window', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const vms = [
+    {
+      id: 'vm-rest',
+      schedulable: true,
+      status: 'running',
+      has_token: true,
+      active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' },
+    },
+    {
+      id: 'vm-day',
+      schedulable: true,
+      status: 'running',
+      has_token: true,
+      active_hours: { start: '08:00', end: '20:00', timezone: 'UTC' },
+    },
+  ]
+  assert.deepEqual(
+    selectHealthProbeTargets(vms, cfg, now).map((v) => v.id),
+    ['vm-day'],
+  )
+})
+
+test('probe_all_slots probes every target but snapshot uses first list success', async () => {
+  const probed = []
+  const monitor = createHealthProbeMonitor({
+    config: { enabled: true, probe_all_slots: true, concurrency: 2, run_on_start: false },
+    listTargets: () => [
+      { id: 'vm-a', schedulable: true, status: 'running', has_token: true },
+      { id: 'vm-b', schedulable: true, status: 'running', has_token: true },
+      { id: 'vm-c', schedulable: true, status: 'running', has_token: true },
+    ],
+    runChat: async (vm) => {
+      probed.push(vm.id)
+      return {
+        ok: true,
+        text: vm.id,
+        vm_id: vm.id,
+        status: 200,
+        model: 'claude-haiku-4-5',
+        body: {
+          id: `msg_${vm.id}`,
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-haiku-4-5',
+          content: [{ type: 'text', text: vm.id }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }
+    },
+  })
+  await monitor.runRealProbe()
+  assert.deepEqual(probed.sort(), ['vm-a', 'vm-b', 'vm-c'])
+  assert.equal(monitor.rawSnapshot().vm_id, 'vm-a')
+  assert.equal(monitor.rawSnapshot().body.id, 'msg_vm-a')
+  monitor.stop()
+})
+
+test('default probe stops after first success', async () => {
+  const probed = []
+  const monitor = createHealthProbeMonitor({
+    config: { enabled: true, run_on_start: false },
+    listTargets: () => [
+      { id: 'vm-a', schedulable: true, status: 'running', has_token: true },
+      { id: 'vm-b', schedulable: true, status: 'running', has_token: true },
+    ],
+    runChat: async (vm) => {
+      probed.push(vm.id)
+      return {
+        ok: true,
+        text: 'ok',
+        vm_id: vm.id,
+        status: 200,
+        model: 'claude-haiku-4-5',
+        body: {
+          id: 'msg_first',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-haiku-4-5',
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }
+    },
+  })
+  await monitor.runRealProbe()
+  assert.deepEqual(probed, ['vm-a'])
+  monitor.stop()
+})
+
 test('monitor singleflight writes snapshot and fail_closed decides fail', async () => {
   let calls = 0
   const monitor = createHealthProbeMonitor({
@@ -411,4 +506,126 @@ test('failed real probe keeps a still-valid cached snapshot', async () => {
 
 test('default match tokens stay below default real probe budget', () => {
   assert.ok(DEFAULT_HEALTH_PROBE.match.max_tokens < DEFAULT_HEALTH_PROBE.real.max_tokens)
+})
+
+const cc = "You are Claude Code, Anthropic's official CLI for Claude."
+
+test('sub2api account test shape matches even with a claude-cli UA', () => {
+  const body = {
+    model: 'claude-sonnet-4-5-20250929',
+    max_tokens: 1024,
+    temperature: 1,
+    stream: true,
+    system: [{ type: 'text', text: cc, cache_control: { type: 'ephemeral' } }],
+    metadata: { user_id: 'user_x_account__session_y' },
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }],
+  }
+  const headers = { 'user-agent': 'claude-cli/2.1.258 (external, cli)', 'x-app': 'cli' }
+  assert.equal(isHealthShape(headers, body, cfg, 'anthropic.messages'), true)
+  assert.equal(isHealthShape(headers, { ...body, max_tokens: 2048 }, cfg, 'anthropic.messages'), false)
+  assert.equal(isHealthShape(headers, { ...body, tools: [{ name: 'Bash' }] }, cfg, 'anthropic.messages'), false)
+  assert.equal(
+    isHealthShape(
+      headers,
+      { ...body, messages: [{ role: 'user', content: 'refactor this' }] },
+      cfg,
+      'anthropic.messages',
+    ),
+    false,
+  )
+  const off = normalizeHealthProbeConfig({ enabled: true, match: { sub2api_account_test: false } })
+  assert.equal(isHealthShape(headers, body, off, 'anthropic.messages'), false)
+})
+
+test('new-api and sub2api chat / responses tests without max_tokens match', () => {
+  const chat = { model: 'claude-haiku-4-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }
+  assert.equal(isHealthShape(unofficial, chat, cfg, 'openai.chat'), true)
+  const responses = {
+    model: 'gpt-5.4',
+    stream: true,
+    instructions: 'You are Codex, based on GPT-5. '.repeat(20),
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+  }
+  assert.equal(isHealthShape(unofficial, responses, cfg, 'openai.responses'), true)
+  assert.equal(
+    isHealthShape(unofficial, { model: 'gpt-5.4', input: [{ role: 'user', content: 'hi' }] }, cfg, 'openai.responses'),
+    true,
+  )
+  // A missing max_tokens never counts on /v1/messages.
+  assert.equal(isHealthShape(unofficial, chat, cfg, 'anthropic.messages'), false)
+  // Real chat turns still pass through.
+  assert.equal(
+    isHealthShape(unofficial, { ...chat, messages: [{ role: 'user', content: 'write a parser' }] }, cfg, 'openai.chat'),
+    false,
+  )
+})
+
+test('decide routes GPT models to the openai snapshot', async () => {
+  const monitor = createHealthProbeMonitor({
+    config: { enabled: true, run_on_start: false, real: { openai_model: 'gpt-5.4' } },
+    listTargets: () => [
+      { id: 'vm-01', platform: 'anthropic', schedulable: true, status: 'running', has_token: true },
+      { id: 'vm-codex', platform: 'openai', schedulable: true, status: 'running', has_token: true },
+    ],
+    runChat: async (vm, real) => ({
+      ok: true,
+      status: 200,
+      text: vm.id,
+      vm_id: vm.id,
+      model: real.model,
+      body: {
+        id: `msg_${vm.id}`,
+        content: [{ type: 'text', text: vm.id }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    }),
+  })
+  await monitor.runRealProbe()
+  const gpt = monitor.decide(unofficial, { model: 'gpt-5.4', input: 'hi' }, 'openai.responses')
+  assert.equal(gpt.action, 'cache')
+  assert.equal(gpt.snapshot.vm_id, 'vm-codex')
+  const claude = monitor.decide(unofficial, hiBody, 'anthropic.messages')
+  assert.equal(claude.snapshot.vm_id, 'vm-01')
+  assert.equal(monitor.getSnapshots().openai.ok, true)
+  monitor.stop()
+})
+
+test('no openai_model leaves GPT probes to the pool', async () => {
+  const monitor = createHealthProbeMonitor({
+    config: { enabled: true, run_on_start: false },
+    listTargets: () => [{ id: 'vm-01', platform: 'anthropic', schedulable: true, status: 'running', has_token: true }],
+    runChat: async () => ({ ok: true, status: 200, text: 'x', body: { id: 'msg_x', content: [] } }),
+  })
+  await monitor.runRealProbe()
+  assert.equal(monitor.decide(unofficial, { model: 'gpt-5.4', input: 'hi' }, 'openai.responses').action, 'pass')
+  monitor.stop()
+})
+
+test('streamed shapes satisfy sub2api and new-api stream checks', () => {
+  const snap = cachedSnap()
+  const chat = formatHealthSse('openai.chat', { model: 'claude-haiku-4-5' }, snap, cfg)
+  const chatData = chat.split('\n').filter((l) => l.startsWith('data: '))
+  assert.equal(chatData.at(-1), 'data: [DONE]')
+  const finish = JSON.parse(chatData.at(-2).slice(6))
+  assert.equal(finish.choices[0].finish_reason, 'stop')
+  assert.ok(finish.usage && Number.isFinite(finish.usage.prompt_tokens))
+
+  const resp = formatHealthSse('openai.responses', { model: 'gpt-5.4' }, snap, cfg)
+  const events = resp
+    .split('\n')
+    .filter((l) => l.startsWith('event: '))
+    .map((l) => l.slice(7))
+  assert.deepEqual(events, ['response.created', 'response.output_text.delta', 'response.completed'])
+  const completed = JSON.parse(
+    resp
+      .split('\n')
+      .filter((l) => l.startsWith('data: '))
+      .at(-1)
+      .slice(6),
+  )
+  assert.equal(completed.response.status, 'completed')
+  assert.ok(completed.response.usage)
+
+  const msg = formatHealthSse('anthropic.messages', hiBody, snap, cfg)
+  assert.match(msg, /event: message_stop/)
 })

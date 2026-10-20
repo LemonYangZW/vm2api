@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   prepareAnthropicRequest,
+  stripInvalidThinkingBlocks,
   rewriteToolNames,
   restoreToolNames,
   restoreToolNamesInSSELine,
@@ -11,6 +12,7 @@ import {
   PROMPT_CACHING_SCOPE_BETA,
   MID_CONVERSATION_SYSTEM_BETA,
   alignSamplingWithThinking,
+  ensureClearThinkingContextManagement,
 } from '../../src/lib/protocol/anthropic-policy.mjs'
 
 test('request policy strips empty blocks, caps cache controls and keeps forced-tool thinking', () => {
@@ -123,6 +125,211 @@ test('unsigned and empty thinking blocks are stripped before hop', () => {
     { type: 'text', text: 'answer' },
   ])
 })
+test('older models keep a long omitted signature and drop redacted thinking', () => {
+  const body = prepareAnthropicRequest({
+    model: 'claude-opus-5',
+    thinking: { type: 'adaptive' },
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 'sig_omitted_12345678901234567890' },
+          { type: 'redacted_thinking', data: 'encrypted-thinking' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(body.messages[0].content, [
+    { type: 'thinking', thinking: '', signature: 'sig_omitted_12345678901234567890' },
+    { type: 'text', text: 'answer' },
+  ])
+})
+test('5.5 drops the whole signed chain after one invalid block', () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'a' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'old', signature: '' },
+        { type: 'text', text: 'answer' },
+      ],
+    },
+    { role: 'user', content: [{ type: 'text', text: 'b' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'later', signature: 'sig_real_1234567890abcdef' },
+        { type: 'redacted_thinking', data: 'encrypted' },
+        { type: 'text', text: 'later answer' },
+      ],
+    },
+    {
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'only thought', signature: 'sig_real_1234567890abcdef' }],
+    },
+  ]
+  for (const model of ['claude-opus-5-5', 'anthropic/claude-sonnet-5.5', 'claude-haiku-5-5']) {
+    const body = stripInvalidThinkingBlocks({
+      model,
+      thinking: { type: 'adaptive' },
+      messages,
+    })
+    assert.deepEqual(
+      body.messages.map((message) => message.content.map((block) => block.text || block.type)),
+      [['a'], ['answer'], ['b'], ['later answer']],
+      model,
+    )
+  }
+  const older = stripInvalidThinkingBlocks({
+    model: 'claude-opus-5',
+    thinking: { type: 'adaptive' },
+    messages,
+  })
+  assert.deepEqual(
+    older.messages[3].content.map((block) => block.type),
+    ['thinking', 'text', 'thinking'],
+  )
+})
+
+test('5.5 keeps a lone redacted block and a short non-dummy signature', () => {
+  const kept = stripInvalidThinkingBlocks({
+    model: 'claude-sonnet-5-5',
+    thinking: { type: 'adaptive' },
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 'signed' },
+          { type: 'redacted_thinking', data: 'encrypted' },
+          { type: 'text', text: 'ok' },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(
+    kept.messages[0].content.map((block) => block.type),
+    ['thinking', 'redacted_thinking', 'text'],
+  )
+  const dropped = stripInvalidThinkingBlocks({
+    model: 'claude-opus-5-5',
+    thinking: { type: 'adaptive' },
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'redacted_thinking' }, { type: 'text', text: 'Visible' }],
+      },
+    ],
+  })
+  assert.deepEqual(dropped.messages[0].content, [{ type: 'text', text: 'Visible' }])
+  const older = stripInvalidThinkingBlocks({
+    model: 'claude-opus-5',
+    thinking: { type: 'adaptive' },
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'redacted_thinking', data: 'encrypted' },
+          { type: 'text', text: 'Visible' },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(older.messages[0].content, [{ type: 'text', text: 'Visible' }])
+  for (const model of ['claude-opus-5-5', 'claude-opus-5']) {
+    const signed = stripInvalidThinkingBlocks({
+      model,
+      thinking: { type: 'adaptive' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'redacted_thinking', signature: 'sig_real_1234567890abcdef' },
+            { type: 'text', text: 'kept' },
+          ],
+        },
+      ],
+    })
+    assert.deepEqual(
+      signed.messages[0].content.map((block) => block.type),
+      ['redacted_thinking', 'text'],
+      model,
+    )
+  }
+})
+
+test('preserve path drops thinking without a usable signature and keeps the rest', () => {
+  const body = stripInvalidThinkingBlocks(
+    {
+      model: 'claude-opus-5-5',
+      thinking: { type: 'adaptive' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'old', signature: '' },
+            { type: 'thinking', thinking: 'later', signature: 'sig_real_1234567890abcdef' },
+            { type: 'redacted_thinking', data: 'encrypted' },
+            { type: 'text', text: 'answer' },
+          ],
+        },
+      ],
+    },
+    { preserveThinkingBlocks: true },
+  )
+  assert.deepEqual(body.messages[0].content, [
+    { type: 'thinking', thinking: 'later', signature: 'sig_real_1234567890abcdef' },
+    { type: 'redacted_thinking', data: 'encrypted' },
+    { type: 'text', text: 'answer' },
+  ])
+})
+test('an untyped thinking block breaks a valid 5.5 chain and is dropped on older models', () => {
+  const messages = [
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'kept', signature: 'sig_real_1234567890abcdef' },
+        { thinking: 'bad' },
+        { type: 'text', text: 'answer' },
+      ],
+    },
+  ]
+  const newer = stripInvalidThinkingBlocks({
+    model: 'claude-opus-5-5',
+    thinking: { type: 'adaptive' },
+    messages,
+  })
+  assert.deepEqual(newer.messages[0].content, [{ type: 'text', text: 'answer' }])
+  const older = stripInvalidThinkingBlocks({
+    model: 'claude-opus-5',
+    thinking: { type: 'adaptive' },
+    messages,
+  })
+  assert.deepEqual(
+    older.messages[0].content.map((block) => block.type || 'untyped'),
+    ['thinking', 'text'],
+  )
+})
+
+test('panel preservation drops a thinking block that has no signature field', () => {
+  const body = prepareAnthropicRequest(
+    {
+      model: 'claude-opus-5',
+      thinking: { type: 'adaptive' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'opaque' },
+            { type: 'text', text: 'answer' },
+          ],
+        },
+      ],
+    },
+    { preserveThinkingBlocks: true },
+  )
+  assert.deepEqual(body.messages[0].content, [{ type: 'text', text: 'answer' }])
+})
 
 test('existing context_management is not overwritten', () => {
   const body = prepareAnthropicRequest({
@@ -233,22 +440,47 @@ test('Haiku lifts messages role=system because the model rejects it', () => {
   assert.equal(body.messages[1].role, 'system')
 })
 
-test('Sonnet keeps mid-conversation role=system when the beta is present', () => {
-  const body = {
-    model: 'claude-sonnet-5',
-    messages: [
-      { role: 'user', content: 'hi' },
-      { role: 'system', content: 'parked leftover' },
-    ],
+test('documented models keep mid-conversation role=system; Sonnet 5 and 4.x lift it', () => {
+  const header = `oauth-2025-04-20,${MID_CONVERSATION_SYSTEM_BETA}`
+  const roles = (model) =>
+    sanitizeAnthropicBodyForBetaTokens(
+      {
+        model,
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'system', content: 'parked leftover' },
+        ],
+      },
+      header,
+    ).messages.map((message) => message.role)
+  for (const model of [
+    'claude-fable-5',
+    'claude-fable-5-1',
+    'claude-fable-5.1[1m]',
+    'claude-mythos-5',
+    'claude-mythos-5-1',
+    'claude-opus-5-5',
+    'claude-opus-5',
+    'claude-opus-4-8',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+  ]) {
+    assert.deepEqual(roles(model), ['user', 'system'], model)
   }
-  const kept = sanitizeAnthropicBodyForBetaTokens(body, `oauth-2025-04-20,${MID_CONVERSATION_SYSTEM_BETA}`)
-  assert.equal(kept.messages[1].role, 'system')
-  assert.equal(kept.messages[1].content, 'parked leftover')
+  for (const model of [
+    'claude-sonnet-5',
+    'claude-sonnet-5-fast',
+    'claude-opus-4-7',
+    'claude-sonnet-4-6',
+    'claude-mythos-preview',
+  ]) {
+    assert.deepEqual(roles(model), ['user'], model)
+  }
 })
 
-test('Sonnet without mid-conversation-system beta lifts role=system', () => {
+test('Sonnet 5.5 without mid-conversation-system beta lifts role=system', () => {
   const body = {
-    model: 'claude-sonnet-5',
+    model: 'claude-sonnet-5-5',
     system: [{ type: 'text', text: 'billing' }],
     messages: [
       { role: 'user', content: 'hi' },
@@ -318,6 +550,28 @@ test('Haiku inbound context_management is stripped', () => {
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
   })
   assert.equal(body.context_management, undefined)
+})
+
+test('Haiku inbound context_management is stripped when thinking is off or disabled', () => {
+  for (const thinking of [undefined, { type: 'disabled' }]) {
+    const body = ensureClearThinkingContextManagement({
+      model: 'claude-haiku-4-5-20251001',
+      ...(thinking ? { thinking } : {}),
+      context_management: { edits: [{ type: 'clear_thinking_20251015' }] },
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    })
+    assert.equal(body.context_management, undefined, `thinking=${JSON.stringify(thinking)}`)
+  }
+})
+
+test('Sonnet keeps caller context_management when thinking is off', () => {
+  const edits = [{ type: 'clear_tool_uses_20250919' }]
+  const body = ensureClearThinkingContextManagement({
+    model: 'claude-sonnet-5',
+    context_management: { edits },
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.deepEqual(body.context_management.edits, edits)
 })
 
 test('unofficial missing thinking/effort fills official 2.1.241 defaults', () => {
@@ -399,6 +653,23 @@ test('unofficial fills omitted when caller thinking has no display', () => {
     { unofficial: true },
   )
   assert.deepEqual(body.thinking, { type: 'adaptive', display: 'omitted' })
+})
+
+test('beta sanitize rewrites thinking.display updates only without the gate token', () => {
+  const updates = { model: 'claude-opus-5-5', thinking: { type: 'adaptive', display: 'updates' } }
+  const dropped = sanitizeAnthropicBodyForBetaTokens(updates, 'oauth-2025-04-20,interleaved-thinking-2025-05-14')
+  assert.deepEqual(dropped.thinking, { type: 'adaptive', display: 'omitted' })
+  const kept = sanitizeAnthropicBodyForBetaTokens(updates, 'oauth-2025-04-20,thinking-display-updates-2026-08-18')
+  assert.equal(kept.thinking.display, 'updates')
+  const summarized = sanitizeAnthropicBodyForBetaTokens(
+    { thinking: { type: 'adaptive', display: 'summarized' } },
+    'oauth-2025-04-20',
+  )
+  assert.equal(summarized.thinking.display, 'summarized')
+  const omitted = sanitizeAnthropicBodyForBetaTokens({ thinking: { type: 'adaptive', display: 'omitted' } }, '')
+  assert.equal(omitted.thinking.display, 'omitted')
+  const spaced = sanitizeAnthropicBodyForBetaTokens(updates, 'oauth-2025-04-20, thinking-display-updates-2026-08-18 ')
+  assert.equal(spaced.thinking.display, 'updates')
 })
 
 test('unofficial does not overwrite caller thinking display, effort, or max_tokens', () => {
