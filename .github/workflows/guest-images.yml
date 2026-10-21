@@ -1,13 +1,7 @@
-# Guest OS layers change independently of application releases.
+# 客体镜像按需手动重建，不随 Oracle 控制面更新发布。
 name: guest-images
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docker/kin-os/**'
-      - 'docker/kin-kvm/**'
-      - '.github/workflows/guest-images.yml'
   workflow_dispatch:
 
 concurrency:

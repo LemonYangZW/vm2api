@@ -1,10 +1,7 @@
-# PR/main gate: Node + Go + pinned payload ELFs + web + ARM64 deployment + 三层原生差分。
+# 完整回归仅手动触发；日常 ARM64 构建和发布由 release.yml 自动执行。
 name: ci
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:

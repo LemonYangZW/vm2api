@@ -1,3 +1,4 @@
+# 三层差分由用户按需手动执行，也可由手动完整回归调用。
 name: native-slot-parity
 
 on:
