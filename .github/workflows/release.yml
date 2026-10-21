@@ -76,11 +76,10 @@ jobs:
           ref=edge
           publish=false
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            test "$GITHUB_REF_NAME" = "v$version" || {
-              echo "tag $GITHUB_REF_NAME does not match VERSION $version" >&2
-              exit 1
-            }
-            ref="$GITHUB_REF_NAME"
+            case "$GITHUB_REF_NAME" in
+              "v$version"|"v$version-arm64") ref="v$version" ;;
+              *) echo "tag $GITHUB_REF_NAME does not match VERSION $version" >&2; exit 1 ;;
+            esac
           fi
           if [ "$GITHUB_EVENT_NAME" != pull_request ] && { [ "$GITHUB_REF" = refs/heads/main ] || [ "$GITHUB_REF_TYPE" = tag ]; }; then
             publish=true
@@ -147,3 +146,49 @@ jobs:
             echo "- 已验证：原生 ARM64 wrap/crag 内核及 CLI、QEMU payload、入口文件刷新、health、console"
             docker image inspect "$IMAGE:$IMAGE_REF-arm64" --format '{{json .RepoDigests}}'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release-arm64:
+    needs: image-arm64
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: 跟随上游版本创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          tag="v$version-arm64"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，保留原标签和发布产物。"
+            exit 0
+          fi
+          title=$(gh release view "v$version" --repo dofastted/vm2api --json name --jq .name 2>/dev/null || true)
+          title="${title:-vm2api v$version}"
+          RELEASE_VERSION="$version" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          version = os.environ['RELEASE_VERSION']
+          repo = os.environ['GITHUB_REPOSITORY']
+          owner = os.environ['GITHUB_REPOSITORY_OWNER'].lower()
+          commit = os.environ['GITHUB_SHA']
+          history = Path('CHANGELOG.md').read_text(encoding='utf-8')
+          match = re.search(rf'(?ms)^## {re.escape(version)}(?:\s[^\n]*)?\n(.*?)(?=^## |\Z)', history)
+          changes = match.group(1).strip() if match else ''
+          notes = (
+              f'Linux ARM64 fork，版本跟随[上游 v{version}](https://github.com/dofastted/vm2api/releases/tag/v{version})。\n\n'
+              f'镜像：`ghcr.io/{owner}/vm2api:sha-{commit}-arm64`\n\n'
+              f'源码：`{commit}`\n\n'
+              f'[发布检查](https://github.com/{repo}/actions/runs/{os.environ["GITHUB_RUN_ID"]})\n\n'
+              f'{changes}\n'
+          )
+          (Path(os.environ['RUNNER_TEMP']) / 'release-notes.md').write_text(notes, encoding='utf-8')
+          PY
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$title" --notes-file "$RUNNER_TEMP/release-notes.md" --latest

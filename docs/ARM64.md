@@ -10,6 +10,7 @@ checkout 本机构建。
 - 保留 ARM64 部署脚本回归、QEMU 准备与回滚检查、Compose 校验，以及原生内核/CLI、入口刷新、`health` 和 `console` 的隔离冒烟验证。
 - 构建使用独立的 ARM64 层缓存；新提交取消同分支的旧发布任务。仅修改文档不会触发构建。
 - 同时发布 `sha-<完整 commit>-arm64`，镜像标签记录源码和版本；部署仍应保存实际 digest。`vX.Y.Z` 标签发布对应的 `vX.Y.Z-arm64`。
+- 镜像发布成功后，自动按上游版本创建 GitHub Release，标题跟随上游（如 `vm2api v1.3.207`），标签为 `vX.Y.Z-arm64`，正文提供固定 commit 的镜像与更新说明。同版本再次构建保留已有 Release，不移动标签。
 - 不再构建 amd64 发布镜像、独立 Release 二进制附件或多架构 manifest。镜像内部仍保留 Oracle 所需的 amd64 兼容 payload，不改变运行能力。
 - 完整 `ci`、`native-slot-parity` 三层差分、`guest-images` 均在 Actions 页面手动运行；三层差分也会随手动完整 `ci` 执行。原生内核升级仍须单独验收。
 - 镜像发布不会自动切换 Oracle 服务。更新时继续先合并上游并检查内核变化；内核变化就停止并提示重新发布 ARM 内核，只更新控制面时保留既有槽位。
