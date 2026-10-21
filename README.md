@@ -5,7 +5,7 @@
 ### 完全隔离的虚拟机级 AI 订阅转 API 生产网关
 **Next-Generation Fully Isolated VM-Level AI Subscription-to-API Gateway**
 
-[![Release](https://img.shields.io/badge/Release-v1.3.205-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
+[![Release](https://img.shields.io/badge/Release-v1.3.206-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
 [![License](https://img.shields.io/badge/License-Noncommercial-amber.svg?style=for-the-badge)](LICENSE)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-Clean%20Verified-00C853?style=for-the-badge&logo=shield)](docs/benchmarks/README.md)
 [![Cluster](https://img.shields.io/badge/Cluster-Multi--VPS%20Ready-7928CA?style=for-the-badge&logo=docker)](docs/DEPLOY.md)
@@ -76,11 +76,12 @@
 
 ### 2026-10-21
 
+- 同步上游 1.3.206：官方登录链接支持跨终端输出提取，可复制、打开授权页并回填授权码；统一 OAuth 方式顺序，遥测同步默认显示关闭。
 - 同步上游 1.3.205：缓存标记使用设置中的 TTL，默认 1 小时，显式 5 分钟保持不变。
 - ARM64 原生槽保留新版官方提示和调用方时区，面板登录入口继续复用同一份凭据。
 - 合入实验性 macOS 原生节点、后台备份和面板用量显示修正。macOS 节点仍需另备原生产物，功能范围见 [MACOS_NODE.md](docs/MACOS_NODE.md)。
 
-完整历史与升级注意见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。
+完整更新记录见 [发布记录](docs/releases/release-notes.md)，上游历史与升级注意见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。
 
 ---
 
