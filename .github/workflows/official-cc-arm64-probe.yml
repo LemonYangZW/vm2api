@@ -1,0 +1,67 @@
+name: official-cc-arm64-probe
+
+# 仅手动核实官方 CLI 是否支持 crag 私有启动协议，不发布镜像或访问生产。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: 校验官方包并在断网 ARM64 容器中验证参数
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, io, json, pathlib, subprocess, tarfile, tempfile, urllib.request
+
+          version = '2.1.296'
+          url = f'https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64/-/claude-code-linux-arm64-{version}.tgz'
+          integrity = 'sha512-Q6Qh6qFmwuBG9rQFiDR6bY3XkFnwTN9AAPrnnDgBvr9sbg1Ql5wrf0lfoCDiV369EUHOzxI4i5OdHW9Vf2/oeA=='
+          archive = urllib.request.urlopen(url, timeout=60).read()
+          assert 'sha512-' + base64.b64encode(hashlib.sha512(archive).digest()).decode() == integrity
+          with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+              binary = tar.extractfile('package/claude').read()
+          assert binary[:6] == b'\x7fELF\x02\x01' and int.from_bytes(binary[18:20], 'little') == 183
+          image = 'node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c'
+          subprocess.run(['docker', 'pull', '--platform=linux/arm64', image], check=True, timeout=90)
+          results = {}
+          with tempfile.TemporaryDirectory() as work:
+              cli = pathlib.Path(work) / 'claude'
+              cli.write_bytes(binary)
+              cli.chmod(0o755)
+              commands = {
+                  'version': ['--version'],
+                  'help': ['--help'],
+                  'single_process': ['--single-process-subagents'],
+                  'max_procs': ['--max-procs', '2'],
+                  'continuous': ['--continuous-tool-loop'],
+                  'crag': ['--single-process-subagents', '--max-procs', '2', '--continuous-tool-loop'],
+              }
+              for name, args in commands.items():
+                  command = ['docker', 'run', '--rm', '--network=none', '--platform=linux/arm64',
+                             '--user=1000:1000', '--tmpfs=/tmp:rw,mode=1777', '-e', 'HOME=/tmp',
+                             '--mount', f'type=bind,src={cli},dst=/official-claude,readonly',
+                             '--entrypoint=/official-claude', image, *args]
+                  try:
+                      result = subprocess.run(command, input='', text=True, capture_output=True, timeout=20)
+                      results[name] = {'args': args, 'exit_code': result.returncode,
+                                       'stdout': result.stdout[:16000], 'stderr': result.stderr[:4000]}
+                  except subprocess.TimeoutExpired:
+                      results[name] = {'args': args, 'timeout': True}
+          report = {'version': version, 'tarball': url, 'integrity': integrity,
+                    'elf_machine': 183, 'size': len(binary), 'sha256': hashlib.sha256(binary).hexdigest(),
+                    'results': results}
+          output = json.dumps(report, ensure_ascii=False, indent=2)
+          pathlib.Path('official-cc-arm64-report.json').write_text(output, encoding='utf-8')
+          print(output)
+          assert results['version']['exit_code'] == 0
+          PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: official-cc-arm64-report
+          path: official-cc-arm64-report.json
