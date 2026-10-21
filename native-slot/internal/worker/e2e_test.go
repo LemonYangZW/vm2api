@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,6 +26,10 @@ import (
 var cliNodeBin string
 
 func TestMain(m *testing.M) {
+	if os.Getenv("FAKE_CRAG_CLI") == "1" {
+		runFakeCragCLI()
+		os.Exit(0)
+	}
 	if os.Getenv("FAKE_HOST_MODE") != "" {
 		os.Exit(fakeHost())
 	}
@@ -292,10 +297,14 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	checks := map[string]string{
 		"User-Agent": "claude-cli/2.1.296 (external, sdk-cli)", "x-app": "cli", "anthropic-version": "2023-06-01",
 		"x-stainless-arch": "x64", "x-stainless-os": "Linux", "x-stainless-runtime-version": "v26.3.0",
-		"x-stainless-package-version": "0.128.0", "x-stainless-retry-count": "0", "x-stainless-timeout": "600",
+		"x-stainless-package-version": "0.128.0", "x-stainless-retry-count": "0", "x-stainless-timeout": "600000",
+		"Accept":        "application/json",
 		"Authorization": "Bearer test-token", "x-claude-code-request-class": "subagent",
 		"X-Claude-Code-Session-Id": "6f1c2d3e-0000-4000-8000-000000000001",
-		"x-claude-code-prompt-id":  "6f1c2d3e-0000-4000-8000-000000000001",
+	}
+	promptID := h.Get("x-claude-code-prompt-id")
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(promptID) || promptID == h.Get("X-Claude-Code-Session-Id") {
+		t.Errorf("prompt ID 必须是请求 UUID，不能复用调用方 session: %q", promptID)
 	}
 	for k, v := range checks {
 		if h.Get(k) != v {
@@ -323,7 +332,7 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	}
 	billing := sys[0].(map[string]any)["text"].(string)
 	if !strings.HasPrefix(billing, "x-anthropic-billing-header: cc_version=2.1.296.") || strings.Contains(billing, "cch=00000") ||
-		!strings.Contains(billing, "cc_entrypoint=sdk-cli;") || !strings.Contains(billing, "cc_prompt_id=6f1c2d3e-0000-4000-8000-000000000001;") ||
+		!strings.Contains(billing, "cc_entrypoint=sdk-cli;") || !strings.Contains(billing, "cc_prompt_id="+promptID+";") ||
 		!strings.HasSuffix(billing, "prompt_version=<You are a Claude agent, built on Anthropic's Claude Agent SDK.>") {
 		t.Errorf("billing block = %q", billing)
 	}
@@ -342,6 +351,12 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	}
 	if !strings.HasPrefix(c.raw, `{"model":"claude-sonnet-5-5","messages":[{"content":"hi there friend","role":"user"}],"system":`) {
 		t.Errorf("body key order: %.120s", c.raw)
+	}
+	// 新版本 queryModel 为每个请求生成独立的 prompt ID。
+	second := k.post(t, "/internal/v1/messages", msgEnvelope("claude-sonnet-5-5", true), nil)
+	_ = readSSE(t, second)
+	if next := up.last(t).header.Get("x-claude-code-prompt-id"); next == promptID || next == "" {
+		t.Errorf("不同请求复用了 prompt ID: %q -> %q", promptID, next)
 	}
 }
 

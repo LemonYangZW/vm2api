@@ -4,6 +4,7 @@
 错误处理。目标是让上游收到的请求在客户端看来与标准 Claude 客户端一致。
 
 2026-10-21 同步上游 1.3.205：文本块数组透传、缓存 TTL 补全条件和配置路径以本版为准。
+三层实测补充：出站 Accept、毫秒 timeout、每请求 prompt ID 和 API Key 元数据门控见下文。
 
 ## 3.1 端点与认证
 
@@ -35,7 +36,7 @@ user-agent: claude-cli/<version> (external, <entrypoint>)
 x-app: <cli | cli-bg>
 anthropic-version: 2023-06-01
 content-type: application/json
-accept: text/event-stream
+accept: application/json
 ```
 
 `user-agent` 由三部分组成：
@@ -84,8 +85,11 @@ x-stainless-runtime: node
 x-stainless-runtime-version: v26.3.0
 x-stainless-package-version: 0.128.0
 x-stainless-retry-count: 0
-x-stainless-timeout: 600
+x-stainless-timeout: 600000
 ```
+
+这是 SDK 已写入的毫秒值（默认 600000，随 `API_TIMEOUT_MS` 配置变化）；
+指纹覆盖函数的缺省兜底值 600 不代表实际出站请求。
 
 覆盖规则：
 
@@ -312,7 +316,7 @@ output_config, context_management, metadata, stream
 2. 不以该前缀开头时补上前缀
 3. 删除已有的 prompt_version=... 与 cch=...
 4. 去掉行尾空白；不以分号结尾则补分号
-5. 缺少 cc_prompt_id= 时追加 " cc_prompt_id=<稳定随机标识>;"
+5. 缺少 cc_prompt_id= 时追加 " cc_prompt_id=<当前请求独立 UUID>;"
 6. 末尾追加 " cch=00000; prompt_version=<IDENTITY>"
 ```
 
@@ -418,7 +422,10 @@ output_config, context_management, metadata, stream
 }
 ```
 
-`device_id` 与 `account_uuid` 固定为空字符串，只有 `session_id` 有值。
+内核缺少调用方元数据时先生成上述空账号形态；已有非空 `metadata.user_id` 字符串原样透传。
+CLI 发往上游前按本地身份重建：`device_id` 来自设备身份，OAuth 模式可带 `account_uuid`；
+API Key 模式不读取本地 OAuth 账户信息，除非存在远程模式的明确账号覆盖。
+`session_id` 保留调用方会话；订阅者的 `cc_prompt_id` 每次请求单独生成，头与正文一致。
 
 CLI 宿主应从内层提取 `session_id`，用于把同一会话的请求归入
 同一执行上下文（例如会话级资源复用）；解析失败时按无会话处理，

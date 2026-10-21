@@ -69,9 +69,13 @@ const metadataMaxEncoded = 512
 var reservedMetadataKeys = map[string]bool{"ti": true, "os": true, "sb": true, "he": true, "uf": true, "ap": true, "tk": true}
 
 // UserID 生成 metadata.user_id（JSON 字符串）。
-func (id *Identity) UserID(session string) string {
+func (id *Identity) UserID(session string, oauthEnabled ...bool) string {
 	id.once.Do(id.load)
 	account := id.accountUUID
+	// 显式 API key 禁用 OAuth 账户信息；远程环境的明确覆盖仍有优先级。
+	if len(oauthEnabled) > 0 && !oauthEnabled[0] {
+		account = ""
+	}
 	if envTruthy("CLAUDE_CODE_REMOTE") && os.Getenv("CLAUDE_CODE_ACCOUNT_UUID") != "" {
 		account = os.Getenv("CLAUDE_CODE_ACCOUNT_UUID")
 	}

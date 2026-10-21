@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"vm2api/native-slot/internal/credential"
@@ -82,9 +83,15 @@ func Build(in BuildInput) (*Built, error) {
 	var system []any
 	rc := in.RequestContext
 	fp := Fingerprint(firstUserText(wireMessages))
+	subscriber := in.Credential.Subscriber()
+	promptID := NewUUID()
 	attr := func() string {
-		return Attribution(AttributionOptions{Fingerprint: fp, Indexes: hasPrompt(wireMessages), Subagent: true,
-			PromptID: session, TurnOrigin: TurnOrigin(QuerySource)})
+		opts := AttributionOptions{Fingerprint: fp}
+		if subscriber {
+			opts.Indexes, opts.Subagent = hasPrompt(wireMessages), true
+			opts.PromptID, opts.TurnOrigin = promptID, TurnOrigin(QuerySource)
+		}
+		return Attribution(opts)
 	}
 	var kinWire []any
 	if rc == nil {
@@ -108,7 +115,6 @@ func Build(in BuildInput) (*Built, error) {
 	}
 
 	// beta
-	subscriber := in.Credential.Subscriber()
 	betas := ModelBetas(model, subscriber)
 	if rc == nil && !contains(betas, betaClaudeCode) {
 		// isAgenticQuery：agent:* 来源且无分类器上下文。
@@ -153,7 +159,7 @@ func Build(in BuildInput) (*Built, error) {
 			metadata.Set(k, wm.Get(k))
 		}
 	}
-	metadata.Set("user_id", in.Identity.UserID(session))
+	metadata.Set("user_id", in.Identity.UserID(session, in.Credential.Bearer()))
 
 	maxTokens := wire.Get("max_tokens")
 	if _, ok := ojson.Num(maxTokens); !ok {
@@ -214,7 +220,8 @@ func Build(in BuildInput) (*Built, error) {
 	raw := StampCch(string(ojson.Marshal(body)), cchOn)
 
 	h := http.Header{}
-	h.Set("Accept", "text/event-stream")
+	// SDK 默认 Accept 为 application/json；SSE 由请求体的 stream 控制。
+	h.Set("Accept", "application/json")
 	h.Set("Content-Type", "application/json")
 	h.Set("anthropic-version", "2023-06-01")
 	h.Set("anthropic-dangerous-direct-browser-access", "true")
@@ -223,6 +230,8 @@ func Build(in BuildInput) (*Built, error) {
 	}
 	in.Credential.Apply(h.Set)
 	h.Set("X-Claude-Code-Session-Id", session)
+	// SDK 在指纹覆盖前已写入毫秒 timeout；指纹函数的 600 仅用于缺省兜底。
+	h.Set("x-stainless-timeout", strconv.FormatInt(apiTimeout().Milliseconds(), 10))
 	ApplyOfficialHeaders(h, QuerySource)
 	if FirstPartyBaseURL() {
 		h.Set("x-client-request-id", NewUUID())

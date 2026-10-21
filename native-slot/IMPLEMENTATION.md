@@ -67,7 +67,7 @@ go test ./...
 - 槽位满时等待（缺省 / 非法 / 溢出为 2000ms，`0` 不等），期间有槽位空出就接着执行，等满返回
   503 `no_capacity`；等待时长优先取控制面下发的 `KIN_SUBMIT_WAIT_MS`，其次 `SUBMIT_WAIT_MS`
   （现网 amd64 kernel 只认后者，kin-03 离线实测）；
-- 响应形状按 kin-03 现网 kernel 离线逐字节对照（18 种情形，仅 header 排列顺序不同）：
+- 响应形状最初按 kin-03 现网 kernel 离线逐字节对照，现由三层差分持续校验：
   - realtime：拿到槽位即提交 200（只有 `Content-Type`、`Trailer`），此后错误一律以 SSE `error`
     事件结束；trailer 成功只有 `x-terminal-state: verified`，失败为 `incomplete` + `x-error-code`；
   - 转发的事件按键名排序重新序列化（数字字面量原样，不转义 HTML / U+2028）；
@@ -79,3 +79,11 @@ go test ./...
 - `/internal/health` 额外带 `ok`、`engine`、`worker_version`、`cli_pid`、`classifier_request_context`、`credential`。
 
 `_prototype/` 是此前的雏形代码，已不参与构建，仅留作参考。
+
+## 上游更新
+
+上游更新 kernel / cli-node / payload 时按 `docs/UPSTREAM_SYNC.md` 执行：离线差分探针
+在 `tools/upstream-probe/`，运行 `python3 tools/upstream-probe/run-local.py`（本目录下）
+固定版本比对内核、真实 CLI 和真实控制面整链路。CLI 出站 JSON 仅忽略字符串外空白，
+动态 ID 保留关联，cch 独立复算；缺参考、断言失败及未知差异阻止发布。
+真机对照、Preflight 复核和部署步骤也写在该手册里。

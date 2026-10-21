@@ -18,6 +18,7 @@ type APIError struct {
 	UpstreamCode string
 	RequestID    string
 	Retryable    bool
+	SparseSSE    bool
 }
 
 func (e *APIError) Error() string { return e.Code + ": " + e.Message }
@@ -32,6 +33,12 @@ var passCodes = map[string]bool{
 
 func workerError(status int, code, message string) *APIError {
 	return &APIError{Status: status, Type: "worker_error", Code: code, Message: message}
+}
+
+// 控制面取消当前提供者后，现网以通用提供者错误结束仍连接的响应流。
+func cancelledProviderError() *APIError {
+	return &APIError{Status: 502, Type: "api_error", Code: "kernel_error",
+		Message: "provider error: client disconnected", SparseSSE: true}
 }
 
 func clip(s string, n int) string {
@@ -81,11 +88,15 @@ func (e *APIError) SSE() []byte {
 	inner := ojson.NewObject()
 	inner.Set("code", e.Code)
 	inner.Set("message", e.message())
-	inner.Set("request_id", optional(e.RequestID))
-	inner.Set("retry_after", optional(e.RetryAfter))
+	if !e.SparseSSE {
+		inner.Set("request_id", optional(e.RequestID))
+		inner.Set("retry_after", optional(e.RetryAfter))
+	}
 	inner.Set("status", e.Status)
 	inner.Set("type", e.Type)
-	inner.Set("upstream_code", optional(e.UpstreamCode))
+	if !e.SparseSSE {
+		inner.Set("upstream_code", optional(e.UpstreamCode))
+	}
 	o := ojson.NewObject()
 	o.Set("error", inner)
 	o.Set("type", "error")

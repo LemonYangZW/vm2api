@@ -1,0 +1,37 @@
+name: native-slot-parity
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: 固定上游版本并在断网容器运行三层差分
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 native-slot/tools/upstream-probe/run-local.py --work-dir .tmp/native-parity
+      - name: 保留差分证据（失败也上传）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-slot-parity
+          path: |
+            .tmp/native-parity/run-*/**/*.json
+            .tmp/native-parity/run-*/**/diff.txt
+            .tmp/native-parity/run-*/**/*.log
+          if-no-files-found: error
+          retention-days: 14

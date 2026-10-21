@@ -313,7 +313,8 @@ SSE 序列输出，只是不再分块传输。
 
 #### 会话与账号元数据
 
-`metadata.user_id` 由内核构造为 JSON 字符串：
+1.3.205 实测：已有非空 `metadata.user_id` 字符串原样透传，并保留其他 metadata 字段；
+缺少或为空时，内核构造 JSON 字符串：
 
 ```json
 {"device_id":"","account_uuid":"","session_id":"<会话标识>"}

@@ -50,6 +50,7 @@ type Config struct {
 	CLIVersion              string `json:"cli_version"`
 	DefaultCacheTTL         string `json:"default_cache_ttl"`
 	SessionIdleTTLSeconds   *int64 `json:"session_idle_ttl_seconds"`
+	Dataplane               string `json:"dataplane"`
 
 	// 附加字段：控制面会写，内核只透传或忽略。
 	WorkerCount *int64 `json:"worker_count,omitempty"`
@@ -223,6 +224,12 @@ func Resolve(c Config) (*Resolved, error) {
 	if c.WorkerCount != nil && *c.WorkerCount <= 0 {
 		return nil, errors.New("worker_count must be positive")
 	}
+	if c.Dataplane == "" {
+		if v := os.Getenv("KIN_DATAPLANE"); v != "" {
+			c.Dataplane = v
+		}
+	}
+	c.Dataplane = strings.ToLower(strings.TrimSpace(c.Dataplane))
 	r := &Resolved{Config: c}
 	var err error
 	slots := int64(MaxSlots)
@@ -315,6 +322,12 @@ func ExpectedTimezone(configured string) string {
 
 // CchEnabledFrom 读取 cch_enabled；缺省为 true，无法读取时沿用上次的值。
 func (r *Resolved) CchEnabledValue() bool { return r.CchEnabled == nil || *r.CchEnabled }
+
+// IsCrag 判断当前是否配置为 crag 官方数据面驱动。
+func (r *Resolved) IsCrag() bool {
+	dp := strings.ToLower(strings.TrimSpace(r.Dataplane))
+	return dp == "crag" || dp == "official-cli" || dp == "official-cc" || dp == "claude-code"
+}
 
 // EnvSeconds 读取秒数环境变量，非法时用默认值。
 func EnvSeconds(name string, def time.Duration) time.Duration {

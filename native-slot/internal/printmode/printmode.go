@@ -139,7 +139,7 @@ func ask(ctx context.Context, cred *credential.Credential, model, prompt, sessio
 	body.Set("messages", messages)
 	body.Set("system", system)
 	body.Set("tools", []any{})
-	body.Set("metadata", map[string]any{"user_id": id.UserID(session)})
+	body.Set("metadata", map[string]any{"user_id": id.UserID(session, cred.Bearer())})
 	body.Set("max_tokens", 32000)
 	body.Set("stream", true)
 	betas := upstream.MergeOfficialExtraBetas(upstream.ModelBetas(model, cred.Subscriber()))

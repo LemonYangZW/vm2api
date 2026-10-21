@@ -140,7 +140,7 @@ type job struct {
 	pingNonce    string
 	pongSeen     bool
 	terminal     bool // 已向 HTTP 侧交付终态
-	recycling    bool // 已收到终态帧，等待 cancel_ack 归还槽位
+	recycling    bool // 已收到终态帧，等待 HTTP 写完后归还槽位
 	charged      int64
 }
 
@@ -322,7 +322,11 @@ func cut(s string, sep byte) (string, string, bool) {
 
 // spawn 拉起新一代宿主并启动读写协程。调用方不持锁。
 func (r *Runtime) spawn() error {
-	cmd := exec.Command(r.cfg.ClaudeBin, r.opts.HostArgs...)
+	args := r.opts.HostArgs
+	if r.cfg.IsCrag() && len(args) == 0 {
+		args = CragHostArgs(r.cfg.Slots)
+	}
+	cmd := exec.Command(r.cfg.ClaudeBin, args...)
 	cmd.Env = r.hostEnv()
 	cmd.Stderr = r.opts.Stderr
 	cmd.Dir = filepath.Dir(r.cfg.ClaudeBin)
@@ -408,6 +412,24 @@ func (r *Runtime) validateReady(h *frame.HostReady) error {
 
 func (r *Runtime) readLoop(g *generation, stdout io.Reader) {
 	lines := frame.NewLineReader(stdout, int(r.cfg.MaxEvent)+(1<<20))
+	if r.cfg.IsCrag() {
+		r.registerCragReady(g)
+		for {
+			line, err := lines.Next()
+			if err == frame.ErrLineTooLong {
+				r.logf("crag cli frame exceeds max_event_bytes; dropped")
+				continue
+			}
+			if err != nil {
+				break
+			}
+			r.handleCragLine(g, line)
+		}
+		g.kill()
+		_ = g.cmd.Wait()
+		r.hostLost(g)
+		return
+	}
 	handshaken := false
 	for {
 		line, err := lines.Next()
@@ -511,11 +533,7 @@ func (r *Runtime) handleFrame(g *generation, in *frame.Inbound) {
 		r.finishSent(j)
 	case "cancel_ack":
 		if !j.terminal {
-			src := j.cancelSource
-			if src == "" {
-				src = "explicit cancel from control plane"
-			}
-			r.deliver(j, jobMsg{kind: msgError, err: &APIError{Status: 499, Type: "api_error", Code: "client_cancelled", Message: src}})
+			r.deliver(j, jobMsg{kind: msgError, err: cancelledProviderError()})
 		}
 		r.release(j)
 	}
@@ -573,13 +591,9 @@ func (r *Runtime) deliver(j *job, m jobMsg) {
 	}
 }
 
-// finishSent：终态帧已到，发送 cancel 回收并等待 cancel_ack 归还槽位。持锁调用。
+// finishSent 标记正常终态；HTTP 写完响应后直接归还槽位，无需发送 cancel。
 func (r *Runtime) finishSent(j *job) {
 	j.recycling = true
-	j.cancelAt = time.Now()
-	if r.gen != nil {
-		r.gen.send(frame.Cancel{Type: "cancel", JobID: j.id, SlotID: j.slot})
-	}
 }
 
 func (r *Runtime) sendCancel(j *job, source string) {
@@ -647,7 +661,7 @@ func (r *Runtime) hostLost(g *generation) {
 	for _, j := range r.jobs {
 		if j.gen == g.n {
 			r.deliver(j, jobMsg{kind: msgError, err: &APIError{Status: 503, Type: "api_error", Code: "kernel_unavailable",
-				Message: "native cli host unavailable", Retryable: true}})
+				Message: "native cli stdout closed", Retryable: true}})
 			r.release(j)
 		}
 	}
@@ -716,7 +730,10 @@ func (r *Runtime) sweep(now time.Time) {
 	restart := ""
 	for _, j := range r.jobs {
 		switch {
-		case j.recycling || j.cancelling:
+		case j.recycling:
+			// 正常终态等待 HTTP 写完，取消确认超时只约束真正的 cancel。
+			continue
+		case j.cancelling:
 			if j.cancelling && !j.pongSeen && j.pingNonce != "" && now.Sub(j.lastPing) >= r.opts.PingInterval {
 				j.lastPing = now
 				r.gen.send(frame.Ping{Type: "ping", Nonce: j.pingNonce})
@@ -746,7 +763,7 @@ func (r *Runtime) sweep(now time.Time) {
 }
 
 // ErrNoCapacity 表示无可用槽位。
-var ErrNoCapacity = &APIError{Status: 503, Type: "overloaded_error", Code: "no_capacity",
+var ErrNoCapacity = &APIError{Status: 503, Type: "worker_error", Code: "no_capacity",
 	Message: "no compatible capacity is currently available", Retryable: true}
 
 // Submit 选槽并下发 job_start。没有空闲槽位时最多等 SubmitWait（现网实测：期间
@@ -804,7 +821,12 @@ func (r *Runtime) Submit(ctx context.Context, requestID, preferredSlot, sessionK
 	if requestID != "" {
 		r.requests[requestID] = j
 	}
-	ok := r.gen.send(frame.JobStart{Type: "job_start", JobID: j.id, SlotID: id, Request: request, RequestContext: requestContext})
+	var ok bool
+	if r.cfg.IsCrag() {
+		ok = r.sendCragJob(j, request)
+	} else {
+		ok = r.gen.send(frame.JobStart{Type: "job_start", JobID: j.id, SlotID: id, Request: request, RequestContext: requestContext})
+	}
 	if !ok {
 		r.release(j)
 		r.requestRestart("stdin unavailable")
@@ -850,13 +872,14 @@ func (r *Runtime) Cancel(requestID, source string) bool {
 		j = r.jobs[requestID]
 	}
 	if j == nil {
-		if r.gen != nil {
+		if r.gen != nil && !r.cfg.IsCrag() {
 			r.gen.send(frame.Cancel{Type: "cancel", JobID: requestID, SlotID: ""})
 		}
 		return false
 	}
-	if !j.terminal {
-		r.deliver(j, jobMsg{kind: msgError, err: &APIError{Status: 499, Type: "api_error", Code: "client_cancelled", Message: source}})
+	if r.cfg.IsCrag() {
+		r.release(j)
+		return true
 	}
 	r.sendCancel(j, source)
 	return true
@@ -869,9 +892,11 @@ func (r *Runtime) abandon(j *job, source string) {
 	if _, ok := r.jobs[j.id]; !ok {
 		return
 	}
-	if !j.recycling {
-		r.sendCancel(j, source)
+	if j.recycling || r.cfg.IsCrag() {
+		r.release(j)
+		return
 	}
+	r.sendCancel(j, source)
 }
 
 // Health 返回 /internal/health 视图。

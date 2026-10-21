@@ -13,6 +13,7 @@ import (
 
 	"vm2api/native-slot/internal/classifier"
 	"vm2api/native-slot/internal/credential"
+	"vm2api/native-slot/internal/frame"
 	"vm2api/native-slot/internal/messages"
 	"vm2api/native-slot/internal/ojson"
 	"vm2api/native-slot/internal/sse"
@@ -40,7 +41,7 @@ func (r *Runtime) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	case strings.HasPrefix(path, "/internal/v1/"):
 		if !r.authorized(req) {
-			writeError(w, workerError(401, "internal_auth_failed", "internal token mismatch"))
+			writeError(w, workerError(401, "internal_auth_failed", "Internal worker authentication failed"))
 			return
 		}
 	}
@@ -77,7 +78,7 @@ func (r *Runtime) handleCancel(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	cancelled := r.Cancel(id, "explicit cancel from control plane")
-	writeJSON(w, 200, map[string]any{"cancelled": cancelled, "ok": true})
+	writeRawJSON(w, 200, messages.Marshal(map[string]any{"cancelled": cancelled, "ok": true}))
 }
 
 func headerFromAny(m map[string]any) http.Header {
@@ -103,6 +104,10 @@ func (r *Runtime) handleMessages(w http.ResponseWriter, req *http.Request) {
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		writeError(w, workerError(400, "invalid_request", "invalid envelope: "+err.Error()))
+		return
+	}
+	if len(env.Body) == 0 || string(env.Body) == "null" {
+		writeError(w, workerError(400, "invalid_request", "body is required"))
 		return
 	}
 	decoded, err := messages.Decode(env.Body)
@@ -138,7 +143,15 @@ func (r *Runtime) handleMessages(w http.ResponseWriter, req *http.Request) {
 	if session == "" {
 		session = messages.NewUUID()
 	}
-	body["metadata"] = map[string]any{"user_id": messages.UserIDJSON(session)}
+	metadata, _ := body["metadata"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+		body["metadata"] = metadata
+	}
+	// 现网保留调用方的 user_id JSON 字符串，仅缺失时构造会话元数据。
+	if userID, ok := metadata["user_id"].(string); !ok || strings.TrimSpace(userID) == "" {
+		metadata["user_id"] = messages.UserIDJSON(session)
+	}
 	body["stream"] = true
 	body["wireMessages"] = true
 	jobReq := messages.Marshal(body)
@@ -202,10 +215,27 @@ func (c *collector) add(raw json.RawMessage) (string, []byte, error) {
 	}
 	c.events++
 	typ, _ := ev["type"].(string)
-	if typ != "response_headers" {
+	// local_cli 的 JSON 汇总只保留块起始 signature；实时 SSE 仍完整透传 delta。
+	delta, _ := ev["delta"].(map[string]any)
+	if typ != "response_headers" && !(typ == "content_block_delta" && delta["type"] == "signature_delta") {
 		c.asm.Add(ev)
 	}
 	return typ, ojson.MarshalSorted(tree), nil
+}
+
+// completeJSON 对齐 local_cli 终结帧：非空 usage 整体覆盖流累计，空对象回退。
+func (c *collector) completeJSON(done *frame.JobDone, model string) {
+	c.asm.Complete(model)
+	if done == nil {
+		return
+	}
+	if done.StopReason != "" {
+		c.asm.StopReason = done.StopReason
+	}
+	var usage map[string]any
+	if json.Unmarshal(done.Usage, &usage) == nil && len(usage) > 0 {
+		c.asm.Usage = sse.Usage{"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
+	}
 }
 
 // messageStop 是 job_done 时缺 message_stop 由现网补发的事件。
@@ -372,7 +402,7 @@ func (r *Runtime) respondJSON(w http.ResponseWriter, req *http.Request, j *job, 
 			writeError(w, m.err)
 			return
 		case msgDone:
-			c.asm.Complete(model)
+			c.completeJSON(m.done, model)
 			body, err := c.asm.FinishJSON()
 			if err != nil {
 				writeError(w, workerError(502, "kernel_error", err.Error()))

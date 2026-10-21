@@ -19,7 +19,11 @@ permissions:
   contents: read
 
 jobs:
+  native-parity:
+    uses: ./.github/workflows/native-parity.yml
+
   linux-amd64:
+    needs: native-parity
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:

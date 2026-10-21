@@ -1,4 +1,4 @@
-# PR/main gate: Node + Go (incl. native-slot) + pinned amd64 payload ELFs + web + native ARM64 deployment.
+# PR/main gate: Node + Go + pinned payload ELFs + web + ARM64 deployment + 三层原生差分。
 name: ci
 
 on:
@@ -15,6 +15,9 @@ permissions:
   contents: read
 
 jobs:
+  native-parity:
+    uses: ./.github/workflows/native-parity.yml
+
   unit:
     runs-on: ubuntu-latest
     timeout-minutes: 8

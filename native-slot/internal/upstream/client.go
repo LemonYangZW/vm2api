@@ -351,7 +351,15 @@ func (c *Client) Stream(ctx context.Context, b *Built, maxEvent int, onEvent fun
 			continue
 		}
 		if !json.Valid(data) || data[0] != '{' {
-			res.Failure = &Failure{Error: "Could not parse upstream SSE event", Code: "cli_error", Status: 502, ErrorType: "api_error"}
+			message := "Could not parse upstream SSE event"
+			// Bun JSON.parse 在对象键未加引号时先期待对象结束；保留官方原始错误。
+			if len(data) > 1 && data[0] == '{' {
+				rest := bytes.TrimSpace(data[1:])
+				if len(rest) > 0 && rest[0] != '"' && rest[0] != '}' {
+					message = "JSON Parse error: Expected '}'"
+				}
+			}
+			res.Failure = &Failure{Error: message, Code: "cli_error", Status: 502, ErrorType: "api_error"}
 			return res
 		}
 		if name == "message_stop" {

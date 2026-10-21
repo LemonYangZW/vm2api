@@ -253,9 +253,10 @@ request-id
 | `usage` | 可为 `null` 或省略 |
 | `stop_reason` | **必填字符串**，不可为 `null` |
 
-内核从 `stream_event` 汇总真实的 `usage` 与 `stop_reason`，
-本帧中的值不会被直接采用；但 `stop_reason` 的类型必须合法，
-否则整帧会被判为未识别并丢弃。
+1.3.205 实测：真实 CLI 通常发送空 `stop_reason` 和空 `usage`，此时内核从
+`stream_event` 汇总非流式结果。若本帧给出非空 `stop_reason`，则覆盖流中值；
+若给出非空 usage 对象，则整体替换累计 usage，只取 `input_tokens` / `output_tokens`，
+缺项按 0，不继承缓存统计。`stop_reason` 类型仍必须合法，否则整帧被丢弃。
 
 ### 2.4.3 `job_error`
 
