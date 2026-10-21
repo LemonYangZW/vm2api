@@ -23,6 +23,7 @@ on:
       - 'share/**'
       - 'docker-compose*.yml'
       - 'test/deploy/**'
+      - 'test/unit/wrap-cli-runtime.test.mjs'
   pull_request:
     paths:
       - '.github/workflows/release.yml'
@@ -42,6 +43,7 @@ on:
       - 'share/**'
       - 'docker-compose*.yml'
       - 'test/deploy/**'
+      - 'test/unit/wrap-cli-runtime.test.mjs'
   workflow_dispatch:
 
 concurrency:
@@ -116,7 +118,11 @@ jobs:
           cache-from: type=gha,scope=vm2api-arm64
           cache-to: type=gha,scope=vm2api-arm64,mode=max,ignore-error=true,timeout=2m
       - name: 验证原生运行时、内核和面板
-        run: python3 test/deploy/smoke_arm64_image.py vm2api-arm64-control:ci
+        run: |
+          docker run --rm --network none --platform linux/arm64 --entrypoint node \
+            --mount "type=bind,src=$PWD/test,dst=/opt/vm2api/test,readonly" \
+            vm2api-arm64-control:ci --test --test-name-pattern=crag test/unit/wrap-cli-runtime.test.mjs
+          python3 test/deploy/smoke_arm64_image.py vm2api-arm64-control:ci
       - uses: docker/login-action@v4
         if: steps.meta.outputs.publish == 'true'
         with:
@@ -138,6 +144,6 @@ jobs:
             echo "### ARM64 发布完成"
             echo "- 镜像：\`$IMAGE:$IMAGE_REF-arm64\`"
             echo "- 源码：\`$GITHUB_SHA\`"
-            echo "- 已验证：原生 ARM64 内核/CLI、QEMU payload、入口文件刷新、health、console"
+            echo "- 已验证：原生 ARM64 wrap/crag 内核及 CLI、QEMU payload、入口文件刷新、health、console"
             docker image inspect "$IMAGE:$IMAGE_REF-arm64" --format '{{json .RepoDigests}}'
           } >> "$GITHUB_STEP_SUMMARY"

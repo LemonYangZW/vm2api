@@ -78,17 +78,19 @@ if [ -d /opt/vm2api/image-wrap-cli ]; then
     refresh_wrap_file "$name"
   done
 fi
-# The crag kernel no longer comes from a repo checkout; refresh it from the image like the wrap ELFs.
-if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
-  mkdir -p "$ROOT/share/crag"
-  dest="$ROOT/share/crag/kin-kernel"
-  if [ ! -f "$dest" ] || ! cmp -s /opt/vm2api/image-crag/kin-kernel "$dest"; then
-    cp /opt/vm2api/image-crag/kin-kernel "$dest.new"
+# 同时刷新 crag 的 amd64 与原生 ARM64 内核，仍由 KIN_AUTO_SYNC_WRAP 控制槽位同步。
+for name in kin-kernel linux-arm64/kin-kernel; do
+  src="/opt/vm2api/image-crag/$name"
+  [ -f "$src" ] || continue
+  dest="$ROOT/share/crag/$name"
+  if [ ! -f "$dest" ] || ! cmp -s "$src" "$dest"; then
+    mkdir -p "$(dirname "$dest")"
+    cp "$src" "$dest.new"
     chmod 755 "$dest.new"
     mv -f "$dest.new" "$dest"
     WRAP_CHANGED=1
   fi
-fi
+done
 
 if [ ! -S /var/run/docker.sock ]; then
   echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2

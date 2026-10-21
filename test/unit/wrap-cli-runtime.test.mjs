@@ -155,6 +155,67 @@ test('crag inspection reports a change and sync marks the kernel for restart', (
   }
 })
 
+test('ARM64 crag 使用原生内核并保留 cc-node，忽略槽位遗留的 x86 loader', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-'))
+  try {
+    seedTemplate(project)
+    const kernel = path.join(project, 'share', 'crag', 'linux-arm64', 'kin-kernel')
+    fs.mkdirSync(path.dirname(kernel), { recursive: true })
+    const bytes = fakeElf64Arm64('crag-native')
+    fs.writeFileSync(kernel, bytes)
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: null }, () => {
+      const vm = { id: 'vm-crag-native', dataplane: 'crag' }
+      const result = syncWrapSample(project, [vm]).items[0]
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.arch, 'arm64')
+      const dest = wrapCliHomeDir(project, vm.id)
+      assert.deepEqual(fs.readFileSync(path.join(dest, 'kin-kernel.bin')), bytes)
+      assert.equal(fs.readFileSync(path.join(dest, CC_NODE_BIN), 'utf8'), 'cc-node')
+      assert.doesNotMatch(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /ld-linux/)
+      assert.equal(inspectKernelChanges(project, [vm]).changed_count, 0)
+      fs.writeFileSync(kernel, fakeElf64Arm64('crag-native-next'))
+      assert.equal(inspectKernelChanges(project, [vm]).changed_count, 1)
+      assert.equal(syncWrapSample(project, [vm]).items[0].kernel_changed, true)
+      assert.equal(inspectKernelChanges(project, [vm]).changed_count, 0)
+    })
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('crag 的 KVM、节点槽、amd64 主机和关闭原生模式仍使用 amd64 内核', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-skip-'))
+  try {
+    seedTemplate(project)
+    const dir = path.join(project, 'share', 'crag')
+    fs.mkdirSync(path.join(dir, 'linux-arm64'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'kin-kernel'), fakeElf64Amd64('crag-amd64'))
+    fs.writeFileSync(path.join(dir, 'linux-arm64', 'kin-kernel'), fakeElf64Arm64('crag-native'))
+    const cases = [
+      [{ KIN_SLOT_HOST_ARCH: 'arm64' }, { id: 'vm-k', runtime: { type: 'kvm' } }],
+      [{ KIN_SLOT_HOST_ARCH: 'arm64' }, { id: 'vm-n', node_id: 'node-1' }],
+      [{ KIN_SLOT_HOST_ARCH: 'x64' }, { id: 'vm-x' }],
+      [{ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: '0' }, { id: 'vm-o' }],
+      [{ KIN_SLOT_HOST_ARCH: 'arm64', KIN_CRAG_KERNEL_BIN: path.join(dir, 'kin-kernel') }, { id: 'vm-env' }],
+    ]
+    for (const [env, vm] of cases) {
+      withEnv({ KIN_NATIVE_SLOTS: null, ...env }, () => {
+        const result = materializeSlotDataplane(project, vm, 'crag')
+        assert.equal(result.ok, true, result.error)
+        assert.equal(result.arch, 'amd64', vm.id)
+        assert.equal(inspectLinuxElf(fs.readFileSync(path.join(result.dest, 'kin-kernel.bin')), 'amd64').ok, true)
+        assert.match(fs.readFileSync(path.join(result.dest, 'kin-kernel'), 'utf8'), /ld-linux/)
+      })
+    }
+    fs.writeFileSync(path.join(dir, 'linux-arm64', 'kin-kernel'), fakeElf64Amd64('wrong-arch'))
+    withEnv({ KIN_SLOT_HOST_ARCH: 'arm64', KIN_NATIVE_SLOTS: null }, () => {
+      assert.equal(materializeSlotDataplane(project, { id: 'vm-bad' }, 'crag').arch, 'amd64')
+    })
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
 test('materializeWrapCli does not recopy identical wrap files', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-skip-'))
   try {

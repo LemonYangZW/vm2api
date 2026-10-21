@@ -60,6 +60,10 @@ for name in ('kin-kernel.bin', 'cli-node'):
     version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10).strip()
     assert version, name
     print('native ' + name + ': ' + version)
+crag = root / 'image-crag' / 'linux-arm64' / 'kin-kernel'
+elf(crag, 183, static=True)
+assert crag.read_bytes() == (native / 'kin-kernel.bin').read_bytes()
+assert subprocess.check_output([str(crag), '--version'], text=True, timeout=10).strip()
 
 env = {**os.environ, 'HOST': '127.0.0.1', 'PORT': '18787', 'KIN_AUTO_SYNC_WRAP': '0',
        'VM2API_ADMIN_PASSWORD': secrets.token_hex(24), 'VM2API_API_KEY': secrets.token_hex(32),
@@ -84,12 +88,27 @@ try:
         assert (root / 'bin' / name).read_bytes() == (root / 'image-bin' / name).read_bytes()
     for name in ('kin-kernel.bin', 'cli-node'):
         assert (root / 'share' / 'wrap-cli' / 'linux-arm64' / name).read_bytes() == (native / name).read_bytes()
+    assert (root / 'share' / 'crag' / 'linux-arm64' / 'kin-kernel').read_bytes() == crag.read_bytes()
+    legacy_loader = root / 'vms/vm-smoke-crag/cli-home/.kin/glibc239/ld-linux-x86-64.so.2'
+    legacy_loader.parent.mkdir(parents=True, exist_ok=True)
+    legacy_loader.write_text('#!/bin/sh\nexit 99\n')
+    legacy_loader.chmod(0o755)
     subprocess.run(['node', '--input-type=module', '-e', r"""
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { ensureSlotComputer } from './src/lib/identity/slot-computer.mjs'
+import { materializeSlotDataplane, inspectKernelChanges } from './src/lib/vm/wrap-cli-runtime.mjs'
+const projectRoot = process.cwd()
+const cragVm = { id: 'vm-smoke-crag', dataplane: 'crag' }
+const cragSlot = materializeSlotDataplane(projectRoot, cragVm, 'crag')
+assert.equal(cragSlot.ok, true, cragSlot.error)
+assert.equal(cragSlot.arch, 'arm64')
+assert.deepEqual(fs.readFileSync(path.join(cragSlot.dest, 'kin-kernel.bin')),
+  fs.readFileSync(path.join(projectRoot, 'image-crag/linux-arm64/kin-kernel')))
+assert.doesNotMatch(fs.readFileSync(path.join(cragSlot.dest, 'kin-kernel'), 'utf8'), /ld-linux/)
+assert.equal(inspectKernelChanges(projectRoot, [cragVm]).changed_count, 0)
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'computer-smoke-'))
 try {
   for (const type of ['docker', 'kvm']) {
@@ -105,6 +124,8 @@ try {
   fs.rmSync(root, { recursive: true, force: true })
 }
 """], cwd=root, check=True, timeout=120)
+    wrapper = root / 'vms/vm-smoke-crag/cli-home/.kin/kin-kernel'
+    assert subprocess.check_output([str(wrapper), '--version'], text=True, timeout=10).strip()
 finally:
     server.terminate()
     try:
@@ -112,7 +133,7 @@ finally:
     except subprocess.TimeoutExpired:
         server.kill()
         server.wait(timeout=5)
-print('PASS: native control plane, native slot kernel/CLI, amd64 cluster helpers, QEMU CLI/computer, stable Docker/KVM identities, entrypoint refresh, health and console')
+print('PASS: native control plane, native wrap/crag kernel and CLI, amd64 cluster helpers, QEMU CLI/computer, stable Docker/KVM identities, entrypoint refresh, health and console')
 '''
 
 

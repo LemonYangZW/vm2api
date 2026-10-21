@@ -24,7 +24,7 @@ checkout 本机构建。
 
 无后缀附件保持 linux amd64，已部署的面板按原名下载 kernel / CLI。ARM64
 控制面镜像另外从 `native-slot/` 源码编译原生 `kin-kernel` 与 `cli-node`，见
-下文「原生槽位 kernel / CLI」。cc-node、crag kernel、Codex kernel、OAuth 和
+下文「原生槽位 kernel / CLI」。cc-node、Codex kernel、OAuth 和
 控制面造机服务 `kin-computer` 仍只有 amd64，ARM64 主机经 QEMU 运行它们。
 
 ## 原生槽位 kernel / CLI
@@ -35,10 +35,16 @@ ARM64 镜像把静态链接的 aarch64 `kin-kernel.bin` 与 `cli-node` 放在
 的 `.kin` 目录改用这一对文件，包装脚本 `kin-kernel` 不再经过 x86 glibc
 loader；数据面热路径（kernel 调度与 CLI 上游请求）因此不再经 QEMU。
 
+同一次编译的内核也包含 crag 模式，另打包到
+`/opt/vm2api/image-crag/linux-arm64/kin-kernel`，启动时刷新到
+`share/crag/linux-arm64/kin-kernel`。本机 ARM64 Docker crag 槽选择该原生内核；
+crag 所用的官方 `cc-node` 仍为 amd64，经 QEMU 运行。构建时执行假 CLI 的
+crag 流式/非流式回归，镜像冒烟验证 crag 的 ARM64 ELF、槽位选择和入口刷新。
+
 | 槽位 | kernel / cli-node |
 | --- | --- |
 | 本机 Docker 槽（wrap、cc 数据面） | 原生 ARM64；cc 数据面的 cc-node 仍为 amd64 |
-| crag 数据面 | 不变：crag kernel + cc-node，均为 amd64 |
+| 本机 Docker 槽（crag 数据面） | crag kernel 原生 ARM64；cc-node 仍为 amd64 |
 | KVM 槽 | amd64（客体是 x86 虚拟机） |
 | 集群节点槽 | amd64（烤进节点镜像，见 `cluster/slot-image.mjs`） |
 

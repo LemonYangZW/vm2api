@@ -69,15 +69,18 @@ exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 `
 }
 
-export function cragKernelWrapperScript() {
-  return `#!/bin/sh
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-BIN="$DIR/${WRAP_KERNEL_BIN}"
-LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
+export function cragKernelWrapperScript({ native = false } = {}) {
+  const loader = native
+    ? ''
+    : `LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
 if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
   exec "$LOADER" --library-path "$DIR/${WRAP_GLIBC_DIR}" "$BIN" "$@"
 fi
-if [ -x "$BIN" ]; then
+`
+  return `#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIN="$DIR/${WRAP_KERNEL_BIN}"
+${loader}if [ -x "$BIN" ]; then
   exec "$BIN" "$@"
 fi
 exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
@@ -273,6 +276,18 @@ export function nativeSlotPayload(projectRoot, vm) {
   return native.ok && native.enabled ? native : null
 }
 
+/** crag 只替换本地 Docker 槽内核；官方 cc-node 继续通过 QEMU 运行。 */
+export function nativeCragSlotPayload(projectRoot, vm) {
+  if (isKvmRuntime(vm) || vm?.node_id || slotHostArch() !== 'arm64') return null
+  if (String(process.env.KIN_NATIVE_SLOTS || '').trim() === '0') return null
+  const configured = String(process.env.KIN_CRAG_KERNEL_BIN || '').trim()
+  if (configured && isFile(configured)) return null
+  const dir = cragTemplateDir(projectRoot)
+  const kernel = dir ? path.join(dir, WRAP_NATIVE_ARM64_DIR, 'kin-kernel') : ''
+  if (!isFile(kernel) || !inspectLinuxElf(readElfHead(kernel), 'arm64').ok) return null
+  return { kernel }
+}
+
 export function inspectWrapCliDir(dir) {
   if (!dir || !fs.existsSync(dir)) {
     return { ok: false, code: 'wrap_cli_template_missing', error: `wrap CLI template missing: ${dir || '(unset)'}` }
@@ -405,9 +420,9 @@ function chownTree(root, uid, gid) {
   walk(root)
 }
 
-function writeCragWrapper(destDir) {
+function writeCragWrapper(destDir, { native = false } = {}) {
   const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
-  const body = cragKernelWrapperScript()
+  const body = cragKernelWrapperScript({ native })
   try {
     if (fs.readFileSync(wrapper, 'utf8') === body) return
   } catch {}
@@ -442,7 +457,8 @@ export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null 
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
-  const src = cragKernelPath(projectRoot)
+  const native = nativeCragSlotPayload(projectRoot, vm)
+  const src = native?.kernel || cragKernelPath(projectRoot)
   if (!src) {
     return {
       ok: false,
@@ -462,13 +478,14 @@ export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null 
   fs.mkdirSync(dest, { recursive: true })
   const kernelChanged = replaceFile(src, path.join(dest, WRAP_KERNEL_BIN))
   copyFile(cliSrc, path.join(dest, CC_NODE_BIN))
-  writeCragWrapper(dest)
+  writeCragWrapper(dest, { native: Boolean(native) })
   chownTree(dest, uid, gid)
   return {
     ok: true,
     dest,
     src,
     dataplane: 'crag',
+    arch: native ? 'arm64' : 'amd64',
     changed: kernelChanged,
     kernel_changed: kernelChanged,
     glibc_shim: false,
@@ -841,8 +858,11 @@ export function inspectKernelChanges(projectRoot, vms, { routing } = {}) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
     const dest = path.join(wrapCliHomeDir(projectRoot, vm.id), WRAP_KERNEL_BIN)
-    const src = dataplane === 'crag' ? crag.path : slotKernelSource(projectRoot, vm, sample.dir)
-    if (dataplane === 'crag' && !crag.ok) {
+    const src =
+      dataplane === 'crag'
+        ? nativeCragSlotPayload(projectRoot, vm)?.kernel || crag.path
+        : slotKernelSource(projectRoot, vm, sample.dir)
+    if (dataplane === 'crag' && !src) {
       items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
       continue
     }
@@ -877,7 +897,7 @@ export function syncWrapSample(projectRoot, vms, { uidOf, routing } = {}) {
       items.push({ id: vm.id, dataplane, ok: false, code: sample.code, error: sample.error })
       continue
     }
-    if (dataplane === 'crag' && !crag.ok) {
+    if (dataplane === 'crag' && !crag.ok && !nativeCragSlotPayload(projectRoot, vm)) {
       items.push({
         id: vm.id,
         dataplane,

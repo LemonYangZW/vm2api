@@ -21,11 +21,12 @@ RUN cd worker && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin
     && GOARCH=amd64 go build -buildvcs=false -trimpath -o /out/amd64/kin-worker ./cmd/kin-worker \
     && CGO_ENABLED=0 GOARCH=amd64 go build -buildvcs=false -trimpath -o /out/amd64/kin-slot-gate ./cmd/kin-slot-gate \
     && cd ../api-kernel && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-api-kernel ./cmd/kin-api-kernel
-# Native slot pair for local Docker slots (standard library only, no go.sum).
+# 本地 Docker 槽的原生内核同时包含 wrap 与 crag 数据面，共用一次编译。
 COPY native-slot/go.mod ./native-slot/
 COPY native-slot/cmd/ ./native-slot/cmd/
 COPY native-slot/internal/ ./native-slot/internal/
 RUN cd native-slot && mkdir -p /out/native \
+    && go test ./internal/worker -run '^TestCragDataplaneE2E$' -count=1 -timeout=30s \
     && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/native/kin-kernel.bin ./cmd/kin-kernel \
     && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/native/cli-node ./cmd/cli-node
 
@@ -63,6 +64,7 @@ COPY share/wrap-cli /opt/vm2api/image-wrap-cli/
 COPY --from=payload /payload/share/wrap-cli/ /opt/vm2api/image-wrap-cli/
 COPY --from=payload /payload/share/crag/ /opt/vm2api/image-crag/
 COPY --from=helpers /out/native/ /opt/vm2api/image-wrap-cli/linux-arm64/
+COPY --from=helpers /out/native/kin-kernel.bin /opt/vm2api/image-crag/linux-arm64/kin-kernel
 # Only the remaining x86 executables need these libraries and loader under QEMU.
 COPY --from=amd64-runtime /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=amd64-runtime /usr/lib64/ /usr/lib64/
