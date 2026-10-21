@@ -16,7 +16,7 @@ jobs:
       - name: 校验官方包并在断网 ARM64 容器中验证参数
         run: |
           python3 - <<'PY'
-          import base64, hashlib, io, json, pathlib, subprocess, tarfile, tempfile, urllib.request
+          import base64, hashlib, io, json, os, pathlib, subprocess, tarfile, tempfile, urllib.request
 
           version = '2.1.296'
           url = f'https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64/-/claude-code-linux-arm64-{version}.tgz'
@@ -52,12 +52,19 @@ jobs:
                                        'stdout': result.stdout[:16000], 'stderr': result.stderr[:4000]}
                   except subprocess.TimeoutExpired:
                       results[name] = {'args': args, 'timeout': True}
+          rejected = any('unknown option' in results[name].get('stderr', '')
+                         for name in ('single_process', 'max_procs', 'continuous', 'crag'))
+          verdict = 'rejected' if rejected else 'inconclusive'
           report = {'version': version, 'tarball': url, 'integrity': integrity,
+                    'crag_parameters': verdict,
                     'elf_machine': 183, 'size': len(binary), 'sha256': hashlib.sha256(binary).hexdigest(),
                     'results': results}
           output = json.dumps(report, ensure_ascii=False, indent=2)
           pathlib.Path('official-cc-arm64-report.json').write_text(output, encoding='utf-8')
           print(output)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f'### 官方 ARM64 CLI 参数探测\n\n版本：{version}\n\ncrag 参数：{verdict}\n\n')
+              summary.write('此任务只收集证据；参数接受也不能证明 JSON 帧和并发语义等价。\n')
           assert results['version']['exit_code'] == 0
           PY
       - uses: actions/upload-artifact@v6

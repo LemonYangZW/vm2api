@@ -24,8 +24,8 @@ checkout 本机构建。
 
 无后缀附件保持 linux amd64，已部署的面板按原名下载 kernel / CLI。ARM64
 控制面镜像另外从 `native-slot/` 源码编译原生 `kin-kernel` 与 `cli-node`，见
-下文「原生槽位 kernel / CLI」。cc-node、Codex kernel、OAuth 和
-控制面造机服务 `kin-computer` 仍只有 amd64，ARM64 主机经 QEMU 运行它们。
+下文「原生槽位 kernel / CLI」。本项目固定 payload 中的 cc-node、Codex kernel、
+OAuth 和控制面造机服务 `kin-computer` 为 amd64，ARM64 主机经 QEMU 运行它们。
 
 ## 原生槽位 kernel / CLI
 
@@ -33,13 +33,30 @@ ARM64 镜像把静态链接的 aarch64 `kin-kernel.bin` 与 `cli-node` 放在
 `/opt/vm2api/image-wrap-cli/linux-arm64/`，entrypoint 每次启动刷新到
 `share/wrap-cli/linux-arm64/`。控制面在宿主为 ARM64 时，物化本机 Docker 槽
 的 `.kin` 目录改用这一对文件，包装脚本 `kin-kernel` 不再经过 x86 glibc
-loader；数据面热路径（kernel 调度与 CLI 上游请求）因此不再经 QEMU。
+loader；wrap 数据面的热路径（kernel 调度与 CLI 上游请求）因此不再经 QEMU。
 
 同一次编译的内核也包含 crag 模式，另打包到
 `/opt/vm2api/image-crag/linux-arm64/kin-kernel`，启动时刷新到
 `share/crag/linux-arm64/kin-kernel`。本机 ARM64 Docker crag 槽选择该原生内核；
 crag 所用的官方 `cc-node` 仍为 amd64，经 QEMU 运行。构建时执行假 CLI 的
 crag 流式/非流式回归，镜像冒烟验证 crag 的 ARM64 ELF、槽位选择和入口刷新。
+
+官方 npm 确实发布了
+[`@anthropic-ai/claude-code-linux-arm64@2.1.296`](https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64/2.1.296)，
+但它不能直接替换本项目的 `cc-node`。2026-10-21 在原生 ARM64 runner 的断网容器中
+[实测](https://github.com/LemonYangZW/vm2api/actions/runs/39537388673)：包完整性校验通过，
+`package/claude` 为 aarch64 ELF，`--version` 返回 `2.1.296 (Claude Code)`；
+当前 crag 必需的三个参数却逐一返回退出码 1：
+
+```text
+error: unknown option '--single-process-subagents'
+error: unknown option '--max-procs'
+error: unknown option '--continuous-tool-loop'
+```
+
+因此本次不替换 `cc-node`，也不据此放开 ARM64 cc-node 上传或宣称 crag 全链路原生。
+仅修改 ELF 上传校验不能解决启动协议不兼容。`official-cc-arm64-probe` 仅手动运行，
+保存固定版本、完整性、架构、版本输出和参数探测报告；不访问生产，不进行真实推理。
 
 | 槽位 | kernel / cli-node |
 | --- | --- |
