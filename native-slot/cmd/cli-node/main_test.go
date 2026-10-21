@@ -206,6 +206,43 @@ func authorizeParams(t *testing.T, out string) url.Values {
 	return u.Query()
 }
 
+func TestPanelLoginWithoutArguments(t *testing.T) {
+	m := newOAuthMock(t)
+	env, dir := baseEnv(t, m)
+	env["KIN_PANEL_LOGIN"] = "1"
+	env["CLAUDE_CODE_HOST_REFRESH"] = "1"
+	path := filepath.Join(dir, "credentials.json")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := startPTY(t, env)
+	q := authorizeParams(t, p.waitFor("Paste code here"))
+	p.paste("good#" + q.Get("state"))
+	p.waitFor("Login successful")
+	if err := p.cmd.Wait(); err != nil {
+		t.Fatalf("exit: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	grant, _ := doc["claudeAiOauth"].(map[string]any)
+	if grant["refreshToken"] != "sk-ant-ort01-ref" {
+		t.Error("面板登录未写入宿主凭据文件")
+	}
+	if out, err := command(env, "auth", "logout").CombinedOutput(); err != nil {
+		t.Fatalf("logout: %v %s", err, out)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(b) {
+		t.Error("logout 修改了宿主维护的凭据")
+	}
+}
+
 func TestAuthLogin(t *testing.T) {
 	m := newOAuthMock(t)
 	env, dir := baseEnv(t, m)

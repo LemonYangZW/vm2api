@@ -24,7 +24,7 @@ var nativeOwnedFields = map[string]bool{
 	"top_p": true, "top_k": true, "stop_sequences": true, "betas": true, "wireMessages": true,
 	"request_context": true, "output_config": true, "context_management": true, "safeguards": true,
 	// 规格要求移除的内核内部字段。
-	"wireBody": true,
+	"wireBody": true, "auto_compact_window": true,
 }
 
 var callerOptionalFields = []string{"tools", "tool_choice", "thinking", "temperature", "top_p",
@@ -142,12 +142,8 @@ func Build(in BuildInput) (*Built, error) {
 		if ttl == "" {
 			ttl = "1h"
 		}
-		applyOwnedCacheMarkers(system, allTools, messages, ttl, kinWire != nil, preserveTools, preserveMessages)
-		// 现网 cli-node（2026-10-19 payload）对调用方给出的段同样补 TTL：oracle 实测
-		// 不带 ttl 的 messages 标记按 default_cache_ttl=1h 创建缓存，与 03 §3.4 一致。
-		// 只补缺失的 ttl，不改计数与上限，所以放在上面那步之后。
-		fillCallerCacheTTL(cacheSections{system: system, tools: allTools, messages: messages,
-			hasSys: kinWire != nil, hasTools: preserveTools, hasMsgs: preserveMessages}, ttl)
+		// 新版 CLI 对全部段统一补 TTL、移除 thinking 标记并限制到四个断点。
+		applyOwnedCacheMarkers(system, allTools, messages, ttl, false, false, false)
 	}
 
 	// metadata

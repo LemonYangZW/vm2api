@@ -54,8 +54,11 @@ go test ./...
 - cch 在发送前按 xxh64 摘要回填（`kernel.json` 的 `cch_enabled=false` 时保持 `00000`）；
 - zero 布局下环境块与调用方剩余文本合并为一块并带 `cache_control`；
 - beta 基础集合含 `prompt-caching-scope`、`mid-conversation-system`，模型集合取自现网常量；
-- 缓存 marker 只裁剪宿主自己生成的 system 段；调用方原样给出的 messages/tools 计入上限，
-  只给 `type=ephemeral` 且缺 `ttl` 的标记补 `default_cache_ttl`（oracle 实测），其余不改写；
+- system 的非空文本块数组直接透传，不再要求包含计费头；数组中计费头只重置 cch；
+- 缓存 marker 对 system/tools/messages 统一处理，去掉 thinking 标记并限制最多四个；
+  只有请求中出现显式合法 TTL 时才补全缺失值，整次请求均省略 TTL 时保持省略；
+- `auto_compact_window` 作为 CLI 内部参数消耗，不发给上游；默认配置路径为 `/run/kin/kernel.json`；
+- 面板登录以 `KIN_PANEL_LOGIN` 无参数启动时进入授权流程，继续复用宿主凭据文件；
 - 发往上游前 `upstream.Preflight` 最后把关：缓存标记规则同控制面 `validateCacheBreakpoints`，
   外加 messages 非空、role/content 形状、按合并后 turn 判 tool_use/tool_result 配对与 id 唯一；
   命中即本地返回 400 `upstream_invalid_request`，不出网；

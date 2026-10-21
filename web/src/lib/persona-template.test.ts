@@ -54,9 +54,9 @@ describe('persona template contract', () => {
 describe('agent standing + system preview', () => {
   const vars = {
     identity: 'ID',
-    identity_cli: 'ID_CLI',
-    reporting: 'REPORT',
-    dynamic_boundary: 'BOUND',
+    identity_cli: 'ID',
+    reporting: 'REPORTING',
+    dynamic_boundary: 'BOUNDARY',
     agent_official: 'AGENT',
     env_official: 'ENV',
     caller_agent: '',
@@ -257,7 +257,12 @@ describe('agent standing + system preview', () => {
       'agent_official',
       'dynamic_boundary',
     ])
-    expect(fullOff.some((block) => block.placeholder)).toBe(false)
+    expect(
+      fullOff.find((block) => block.id === 'agent_official')
+    ).toMatchObject({
+      placeholder: false,
+    })
+    expect(fullOff.some((block) => block.id === 'env_official')).toBe(false)
 
     expect(
       previewSystemBlocks(

@@ -77,7 +77,7 @@ func kernelConfigPath() string {
 	if v := os.Getenv("KERNEL_CONFIG"); v != "" {
 		return v
 	}
-	return "/run/guest/kernel.json"
+	return "/run/kin/kernel.json"
 }
 
 var (
@@ -275,19 +275,21 @@ func eachCacheBlock(s cacheSections, fn func(any)) {
 }
 
 func fillMissingCacheTTL(s cacheSections, ttl string) {
+	var system, tools, messages any
+	if s.hasSys {
+		system = s.system
+	}
+	if s.hasTools {
+		tools = s.tools
+	}
+	if s.hasMsgs {
+		messages = s.messages
+	}
+	// 新版 CLI 在整段请求未显式指定合法 TTL 时保持省略。
+	if explicitCacheTTL(system, tools, messages) == "" {
+		return
+	}
 	eachCacheBlock(s, func(b any) { stampBlock(b, ttl) })
-}
-
-// fillCallerCacheTTL 只给调用方 type=ephemeral 且没写 ttl 的标记补 ttl，其余字段
-// 原样保留；非法标记不动，留给 Preflight 本地拒绝，不替调用方修。
-func fillCallerCacheTTL(s cacheSections, ttl string) {
-	eachCacheBlock(s, func(b any) {
-		cc := ojson.Obj(ojson.Obj(b).Get("cache_control"))
-		if cc == nil || ojson.Str(cc.Get("type")) != "ephemeral" || cc.Get("ttl") != nil {
-			return
-		}
-		cc.Set("ttl", ttl)
-	})
 }
 
 // applyOwnedCacheMarkers 只改宿主自己生成的段；调用方原样给出的段计入上限但不改写。

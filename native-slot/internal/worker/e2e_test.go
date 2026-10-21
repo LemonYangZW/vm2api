@@ -307,7 +307,7 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	}
 	beta := h.Get("anthropic-beta")
 	if !strings.HasPrefix(beta, "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01") ||
-		!strings.Contains(beta, "extended-cache-ttl-2025-04-11") {
+		strings.Contains(beta, "extended-cache-ttl-2025-04-11") {
 		t.Errorf("anthropic-beta = %s", beta)
 	}
 	body := c.body
@@ -331,7 +331,7 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	if env["text"] != "# Environment\n - Timezone: Asia/Taipei" {
 		t.Errorf("environment block = %v", env["text"])
 	}
-	if cc, _ := env["cache_control"].(map[string]any); cc["ttl"] != "1h" || cc["type"] != "ephemeral" {
+	if cc, _ := env["cache_control"].(map[string]any); cc["ttl"] != nil || cc["type"] != "ephemeral" {
 		t.Errorf("environment cache_control = %v", env["cache_control"])
 	}
 	md, _ := body["metadata"].(map[string]any)
@@ -342,6 +342,46 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	}
 	if !strings.HasPrefix(c.raw, `{"model":"claude-sonnet-5-5","messages":[{"content":"hi there friend","role":"user"}],"system":`) {
 		t.Errorf("body key order: %.120s", c.raw)
+	}
+}
+
+// 控制面传入的官方两段 system 没有计费头；宿主不得重写身份、时区或断点。
+func TestEndToEndOfficialSystemPassthrough(t *testing.T) {
+	up := newUpstream(t)
+	k, err := startKernel(t, up, 1, cliNodeBin, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := msgEnvelope("claude-sonnet-5-5", false)
+	body := env["body"].(map[string]any)
+	system := []any{
+		map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}},
+		map[string]any{"type": "text", "text": "调用方提示\n# Environment\n - Timezone: Pacific/Auckland", "cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}},
+	}
+	body["system"] = system
+	body["auto_compact_window"] = 200000
+	body["messages"] = []any{
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "hi", "cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}}}},
+		map[string]any{"role": "system", "content": "保留会话内提醒"},
+	}
+	resp := k.post(t, "/internal/v1/messages", env, nil)
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	got := up.last(t).body
+	wantSystem, _ := json.Marshal(system)
+	gotSystem, _ := json.Marshal(got["system"])
+	if string(gotSystem) != string(wantSystem) {
+		t.Errorf("system = %s, want %s", gotSystem, wantSystem)
+	}
+	if _, ok := got["auto_compact_window"]; ok {
+		t.Error("auto_compact_window leaked upstream")
+	}
+	msgs := got["messages"].([]any)
+	if msgs[1].(map[string]any)["content"] != "保留会话内提醒" {
+		t.Errorf("system message = %v", msgs[1])
 	}
 }
 
@@ -523,9 +563,8 @@ func TestEndToEndConcurrentSlots(t *testing.T) {
 	}
 }
 
-// oracle 实测：现网对调用方 messages 中不带 ttl 的标记按 default_cache_ttl 补全；
-// 显式 ttl 原样保留，且显式 5m 会让整次请求取 5m（显式优先）。
-func TestCallerCacheMarkersGetDefaultTTL(t *testing.T) {
+// 新版 CLI 保留整次请求均省略 TTL 的形状；出现显式 TTL 时才补全缺失值。
+func TestCallerCacheMarkersFollowExplicitTTL(t *testing.T) {
 	up := newUpstream(t)
 	k, err := startKernel(t, up, 1, cliNodeBin, nil, nil)
 	if err != nil {
@@ -536,7 +575,7 @@ func TestCallerCacheMarkersGetDefaultTTL(t *testing.T) {
 		explicit any
 		want     []string
 	}{
-		{"missing ttl gets 1h", nil, []string{"1h", "1h"}},
+		{"missing ttl stays omitted", nil, []string{"", ""}},
 		{"explicit 5m wins", "5m", []string{"5m", "5m"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -568,7 +607,7 @@ func TestCallerCacheMarkersGetDefaultTTL(t *testing.T) {
 			blocks := msgs[0].(map[string]any)["content"].([]any)
 			for i, want := range c.want {
 				cc, _ := blocks[i].(map[string]any)["cache_control"].(map[string]any)
-				if cc["ttl"] != want {
+				if (want == "" && cc["ttl"] != nil) || (want != "" && cc["ttl"] != want) {
 					t.Errorf("block %d cache_control = %v, want ttl %s", i, cc, want)
 				}
 			}

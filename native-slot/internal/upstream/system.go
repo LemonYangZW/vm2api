@@ -211,21 +211,18 @@ func jsString(v any) string {
 
 func blockText(b *ojson.Object) string { return ojson.Str(b.Get("text")) }
 
-// wireSystemBlocks：调用方 system 含计费头块时原样使用，只重置 cch。
+// wireSystemBlocks 透传非空文本块数组；计费头只重置 cch。
 func wireSystemBlocks(system any) []any {
 	arr, ok := system.([]any)
-	if !ok {
+	if !ok || len(arr) == 0 {
 		return nil
 	}
-	standard := false
 	for _, b := range arr {
-		if o := ojson.Obj(b); o != nil && billingLeadRe.MatchString(blockText(o)) {
-			standard = true
-			break
+		if o := ojson.Obj(b); o == nil {
+			return nil
+		} else if _, ok := o.Get("text").(string); !ok {
+			return nil
 		}
-	}
-	if !standard {
-		return nil
 	}
 	out := make([]any, 0, len(arr))
 	for _, b := range arr {

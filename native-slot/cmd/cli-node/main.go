@@ -38,6 +38,10 @@ func run(args []string) int {
 		return 0
 	}
 	term := &login.Terminal{In: bufio.NewReader(os.Stdin), Out: os.Stdout, Err: os.Stderr, Prompt: 30 * time.Minute}
+	// 新版面板登录终端无参数启动 claude；原生版沿用已有授权流程。
+	if len(args) == 0 && os.Getenv("KIN_PANEL_LOGIN") != "" {
+		return login.AuthLogin(ctx, nil, term)
+	}
 	if len(args) >= 2 && args[0] == "auth" {
 		switch args[1] {
 		case "login":

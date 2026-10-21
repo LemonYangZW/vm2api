@@ -213,7 +213,21 @@ func CredentialsPath() string {
 	if v := os.Getenv("KIN_CREDENTIAL_FILE"); v != "" {
 		return v
 	}
+	if hostRefreshEnabled() {
+		path := filepath.Join(upstream.ConfigDir(), "credentials.json")
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
 	return filepath.Join(upstream.ConfigDir(), ".credentials.json")
+}
+
+func hostRefreshEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CLAUDE_CODE_HOST_REFRESH"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // Save 把令牌合并写入凭据文件（0600）。
@@ -541,6 +555,11 @@ func Status(args []string, out io.Writer) int {
 
 // Logout 是 `cli-node auth logout`：移除 claudeAiOauth。
 func Logout(out, errw io.Writer) int {
+	// 宿主维护共享凭据时，官方 CLI 的 logout 不删除或清空它。
+	if hostRefreshEnabled() {
+		fmt.Fprintln(out, "Successfully logged out from your Anthropic account.")
+		return 0
+	}
 	path := CredentialsPath()
 	b, err := os.ReadFile(path)
 	if err == nil {

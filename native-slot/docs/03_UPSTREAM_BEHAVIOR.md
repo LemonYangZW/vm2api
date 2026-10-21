@@ -3,6 +3,8 @@
 本文规定 CLI 宿主调用上游 Messages 服务时的请求构造、流式转发与
 错误处理。目标是让上游收到的请求在客户端看来与标准 Claude 客户端一致。
 
+2026-10-21 同步上游 1.3.205：文本块数组透传、缓存 TTL 补全条件和配置路径以本版为准。
+
 ## 3.1 端点与认证
 
 | 项 | 值 |
@@ -245,6 +247,7 @@ CLI 宿主**原样透传** `job_start.request` 的内容，不做消息重组。
 ```text
 wireMessages
 wireBody
+auto_compact_window
 ```
 
 其余字段直接传给上游：
@@ -267,8 +270,8 @@ output_config, context_management, metadata, stream
 最终发给上游的 system 由 CLI 宿主按下列优先级决定：
 
 ```text
-1. system 块中含 x-anthropic-billing-header: 的块
-   → 原样使用整个数组，只把该块的 cch= 重置为 cch=00000
+1. 非分类器请求的 system 是非空数组，且每一项都是 text 为字符串的对象
+   → 使用整个数组，仅对其中计费头块重置 cch=00000
 2. 带 request_context（分类器场景）
    → classifierSystemBlocks(...)
 3. SYSTEM_MODE / CLAUDE_CODE_SYSTEM_LAYOUT 不是 stock
@@ -388,14 +391,15 @@ output_config, context_management, metadata, stream
 ]
 ```
 
-此时**不会**追加 `IDENTITY` 与环境块——只要存在计费头块，整个数组
-就按调用方给出的内容和顺序使用。
+此时不会追加 `IDENTITY` 与环境块。新版只要求非空文本块数组，不再要求包含计费头；
+每项输出 `type: text`、原始 `text`，并保留对象形式的 `cache_control`，其余属性丢弃。
+空数组、字符串及含非字符串 text 的数组仍走布局生成分支；分类器上下文单独处理。
 
 ### 3.3.2 消息
 
 `messages` 保持客户端原始结构，包括：
 
-- `role`：`user` / `assistant`
+- `role`：`user` / `assistant` / `system`（对应 beta）
 - `content`：字符串或内容块数组
 - 内容块上的 `cache_control`
 - `tool_use` / `tool_result` 块
@@ -429,14 +433,15 @@ CLI 宿主应从内层提取 `session_id`，用于把同一会话的请求归入
 | TTL 取值 | 仅 `5m` / `1h` |
 | 优先级 | 显式 `cache_control.ttl` → `KERNEL_CONFIG.default_cache_ttl` → `1h` |
 | marker 上限 | 最多 4 个 |
-| 超限删除顺序 | `tools` → `system` → `messages` 的逆序 |
+| 超限删除顺序 | tools 逆序 → system 逆序 → messages 正序 |
 | thinking 块 | `thinking` / `redacted_thinking` 上的 `cache_control` 必须删除 |
 
-补全时只改 `ttl`，`scope`（`global` / `org`）原样保留；
-`type` 不是 `ephemeral` 的块不动，已有合法 TTL 的块也不动。
+仅当 system/tools/messages 中出现显式合法 TTL 时才补全缺失或非法 TTL；整次请求
+均省略 TTL 时保持省略。`type` 不是 `ephemeral` 的块不动，已有合法 TTL 的块也不动；
+补全时保留 `scope` 的 `global` / `org`，其余 scope 不保留。三段统一参与补全与上限裁剪。
 
 配置默认值来自 `KERNEL_CONFIG` 指向的 JSON（默认
-`/run/guest/kernel.json`）中的 `default_cache_ttl`。
+`/run/kin/kernel.json`）中的 `default_cache_ttl`。
 
 ## 3.5 流式响应
 
@@ -512,7 +517,7 @@ CLI 宿主读取的环境变量：
 | `CLAUDE_CODE_CONFIG_HASH` | 可选，内核不校验 |
 | `CLAUDE_CODE_VERSION` | 版本号，缺省 `2.1.296` |
 | `CLAUDE_CODE_ENTRYPOINT` | 缺省 `sdk-cli` |
-| `KERNEL_CONFIG` | 内核配置路径，默认 `/run/guest/kernel.json` |
+| `KERNEL_CONFIG` | 内核配置路径，默认 `/run/kin/kernel.json` |
 | `TZ` / `SLOT_TZ` | 时区回退 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 出口代理 |
 

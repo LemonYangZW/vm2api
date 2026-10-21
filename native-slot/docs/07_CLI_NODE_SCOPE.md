@@ -3,6 +3,11 @@
 本文说明 CLI 宿主（`cli-node`）在不同模式下承担的功能，
 用于确定 ARM64 重写版必须覆盖的最小范围。
 
+2026-10-21 增量：上游 1.3.204 起，面板登录终端设置 `KIN_PANEL_LOGIN` 后无参数
+启动 `claude`。ARM64 最小实现将此入口分派到已有 `auth login` 流程。
+`CLAUDE_CODE_HOST_REFRESH=1` 时优先写已存在的宿主 `credentials.json`，不存在则
+沿用 `.credentials.json`；宿主刷新模式下 logout 不清空共享凭据。不提供完整交互界面。
+
 帧协议与握手见 `02_CLI_INTERFACE_SPEC.md`，
 上游请求形态见 `03_UPSTREAM_BEHAVIOR.md`。
 

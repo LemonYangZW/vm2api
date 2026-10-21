@@ -191,6 +191,11 @@ func TestDifferentialAgainstOfficialModules(t *testing.T) {
 		diffCase{Op: "cchPlaceholder", Text: "x-anthropic-billing-header: cc_version=9.9.9"},
 		diffCase{Op: "wire", System: raw(`[{"type":"text","text":"x-anthropic-billing-header: cc_version=9.9.9; cch=abcde;"},{"type":"text","text":"自定义","cache_control":{"type":"ephemeral"},"citations":[]}]`)},
 		diffCase{Op: "wire", System: raw(`[{"type":"text","text":"plain"}]`)},
+		diffCase{Op: "wire", System: raw(`[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"5m"}},{"type":"text","text":"调用方提示","cache_control":{"type":"ephemeral","ttl":"5m"}}]`)},
+		diffCase{Op: "wire", System: raw(`[{"text":""}]`)},
+		diffCase{Op: "wire", System: raw(`[{"text":123}]`)},
+		diffCase{Op: "wire", System: raw(`[{"text":"plain"},{}]`)},
+		diffCase{Op: "wire", System: raw(`[]`)},
 		diffCase{Op: "wire", System: raw(`"x-anthropic-billing-header: string form"`)},
 		diffCase{Op: "classifierSystem", System: raw(`[{"type":"text","text":"  x-anthropic-billing-header: a"},{"type":"text","text":"keep"}]`), Attribution: "x-anthropic-billing-header: cli;"},
 		diffCase{Op: "classifierSystem", System: raw(`"just text"`), Attribution: ""},
@@ -207,6 +212,7 @@ func TestDifferentialAgainstOfficialModules(t *testing.T) {
 		diffCase{Op: "setupBetas", Model: "claude-haiku-5-5"},
 	)
 	// 缓存 marker：保留段计入上限、只改宿主自有段。
+	cases = append(cases, diffCase{Op: "cache", TTL: "1h", Params: raw(`{"system":[{"type":"text","text":"plain","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}`)})
 	cacheParams := `{"system":[{"type":"text","text":"b"},{"type":"text","text":"e","cache_control":{"type":"ephemeral","scope":"org"}}],
 	 "tools":[{"name":"t1","cache_control":{"type":"ephemeral"}},{"name":"t2","cache_control":{"type":"ephemeral","ttl":"5m"}},{"name":"t3","cache_control":{"type":"other"}}],
 	 "messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","cache_control":{"type":"ephemeral"}},{"type":"text","text":"a","cache_control":{}}]},
@@ -224,6 +230,7 @@ func TestDifferentialAgainstOfficialModules(t *testing.T) {
 		}
 	}
 	want := runReference(t, cases)
+	t.Logf("对照已提取的 CLI 参考模块验证 %d 个用例", len(cases))
 	if len(want) != len(cases) {
 		t.Fatalf("reference returned %d results for %d cases", len(want), len(cases))
 	}
