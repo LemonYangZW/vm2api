@@ -189,7 +189,10 @@ export function officialSystemTemplate(system, ttl = DEFAULT_CACHE_TTL) {
   return out
 }
 
-/** 在末条可缓存消息上保留一个断点，并写入配置的 TTL。 */
+/**
+ * 在末条 user 和上一条 user（至少 4 条消息）保留缓存断点，并写入配置的 TTL。
+ * 前一个断点衔接上一轮缓存写入，避免消息增长超过 20 个位置回溯范围后仅命中 system 前缀。
+ */
 function officialMessageMarker(messages, ttl = DEFAULT_CACHE_TTL) {
   if (!Array.isArray(messages) || messages.length === 0) return messages
   const next = messages.map((message) => {
@@ -211,34 +214,36 @@ function officialMessageMarker(messages, ttl = DEFAULT_CACHE_TTL) {
     })
     return changed ? { ...message, content } : message
   })
-  let tail = -1
-  for (let i = next.length - 1; i >= 0; i--) {
+  const users = []
+  for (let i = next.length - 1; i >= 0 && users.length < 2; i--) {
     if (next[i]?.role !== 'user') continue
     const content = next[i].content
-    if (typeof content === 'string' ? content : Array.isArray(content) && content.length) {
-      tail = i
-      break
-    }
+    if (typeof content === 'string' ? content : Array.isArray(content) && content.length) users.push(i)
   }
-  if (tail < 0) return next
-  const message = next[tail]
+  if (users.length === 0) return next
+  stampMessageTail(next, users[0], ttl)
+  if (users.length > 1 && next.length >= 4) stampMessageTail(next, users[1], ttl)
+  return next
+}
+
+function stampMessageTail(messages, index, ttl) {
+  const message = messages[index]
   if (typeof message.content === 'string') {
-    next[tail] = {
+    messages[index] = {
       ...message,
       content: [
         { type: 'text', text: message.content, cache_control: { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) } },
       ],
     }
-    return next
+    return
   }
   const content = message.content.slice()
   for (let i = content.length - 1; i >= 0; i--) {
     if (content[i]?.type === 'thinking' || content[i]?.type === 'redacted_thinking') continue
     content[i] = { ...content[i], cache_control: { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) } }
-    next[tail] = { ...message, content }
-    return next
+    messages[index] = { ...message, content }
+    return
   }
-  return next
 }
 /** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
 function stripEagerInputStreaming(tools) {
