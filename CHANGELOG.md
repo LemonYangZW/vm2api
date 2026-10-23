@@ -2,12 +2,29 @@
 
 ## 未发布
 
+- 请求日志的 `outbound_headers` 改为新 cli-node 在最终 fetch 前回传的脱敏请求头，新增采集来源；Node → worker 中间头另存 `worker_envelope_headers`。流式与非流式入站均支持，内部事件不发给客户端、不触发提交或上游 idle 计时；旧 CLI 未回传时明确显示未获取，旧日志不冒充最终值。需同时更新 Node、web 与新 cli-node；本轮尚未发布 payload 或部署。
 - cli-node 补齐 `Accept: application/json, text/event-stream` 与 `Accept-Encoding: gzip, br`，在 CCH 密封后按最终 UTF-8 请求体写 `Content-Length`；修复旧 SDK 把毫秒 timeout 写入 `x-stainless-timeout` 的问题（缺省 `600000` → `600` 秒）。对应构建尚未进 payload。
+
+## 1.3.225 — 2026-10-24
+
+- CI：PR 的 run 先合入 base 分支最新提交再测，Re-run 即对着当前 main（GitHub 的 `refs/pull/<n>/merge` 停在 PR 最后一次 push 时的 base）；`cancel-in-progress` 只对 PR 生效，main 每次 push 都留下结论。新增 `pr-rerun.yml`：main 的 ci 由红转绿时自动重跑最近一次 ci 失败的 open PR（非草稿、无冲突），也可手动触发。
+
+已部署机升级：无运行时变化（仅 CI / 文档），可不升级。
+
+## 1.3.224 — 2026-10-24
+
+- API 直连原生 Anthropic Messages：端点上显式配置的头优先于调用方协议头；`anthropic-beta` 取端点与调用方的并集（未知 beta / safeguards 照常透传）；调用方带来的 `context-1m` 按模型页 1M 策略剥离或放行，端点自己配的不受影响。修复 #667 后 Claude Code 请求使端点 headers 配置失效、并绕过 1M 门禁的问题。
+
+已部署机升级：仅更新 Node 控制面后重启（无 web、无 payload 变化）。不必 `fetch:payload` / `wrap-cli/sync` / recreate 槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.223 — 2026-10-24
+
 - 以 v1.3.221 生产验证产物为基线：`deploy/payload.json` 改指 `payload-2026.10.23-v1.3.221`，并钉住 `kin-worker` / `kin-egress` / `kin-slot-gate`（与线上逐字节一致）。release.yml 与 amd64 镜像不再从源码编译这三个 helper；改 `worker/` 后须重新钉 payload 才会发出。ARM64 镜像与附件不变。
 - CI 合并为单个 job：格式与语法、payload 校验、Node unit、Go vet/test、web；去掉 ARM64 冒烟、真链路 CCH e2e 与 ARM64 主机脚本测试。
 - 删除 1.3.198–1.3.219 的 CLI CCH 历史热修 `scripts/fix-cli-cch.mjs` 及其测试与文档；钉住的 cli-node `944f6457` 已含该修复。
+- 原生 Anthropic Messages 转发调用方协议头（含未知 anthropic-* beta / safeguards）；OpenAI 兼容路由不变。（#667）
 
-已部署机升级（以上三条）：payload 字节与 1.3.221 相同，只换了 Release 名，不必 `fetch:payload`、不必 `wrap-cli/sync`。
+已部署机升级：仅更新 Node 控制面后重启（#667 无 web；#696 payload 字节与 1.3.221 相同）。不必 `fetch:payload` / `wrap-cli/sync` / recreate 槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.3.222 — 2026-10-23
 
