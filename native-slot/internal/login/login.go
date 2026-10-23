@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"vm2api/native-slot/internal/credential"
+	"vm2api/native-slot/internal/netx"
 	"vm2api/native-slot/internal/ojson"
 	"vm2api/native-slot/internal/upstream"
 )
@@ -103,7 +104,12 @@ type Tokens struct {
 // ErrInvalidCode 表示授权码无效（401）。
 var ErrInvalidCode = errors.New("Authentication failed: Invalid authorization code")
 
-func httpClient(timeout time.Duration) *http.Client { return &http.Client{Timeout: timeout} }
+func httpClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, Transport: &http.Transport{
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: netx.DialContext,
+	}}
+}
 
 // Exchange 用授权码换取令牌。
 func Exchange(ctx context.Context, code string, p PKCE, expiresIn int64) (*Tokens, error) {

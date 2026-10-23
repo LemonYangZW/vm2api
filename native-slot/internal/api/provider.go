@@ -18,6 +18,7 @@ import (
 
 	"vm2api/native-slot/internal/config"
 	"vm2api/native-slot/internal/credential"
+	"vm2api/native-slot/internal/netx"
 	"vm2api/native-slot/internal/sse"
 )
 
@@ -92,7 +93,7 @@ func newAnthropicProvider(cfg *config.Resolved) (*anthropicProvider, error) {
 	}
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		DialContext:           netx.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,

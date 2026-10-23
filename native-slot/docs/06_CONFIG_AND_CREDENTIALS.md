@@ -235,6 +235,23 @@ SYSTEM_MODE=zero
   转换（错误消息：`Claude CLI cannot use SOCKS5 as HTTPS_PROXY;
   set BRIDGE_HTTPS_PROXY to an HTTP CONNECT bridge`）。
 
+### 6.3.4 出口必须经过控制面配置的代理（IPv4）
+
+宿主机按槽位 UID 用 iptables（`KEG<proxy_id>` 链）把 TCP 全部 REDIRECT 到该槽位
+代理的**本地 IPv4 监听**（`127.0.0.1:<port>`，由控制面写在 `vms/<id>.json` 的
+`proxy` 里），DNS 也走同一链。这套重定向只覆盖 IPv4。
+
+因此：
+
+| 组件 | 规则 |
+| --- | --- |
+| 原生 CLI / 原生内核（Go 出站） | 统一 `tcp4`：`native-slot/internal/netx` 强制 IPv4（`KIN_EGRESS_IPV4=0` 仅供排障放开）。每个出站连接都会落进 `KEG*` 链，不会出现绕过代理的 IPv6 直连 |
+| kin-egress（出口代理本体） | 到上游一律 `tcp4`；SOCKS 目标是域名且 scheme 为 `socks5://` 时**本地解析 A 记录**后按 IPv4 下发，`socks5h://` 保持代理解析语义；显式 IPv6 目标直接拒绝 |
+| 后果 | 若上游只有 AAAA 记录，请求会明确失败而不是偷偷直连（现场：`dial tcp [2607:6bc0::10]:443: connect: network is unreachable`） |
+
+排查顺序：先看 `iptables -t nat -S | grep KEG` 有没有该槽位的链，再看
+`ss -lntp | grep <port>` 代理是否在 IPv4 环回上监听，最后才看 CLI 侧。
+
 ## 6.4 凭据
 
 ### 6.4.1 文件

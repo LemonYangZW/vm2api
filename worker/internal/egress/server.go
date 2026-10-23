@@ -207,7 +207,7 @@ func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) e
 	if err != nil {
 		return err
 	}
-	up, err := s.dialer.DialContext(ctx, "tcp", dialDest)
+	up, err := s.dialer.DialContext(ctx, "tcp4", dialDest)
 	if err != nil {
 		return &spliceError{class: classSocksDial, dest: dialDest, err: err}
 	}
@@ -529,7 +529,7 @@ func (s *Server) resolveDoH(ctx context.Context, upstream string, query []byte) 
 }
 
 func (s *Server) resolveDNSTCP(ctx context.Context, upstream string, query []byte) ([]byte, error) {
-	up, err := s.dialer.DialContext(ctx, "tcp", upstream)
+	up, err := s.dialer.DialContext(ctx, "tcp4", upstream)
 	if err != nil {
 		return nil, err
 	}

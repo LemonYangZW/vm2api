@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"vm2api/native-slot/internal/frame"
+	"vm2api/native-slot/internal/netx"
 	"vm2api/native-slot/internal/sse"
 )
 
@@ -50,7 +51,7 @@ func apiTimeout() time.Duration {
 func newTransport() *http.Transport {
 	t := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           netx.DialContext,
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,

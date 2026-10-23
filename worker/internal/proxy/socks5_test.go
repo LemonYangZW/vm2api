@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -119,4 +120,59 @@ func search(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// socks5:// 语义：本地把域名解析成 IPv4，代理只建 IPv4 上游连接。
+func TestConnectRequestLocalResolveUsesIPv4(t *testing.T) {
+	lookup := func(_ context.Context, network, host string) ([]net.IP, error) {
+		if network != "ip4" {
+			t.Fatalf("lookup network = %q, want ip4", network)
+		}
+		if host != "api.anthropic.com" {
+			t.Fatalf("lookup host = %q", host)
+		}
+		return []net.IP{net.ParseIP("160.79.104.10")}, nil
+	}
+	request, err := connectRequestWith("api.anthropic.com:443", true, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x05, 0x01, 0x00, 0x01, 160, 79, 104, 10, 0x01, 0xbb}
+	if !bytes.Equal(request, want) {
+		t.Fatalf("connect request = %v, want %v", request, want)
+	}
+}
+
+// socks5h:// 语义：域名原样下发，由代理解析。
+func TestConnectRequestRemoteResolveSendsHostname(t *testing.T) {
+	request, err := connectRequestWith("api.anthropic.com:443", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len("api.anthropic.com"))}, []byte("api.anthropic.com")...)
+	want = append(want, 0x01, 0xbb)
+	if !bytes.Equal(request, want) {
+		t.Fatalf("connect request = %v, want %v", request, want)
+	}
+}
+
+// 显式 IPv6 目标必须被拒绝：出口只能经过代理的 IPv4 地址。
+func TestConnectRequestRejectsIPv6Target(t *testing.T) {
+	for _, target := range []string{"[2607:6bc0::10]:443", "[::1]:443"} {
+		if _, err := connectRequest(target, true); err == nil {
+			t.Fatalf("expected IPv6 target %s to be rejected", target)
+		} else if !contains(err.Error(), "refusing IPv6 target") {
+			t.Fatalf("error = %q", err)
+		}
+	}
+}
+
+// 没有 A 记录时明确报错，不静默回落到 IPv6。
+func TestConnectRequestNoIPv4Record(t *testing.T) {
+	lookup := func(context.Context, string, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("2607:6bc0::10")}, nil
+	}
+	if _, err := connectRequestWith("api.anthropic.com:443", true, lookup); err == nil {
+		t.Fatal("expected error when only AAAA records exist")
+	}
 }

@@ -89,6 +89,9 @@ go test ./...
     `msg_<pid>`、`stop_reason` 缺省 `end_turn`；usage 只有上游给了才带 `cache_creation`；
   - 非流式 / verified 出错为 `{"ok":false,"error":{type,code,message,status[,retry_after][,upstream_code][,request_id]}}`，
     只带 `retry-after` / `request-id` 头；非流式成功只带 `x-terminal-state`；
+- 出站统一 IPv4：`internal/netx` 强制 `tcp4`（CLI / 登录 / 直连 provider 三处），
+  保证全部落进宿主机按槽位 UID 的 `KEG*` 透明重定向（控制面配置的代理 IPv4 监听）；
+  `kin-egress` 到上游同样 `tcp4`，`socks5://` 本地解析 A 记录，IPv6 目标直接拒绝；
 - 未知 CLI 错误码归为 `cli_error`；
 - `/internal/health` 额外带 `ok`、`engine`、`worker_version`、`cli_pid`、`classifier_request_context`、`credential`。
 

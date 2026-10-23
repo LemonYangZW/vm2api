@@ -18,6 +18,9 @@ type Dialer struct {
 	Username string
 	Password string
 	Timeout  time.Duration
+	// LocalResolve 为 true 时（socks5:// 语义）在本地把域名解析成 IPv4 再发给代理，
+	// 保证代理只建立 IPv4 上游连接；socks5h:// 保持「代理解析」的语义。
+	LocalResolve bool
 }
 
 func New(rawURL string, timeout time.Duration) (*Dialer, error) {
@@ -46,10 +49,11 @@ func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 		timeout = 15 * time.Second
 	}
 	return &Dialer{
-		Address:  net.JoinHostPort(host, port),
-		Username: username,
-		Password: password,
-		Timeout:  timeout,
+		Address:      net.JoinHostPort(host, port),
+		Username:     username,
+		Password:     password,
+		Timeout:      timeout,
+		LocalResolve: u.Scheme == "socks5",
 	}, nil
 }
 
@@ -88,7 +92,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	} else if d.Timeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(d.Timeout))
 	}
-	if err = d.negotiate(conn, address); err != nil {
+	if err = d.negotiateConn(conn, address); err != nil {
 		return nil, err
 	}
 	if err = ctx.Err(); err != nil {
@@ -100,7 +104,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	return conn, nil
 }
 
-func (d *Dialer) negotiate(conn net.Conn, target string) error {
+func (d *Dialer) negotiateConn(conn net.Conn, target string) error {
+	return d.negotiate(conn, target, d.LocalResolve)
+}
+
+func (d *Dialer) negotiate(conn net.Conn, target string, localResolve bool) error {
 	methods := []byte{0x00}
 	if d.Username != "" || d.Password != "" {
 		methods = append(methods, 0x02)
@@ -127,7 +135,7 @@ func (d *Dialer) negotiate(conn net.Conn, target string) error {
 	default:
 		return fmt.Errorf("unsupported SOCKS5 authentication method %d", reply[1])
 	}
-	request, err := connectRequest(target)
+	request, err := connectRequest(target, localResolve)
 	if err != nil {
 		return err
 	}
@@ -171,7 +179,18 @@ func (d *Dialer) authenticate(conn net.Conn) error {
 	return nil
 }
 
-func connectRequest(target string) ([]byte, error) {
+// connectRequest 组装 SOCKS5 CONNECT 请求。localResolve 为 true（socks5://）时，
+// 域名目标**在本地解析出 A 记录**后按 IPv4 发出，让代理只建 IPv4 上游连接
+// （控制面配置的出口代理只有 IPv4 监听与 IPv4 路由；交给代理解析会拿到 AAAA
+// 而连不通：dial tcp [2607:6bc0::10]:443: connect: network is unreachable）。
+// 显式 IPv6 目标一律拒绝（出口必须经过代理的 IPv4 地址）；
+// localResolve 为 false（socks5h://）时保持「域名下发、代理解析」的语义。
+func connectRequest(target string, localResolve bool) ([]byte, error) {
+	return connectRequestWith(target, localResolve, nil)
+}
+
+func connectRequestWith(target string, localResolve bool,
+	lookup func(context.Context, string, string) ([]net.IP, error)) ([]byte, error) {
 	host, portRaw, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, fmt.Errorf("split target address: %w", err)
@@ -180,26 +199,51 @@ func connectRequest(target string) ([]byte, error) {
 	if err != nil || port < 1 || port > 65535 {
 		return nil, fmt.Errorf("invalid target port %q", portRaw)
 	}
-	request := []byte{0x05, 0x01, 0x00}
-	if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			request = append(request, 0x01)
-			request = append(request, v4...)
-		} else {
-			request = append(request, 0x04)
-			request = append(request, ip.To16()...)
-		}
-	} else {
+	ip := net.ParseIP(host)
+	if ip != nil && ip.To4() == nil {
+		return nil, fmt.Errorf("refusing IPv6 target %s: egress must go through the configured IPv4 proxy", host)
+	}
+	if ip == nil {
 		if len(host) == 0 || len(host) > 255 {
 			return nil, errors.New("target hostname must contain 1-255 bytes")
 		}
-		request = append(request, 0x03, byte(len(host)))
-		request = append(request, host...)
+		if !localResolve {
+			request := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
+			request = append(request, host...)
+			return appendPort(request, port), nil
+		}
+		if lookup == nil {
+			lookup = net.DefaultResolver.LookupIP
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ips, err := lookup(ctx, "ip4", host)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s over IPv4: %w", host, err)
+		}
+		for _, candidate := range ips {
+			if v4 := candidate.To4(); v4 != nil {
+				ip = v4
+				break
+			}
+		}
+		if ip == nil {
+			return nil, fmt.Errorf("no IPv4 address for %s", host)
+		}
 	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return nil, fmt.Errorf("refusing IPv6 target %s: egress must go through the configured IPv4 proxy", host)
+	}
+	request := []byte{0x05, 0x01, 0x00, 0x01}
+	request = append(request, v4...)
+	return appendPort(request, port), nil
+}
+
+func appendPort(request []byte, port int) []byte {
 	portBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBytes, uint16(port))
-	request = append(request, portBytes...)
-	return request, nil
+	return append(request, portBytes...)
 }
 
 func discardAddress(reader io.Reader, addressType byte) error {
