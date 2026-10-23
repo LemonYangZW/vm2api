@@ -105,6 +105,11 @@ type Failure struct {
 	RequestID    string
 }
 
+// FailureError 让构建阶段（例如面板开关导致的必错请求）把可映射的终态带回宿主。
+type FailureError struct{ Failure *Failure }
+
+func (e *FailureError) Error() string { return e.Failure.Error }
+
 func (f *Failure) Frame(jobID, slotID string) frame.JobError {
 	return frame.JobError{Type: "job_error", JobID: jobID, SlotID: slotID, Error: f.Error, Code: f.Code,
 		Status: f.Status, ErrorType: f.ErrorType, RetryAfter: f.RetryAfter, UpstreamCode: f.UpstreamCode,

@@ -194,6 +194,7 @@ mid-conversation-system-2026-04-07
 | 工具 `defer_loading` 或 `tool_search_tool_*` | `advanced-tool-use-2025-11-20` |
 | `thinking.block_binding` 存在 | `thinking-binding-controls-2026-08-01` |
 | `thread` 存在 | `message-threads-2026-08-12` |
+| `thread` 存在且模型属于 mid-output-config 集合 | `mid-conversation-output-config-2026-07-01` |
 | `diagnostics` 存在 | `cache-diagnosis-2026-04-07` |
 | `fallbacks = "default"` | `server-side-fallback-2026-07-01` |
 | `fallbacks` 为非空数组 | `server-side-fallback-2026-06-01` |
@@ -209,6 +210,11 @@ mid-conversation-system-2026-04-07
 
 模型名在判断前会去掉 `[1m]` 后缀、`-YYYYMMDD` 日期后缀与 `provider/`
 前缀。
+
+`mid-output-config` 的模型集合（`MID_OUTPUT_CONFIG_MODELS`）只有：
+`claude-haiku-5-5`、`claude-sonnet-5-5`、`claude-opus-5`、`claude-opus-5-5`、
+`claude-fable-5-1`、`claude-mythos-5-1`。不在集合里时带 `thread` 只加
+`message-threads`，不会拉出 `mid-conversation-output-config`。
 
 #### 3.2.8 只有 inference scope 时
 
@@ -425,11 +431,87 @@ output_config, context_management, metadata, stream
 内核缺少调用方元数据时先生成上述空账号形态；已有非空 `metadata.user_id` 字符串原样透传。
 CLI 发往上游前按本地身份重建：`device_id` 来自设备身份，OAuth 模式可带 `account_uuid`；
 API Key 模式不读取本地 OAuth 账户信息，除非存在远程模式的明确账号覆盖。
-`session_id` 保留调用方会话；订阅者的 `cc_prompt_id` 每次请求单独生成，头与正文一致。
+`session_id` 保留调用方会话；订阅者的 `cc_prompt_id` 由 CLI 每次请求单独生成，
+头与正文一致。
+
+例外（控制面路径）：控制面的 `crs-persona.stampBillingPromptId` 会把计费头里的
+`cc_prompt_id` 改写成**出站会话 id**（`billingPromptId(sessionId, …)` 对 UUID 直接
+返回会话本身），目的是让 `system[0]` 跨轮不变、保住缓存前缀。因此经 `/v1/messages`
+进入的请求满足：
+
+| 断言 | 值 |
+| --- | --- |
+| `x-claude-code-prompt-id` | == 计费头 `cc_prompt_id` |
+| `x-claude-code-session-id` | == `metadata.user_id.session_id` == 计费头 `cc_prompt_id` |
+| 出站会话 | 由控制面生成，**不得**等于调用方传入的 session |
+
+只有绕过控制面、直接由内核驱动 CLI 的槽位内部路径才保持「prompt_id 另生成、
+不等于 session」的形态。
 
 CLI 宿主应从内层提取 `session_id`，用于把同一会话的请求归入
 同一执行上下文（例如会话级资源复用）；解析失败时按无会话处理，
 不得因此拒绝请求。
+
+### 3.3.4 计费头的生成与 cch
+
+计费头（`x-anthropic-billing-header: ...`）由 CLI 宿主生成，字段按顺序拼接：
+
+```text
+[ cch=00000;] [ <workload>] [ cc_is_subagent=true;] [ cc_prev_req=...;]
+[ cc_prompt_id=...;] [ cc_turn_origin=...;] [ cc_prompt_index=0; cc_turn_index=1;]
+```
+
+每个字段是否写出由两道门控决定（`attributionGates`）：
+
+| provider | `cch` | 订阅者字段 |
+| --- | --- | --- |
+| 第一方 + 订阅者 | 写 | 写 |
+| 第一方 + 非订阅者（API Key / 无 `user:inference`） | 不写 | 不写 |
+| vertex | 写 | 不写 |
+| bedrock / foundry | 不写 | 不写 |
+
+provider 只由 `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` /
+`CLAUDE_CODE_USE_FOUNDRY` 决定，与 `ANTHROPIC_BASE_URL` 无关。
+「订阅者」按 `isClaudeAISubscriber` 判定：OAuth 且带 `user:inference`；
+没有 `user:profile` 的 setup-token 仍算订阅者（只影响 beta 列表）。
+
+订阅者字段的取值规则：
+
+| 字段 | 条件 |
+| --- | --- |
+| `cc_is_subagent=true;` | 始终（kin 槽位是子代理路径） |
+| `cc_prev_req=…;` | 匹配 `^req_[A-Za-z0-9_-]{1,36}$` |
+| `cc_prompt_id=…;` | 每次请求新生成的 UUID |
+| `cc_turn_origin=…;` | 匹配 `^[a-z][a-z_]{0,31}$`；`agent:kin` 不能匹配，回退到入口类型（`sdk-cli`/`sdk-ts`/`sdk-py` → `sdk`，`cli` → `cli`），仍取不到则省略 |
+| `cc_prompt_index` / `cc_turn_index` | 请求里有真实用户提示时固定 `0` / `1` |
+
+`CLAUDE_CODE_ATTRIBUTION_HEADER` 为 `0`/`false`/`no`/`off` 时整段计费头为空。
+
+`` 只在官方 CLI 收到 `--workload <tag>`（或 SDK 的 workload 选项）时出现，
+来源是 CLI 自己的 AsyncLocalStorage，**不是环境变量**；原生宿主没有 workload
+选项，因此槽位路径永远不带该字段（早前实现读 `CLAUDE_CODE_WORKLOAD`，
+上游从未读过这个变量，已删除）。
+
+#### cch 的计算范围（重要）
+
+`cch` 只投影**首个 canonical system 计费头块**：
+
+1. 只扫描 `system`：字符串形态整段、或数组里各块的 `text`；
+2. 只认「块文本开头 + 同一行内 + 5 位十六进制 + 分号」的 `cch=NNNNN;`；
+3. 命中第一个即停，后续 system 块里的示例不改；
+4. `messages`、工具结果、文档正文里的计费示例**永远不改**；
+   改写它们会改变上轮的 prompt 前缀，丢掉 prompt cache；
+5. 找不到 canonical 头时整个请求体原样返回，不写任何 cch。
+
+摘要材料是「关闭 cch 占位后的紧凑 JSON」，再裁掉：
+`max_tokens` 数值、`fallbacks` 数组、`fallback_credit_token`，
+以及所有 `"model":"…"` 的值。取 XXH64（种子 `0x4d659218e32a3268`）
+低 20 位，5 位小写十六进制。因此 `cch` 不是会话常量：请求变长就会变，
+但已发出的历史消息字节不得改变。
+
+注意：`zero` / `identity` 布局会无条件写出 `cch=00000` 占位，
+所以这两种布局下 `cch` 字段的存在与 provider 门控无关；门控只影响
+计费头里 `cch` 是否被写在 attribution 阶段。
 
 ## 3.4 缓存控制
 

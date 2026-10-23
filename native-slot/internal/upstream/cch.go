@@ -176,14 +176,64 @@ func skipMaxTokens(s string) string {
 	return cut(s, j, k)
 }
 
-var (
-	cchResetRe = regexp.MustCompile(`(?i)(x-anthropic-billing-header:[^"]*?\bcch=)[0-9a-f]{5};`)
-	cchSlotRe  = regexp.MustCompile(`(?i)(x-anthropic-billing-header:[^"]*?\bcch=)00000;`)
-)
+// canonicalCchRe 只匹配 system 计费头块文本开头的 cch 值：锚定块起始、限制在
+// 同一行（[^\r\n]）、且必须是 5 位十六进制后紧跟分号。与现网 cli-node
+// src/utils/cch.ts 的 setSystemCch 一致，messages 与后续 system 示例不再命中。
+var canonicalCchRe = regexp.MustCompile(`(?i)^\s*x-anthropic-billing-header:[^\r\n]*?\bcch=[0-9a-f]{5};`)
 
+// setSystemCch 就地替换 body.system（字符串或 [{text}]）里第一个 canonical
+// 计费头的 cch 值，返回是否命中。
+func setSystemCch(body *ojson.Object, value string) bool {
+	if body == nil {
+		return false
+	}
+	switch sys := body.Get("system").(type) {
+	case string:
+		out, ok := replaceCanonicalCch(sys, value)
+		if !ok {
+			return false
+		}
+		body.Set("system", out)
+		return true
+	case []any:
+		for _, item := range sys {
+			block := ojson.Obj(item)
+			if block == nil {
+				continue
+			}
+			text, ok := block.Get("text").(string)
+			if !ok {
+				continue
+			}
+			out, ok := replaceCanonicalCch(text, value)
+			if !ok {
+				continue
+			}
+			block.Set("text", out)
+			return true
+		}
+	}
+	return false
+}
+
+func replaceCanonicalCch(text, value string) (string, bool) {
+	loc := canonicalCchRe.FindStringIndex(text)
+	if loc == nil {
+		return text, false
+	}
+	end := loc[1] - 1 // 分号位置
+	start := end - 5  // cch 值的 5 位十六进制
+	return text[:start] + value + text[end:], true
+}
+
+// projectForCch：把 canonical system 计费头的 cch 归零后取紧凑 JSON，再裁掉
+// max_tokens、fallbacks、fallback_credit_token 与所有 model 值。
 func projectForCch(body string) string {
-	reset := replaceFirst(cchResetRe, body, "${1}00000;")
-	return skipMaxTokens(skipCredit(skipFallbacks(blankStringModels(reset))))
+	if v, err := ojson.ParseObject([]byte(body)); err == nil {
+		setSystemCch(v, "00000")
+		body = string(ojson.Marshal(v))
+	}
+	return skipMaxTokens(skipCredit(skipFallbacks(blankStringModels(body))))
 }
 
 func computeCch(body string) string {
@@ -191,25 +241,18 @@ func computeCch(body string) string {
 	return fmt.Sprintf("%05x", d&0xfffff)
 }
 
-// StampCch 把计费头里的 cch=00000 占位替换为请求体摘要。body 必须已是
-// JSON.stringify 形态的紧凑 JSON。
+// StampCch 用「canonical system 计费头所在请求体」的摘要填充 cch。找不到该头
+// 时原样返回 body：messages、工具结果与后续 system 里的计费示例属于历史内容，
+// 改写它们会让上轮的 prompt-cache 前缀失效。body 必须已是紧凑 JSON。
 func StampCch(body string, enabled bool) string {
-	if !enabled || !cchSlotRe.MatchString(body) {
+	if !enabled {
 		return body
 	}
-	if v, err := ojson.Parse([]byte(body)); err == nil {
-		body = string(ojson.Marshal(v))
+	v, err := ojson.ParseObject([]byte(body))
+	if err != nil || !setSystemCch(v, "00000") {
+		return body
 	}
-	sum := computeCch(body)
-	return replaceFirst(cchSlotRe, body, "${1}"+sum+";")
-}
-
-func replaceFirst(re *regexp.Regexp, s, repl string) string {
-	loc := re.FindStringSubmatchIndex(s)
-	if loc == nil {
-		return s
-	}
-	var dst []byte
-	dst = re.ExpandString(dst, repl, s, loc)
-	return s[:loc[0]] + string(dst) + s[loc[1]:]
+	compact := string(ojson.Marshal(v))
+	setSystemCch(v, computeCch(compact))
+	return string(ojson.Marshal(v))
 }

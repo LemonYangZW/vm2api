@@ -4,6 +4,7 @@ package clihost
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -241,7 +242,7 @@ func CredentialPath() string {
 	if v := os.Getenv("KIN_CREDENTIAL_FILE"); v != "" {
 		candidates = append(candidates, v)
 	}
-	if b, err := os.ReadFile(kernelConfig()); err == nil {
+	if b, err := os.ReadFile(upstream.KernelConfigPath()); err == nil {
 		var cfg struct {
 			CredentialPath string `json:"credential_path"`
 		}
@@ -261,13 +262,6 @@ func CredentialPath() string {
 		}
 	}
 	return candidates[0]
-}
-
-func kernelConfig() string {
-	if v := os.Getenv("KERNEL_CONFIG"); v != "" {
-		return v
-	}
-	return "/run/guest/kernel.json"
 }
 
 func (h *Host) runJob(ctx context.Context, slotID, jobID string, request, rc *ojson.Object) {
@@ -302,6 +296,11 @@ func (h *Host) runJob(ctx context.Context, slotID, jobID string, request, rc *oj
 	built, err := upstream.Build(upstream.BuildInput{Request: request, RequestContext: rc, SessionID: session,
 		Credential: cred, Identity: h.identity})
 	if err != nil {
+		var fe *upstream.FailureError
+		if errors.As(err, &fe) {
+			failJob(fe.Failure)
+			return
+		}
 		failJob(&upstream.Failure{Error: err.Error(), Code: "cli_error", Status: 502, ErrorType: "api_error"})
 		return
 	}

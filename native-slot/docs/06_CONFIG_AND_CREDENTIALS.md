@@ -429,6 +429,38 @@ kin-kernel --gateway-worker [--config <path>]
 实现建议：配置只在进程启动时解析一次，运行期变更通过显式重启
 或控制面指令生效，避免出现半更新状态。
 
+### 6.6.1 CLI 宿主从同一份 kernel.json 读取的面板键
+
+`WorkerConfig` 的 27 个字段之外，CLI 宿主还会读下列键（内核不校验、只透传文件）。
+它们每次请求都重读同一份文件（`KERNEL_CONFIG` 优先，默认
+`/run/kin/kernel.json`），读失败时沿用上一次的值：
+
+| 键 | 类型 | 缺省 / 语义 |
+| --- | --- | --- |
+| `default_cache_ttl` | string | `5m` / `1h`；仅当请求内已存在显式 TTL 时才用于补全 |
+| `cch_enabled` | bool | 键缺失视为 `true`；控制计费头 cch 是否回填 |
+| `cached_microcompact_enabled` | bool | 键缺失重置为 `false`；为 `true` 时本构建必错（见下） |
+| `auto_compact_window` | integer | 100000–1000000；由官方 CLI 的自动压缩使用 |
+| `credential_path` | string | 凭据文件候选路径之一 |
+
+`cached_microcompact_enabled=true` 时，本 CLI 构建（官方 2.1.296 基线 +
+kin 补丁）没有 cache-editing 实现（`cachedMicrocompactRuntime.implementation()`
+恒返回 `null`），因此**每条** `messages` 请求都以
+`cached_microcompact_unavailable` 结束：
+
+```json
+{"type":"job_error","code":"cached_microcompact_unavailable",
+ "status":400,"error_type":"invalid_request_error",
+ "error":"cached_microcompact_unavailable: enabled in kernel.json, but this CLI build has no cache-editing implementation"}
+```
+
+这条错误发生在建请求之前，不会发往上游；面板因此不得把它当性能开关默认打开。
+`auto_compact_window` 只影响 CLI 自己的压缩阈值，不进上游请求体（请求里的
+`auto_compact_window` 字段同样在出站前被删除）。
+
+原生实现目前没有本地压缩，所以只做「删除字段」这一半；`auto_compact_window`
+与 `cached_microcompact_enabled` 读取器已按上表语义实现。
+
 ## 6.7 配置样例
 
 ```json

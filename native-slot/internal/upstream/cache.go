@@ -2,7 +2,9 @@ package upstream
 
 import (
 	"encoding/json"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -72,6 +74,10 @@ func explicitCacheTTL(parts ...any) string {
 	return ""
 }
 
+// KernelConfigPath 是宿主读取面板配置的路径，与现网 CLI 的 kernelConfigPath()
+// 一致：KERNEL_CONFIG 优先，默认 /run/kin/kernel.json。
+func KernelConfigPath() string { return kernelConfigPath() }
+
 // kernelConfigPath 是宿主读取面板配置的路径。
 func kernelConfigPath() string {
 	if v := os.Getenv("KERNEL_CONFIG"); v != "" {
@@ -111,6 +117,120 @@ func panelSettings() (ttl string, cch bool) {
 		}
 	}
 	return ttl, lastCchFlag
+}
+
+// CachedMicrocompactUnavailable 对应 CACHED_MICROCOMPACT_UNAVAILABLE：这个
+// CLI 构建没有 cache-editing 实现（cachedMicrocompactRuntime.implementation 恒
+// 返回 null），面板一旦打开开关，每条 messages 请求都会以它失败。
+const CachedMicrocompactUnavailable = "cached_microcompact_unavailable: enabled in kernel.json, but this CLI build has no cache-editing implementation"
+
+var (
+	cachedMCMu       sync.Mutex
+	lastCachedMCFlag bool
+)
+
+// PanelCachedMicrocompactEnabled 对应 readPanelCachedMicrocompactEnabled（默认
+// 读 kernelConfigPath）：键缺失时回到 false，值不是布尔时沿用上次结果。
+func PanelCachedMicrocompactEnabled() bool {
+	return readPanelCachedMicrocompactEnabled(kernelConfigPath())
+}
+
+func readPanelCachedMicrocompactEnabled(path string) bool {
+	b, err := os.ReadFile(path)
+	cachedMCMu.Lock()
+	defer cachedMCMu.Unlock()
+	if err != nil {
+		return lastCachedMCFlag
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(b, &raw) != nil {
+		return lastCachedMCFlag
+	}
+	v, ok := raw["cached_microcompact_enabled"]
+	if !ok {
+		lastCachedMCFlag = false
+		return lastCachedMCFlag
+	}
+	var flag bool
+	if json.Unmarshal(v, &flag) == nil {
+		switch string(v) {
+		case "true", "false":
+			lastCachedMCFlag = flag
+		}
+	}
+	return lastCachedMCFlag
+}
+
+var (
+	autoCompactMu   sync.Mutex
+	lastPanelWindow any
+)
+
+// validAutoCompactWindow 对应 validAutoCompactWindow：整数且在
+// [1e5, 1e6] 区间内，否则视为未设置。
+func validAutoCompactWindow(v any) (int64, bool) {
+	f, ok := ojson.Num(v)
+	if !ok {
+		if s, isStr := v.(string); isStr {
+			trimmed := strings.TrimSpace(s)
+			if trimmed == "" {
+				return 0, false
+			}
+			parsed, err := strconv.ParseFloat(trimmed, 64)
+			if err != nil {
+				return 0, false
+			}
+			f = parsed
+		} else {
+			return 0, false
+		}
+	}
+	if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) {
+		return 0, false
+	}
+	n := int64(f)
+	if n < 100000 || n > 1000000 {
+		return 0, false
+	}
+	return n, true
+}
+
+// readPanelAutoCompactWindow 对应 readPanelAutoCompactWindow：键缺失或为 null
+// 时重置为未设置，合法整数则记住；非法值沿用上一次结果。
+func readPanelAutoCompactWindow(path string) (int64, bool) {
+	b, err := os.ReadFile(path)
+	autoCompactMu.Lock()
+	defer autoCompactMu.Unlock()
+	if err != nil {
+		n, ok := validAutoCompactWindow(lastPanelWindow)
+		return n, ok && lastPanelWindow != nil
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(b, &raw) != nil {
+		n, ok := validAutoCompactWindow(lastPanelWindow)
+		return n, ok && lastPanelWindow != nil
+	}
+	v, present := raw["auto_compact_window"]
+	if !present || string(v) == "null" {
+		lastPanelWindow = nil
+		return 0, false
+	}
+	var decoded any
+	if json.Unmarshal(v, &decoded) != nil {
+		n, ok := validAutoCompactWindow(lastPanelWindow)
+		return n, ok && lastPanelWindow != nil
+	}
+	if n, ok := validAutoCompactWindow(decoded); ok {
+		lastPanelWindow = decoded
+		return n, true
+	}
+	n, ok := validAutoCompactWindow(lastPanelWindow)
+	return n, ok && lastPanelWindow != nil
+}
+
+// PanelAutoCompactWindow 供宿主查询面板设置里的自动压缩窗口。
+func PanelAutoCompactWindow() (int64, bool) {
+	return readPanelAutoCompactWindow(kernelConfigPath())
 }
 
 func rewriteBlock(block *ojson.Object, ttl string) {

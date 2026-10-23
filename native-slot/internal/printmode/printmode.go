@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -125,11 +126,17 @@ func Run(ctx context.Context, o Options, out io.Writer) int {
 
 // ask 以官方非交互会话的形态发一次 Messages 请求。
 func ask(ctx context.Context, cred *credential.Credential, model, prompt, session string) (string, map[string]any, string, error) {
+	// 与官方 CLI 一致：面板打开 cached_microcompact_enabled 而本构建没有
+	// cache-editing 实现时，非交互调用同样以该错误结束。
+	if upstream.PanelCachedMicrocompactEnabled() {
+		return "", nil, "", errors.New(upstream.CachedMicrocompactUnavailable)
+	}
 	id := upstream.NewIdentity()
 	messages := []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": prompt}}}}
+	includeCch, includeSubFields := upstream.APIGates(cred.Subscriber())
 	attribution := upstream.Attribution(upstream.AttributionOptions{
 		Fingerprint: upstream.Fingerprint(prompt), Indexes: true, PromptID: session,
-		TurnOrigin: upstream.TurnOrigin("sdk")})
+		TurnOrigin: upstream.TurnOrigin("sdk"), IncludeCch: includeCch, IncludeSubscriberFields: includeSubFields})
 	system := []any{map[string]any{"type": "text", "text": attribution}}
 	system = append(system, map[string]any{"type": "text",
 		"text":          "You are Claude Code, Anthropic's official CLI for Claude.",

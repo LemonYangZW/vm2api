@@ -31,6 +31,7 @@ from cli_cch import normalize_verified, strip_json_whitespace, verify
 
 TIMEOUT = 30
 MODEL = "claude-sonnet-5-5"
+CALLER_SESSION = "00000000-0000-4000-8000-000000000000"
 API_KEY = "sk-probe-integration-fake"
 
 
@@ -260,7 +261,7 @@ def success(response, stream=False, tool=False, terminal=True):
         check(header(response, "x-terminal-state") == "verified", "缺 verified 终态")
 
 
-def captured_request(mock, offset):
+def captured_request(mock, offset, control=False):
     with mock.lock:
         requests = copy.deepcopy(mock.requests[offset:])
     check(len(requests) == 1, "预期一次 CLI 上游请求，实际 " + str(len(requests)))
@@ -274,8 +275,17 @@ def captured_request(mock, offset):
     if billing:
         check(request["headers"].get("x-claude-code-prompt-id") == billing[1], "出站 prompt_id 头与正文不一致")
     metadata = json.loads(request["body"]["metadata"]["user_id"])
-    check(request["headers"].get("x-claude-code-session-id") == metadata["session_id"], "出站 session_id 头与正文不一致")
-    check(request["headers"].get("x-claude-code-prompt-id") != metadata["session_id"], "每次请求的 prompt_id 被错误复用为 session_id")
+    session_id = metadata["session_id"]
+    check(request["headers"].get("x-claude-code-session-id") == session_id, "出站 session_id 头与正文不一致")
+    prompt_id = request["headers"].get("x-claude-code-prompt-id")
+    if control:
+        # 控制面 crs-persona.stampBillingPromptId 把计费头 cc_prompt_id 指向出站会话，
+        # 让 system[0] 跨轮不变；出站会话由控制面生成，不得复用调用方固定 session。
+        check(session_id != CALLER_SESSION, "控制面未生成独立出站会话，复用了调用方 session")
+        check(prompt_id == session_id, "控制面未把计费 prompt_id 指向出站会话")
+    else:
+        # 槽位内核直接沿用请求里的 session，计费 prompt_id 必须另行生成。
+        check(prompt_id != session_id, "每次请求的 prompt_id 被错误复用为 session_id")
     # 同一次出站中的动态 UUID 使用双射；固定输入 session_id 保持原值。
     ids = {}
     def dynamic_id(match):
@@ -533,7 +543,7 @@ def control_case(kernel, mock, port, name):
         check("probe-imported-access" in credential_path.read_text(), "导入未写入槽位凭据文件")
         response = tcp_request(port, "/v1/messages", message())
         success(response, terminal=False)
-        captured_request(mock, offset)
+        captured_request(mock, offset, control=True)
         check(mock.requests[-1]["uses_imported_test_token"], "真实 CLI 未读取新导入凭据")
         return {"wrong_password_status": denied["status"], "login_status": login["status"], "role": "admin",
                 "session_valid": True, "import_status": imported["status"], "credential_persisted": True,
@@ -565,7 +575,7 @@ def control_case(kernel, mock, port, name):
         body["system"] = [{"type": "text", "text": "公共入口缓存", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
     response = tcp_request(port, "/v1/messages", body)
     success(response, stream=stream, tool=scenario == "tool", terminal=False)
-    outbound = captured_request(mock, offset)
+    outbound = captured_request(mock, offset, control=True)
     if scenario == "cache":
         check('"cache_control"' in outbound, "公共缓存标记未到达真实上游")
     # 控制面公开响应的 request-id 可以随机，但仍保留实际出站消息和缓存形状。

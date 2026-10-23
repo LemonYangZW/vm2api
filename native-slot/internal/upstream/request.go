@@ -59,6 +59,13 @@ func thinkingEnabled(v any) bool {
 // Build 复刻 queryKinMessagesWithStreaming → queryModel → paramsFromContext 的
 // 槽位路径：消息与工具原样透传，只加工 system、缓存标记、metadata 与 beta。
 func Build(in BuildInput) (*Built, error) {
+	// 官方 CLI 构建里 cachedMicrocompactRuntime.implementation() 恒为 null：
+	// 面板打开 cached_microcompact_enabled 时，每条请求都以该错误结束。
+	if PanelCachedMicrocompactEnabled() {
+		return nil, &FailureError{Failure: &Failure{
+			Error: CachedMicrocompactUnavailable, Code: "cached_microcompact_unavailable",
+			Status: 400, ErrorType: "invalid_request_error"}}
+	}
 	wire := in.Request.Clone()
 	model := ojson.Str(wire.Get("model"))
 	if model == "" {
@@ -84,14 +91,22 @@ func Build(in BuildInput) (*Built, error) {
 	rc := in.RequestContext
 	fp := Fingerprint(firstUserText(wireMessages))
 	subscriber := in.Credential.Subscriber()
+	includeCch, includeSubFields := APIGates(subscriber)
 	promptID := NewUUID()
+	// billingIndexesFromMessages：有真实用户提示时固定 prompt=0 / turn=1。
+	promptIndex, turnIndex := 0, 1
 	attr := func() string {
-		opts := AttributionOptions{Fingerprint: fp}
-		if subscriber {
-			opts.Indexes, opts.Subagent = hasPrompt(wireMessages), true
-			opts.PromptID, opts.TurnOrigin = promptID, TurnOrigin(QuerySource)
-		}
-		return Attribution(opts)
+		return Attribution(AttributionOptions{
+			Fingerprint:             fp,
+			Indexes:                 hasPrompt(wireMessages),
+			PromptIndex:             promptIndex,
+			TurnIndex:               turnIndex,
+			Subagent:                true,
+			PromptID:                promptID,
+			TurnOrigin:              TurnOrigin(QuerySource),
+			IncludeCch:              includeCch,
+			IncludeSubscriberFields: includeSubFields,
+		})
 	}
 	var kinWire []any
 	if rc == nil {

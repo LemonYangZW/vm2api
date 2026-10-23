@@ -393,13 +393,52 @@ func hasPrompt(messages []any) bool {
 	return false
 }
 
+// billingIndexMax 对应 BILLING_INDEX_MAX。
+const billingIndexMax = 1e7
+
+// boundedBillingIndex 对应 boundedBillingIndex(value, min)：越界即视为未提供。
+func boundedBillingIndex(value, min int) bool {
+	return value >= min && value <= billingIndexMax
+}
+
 // AttributionOptions 对应 getAttributionHeader 的可选项。
 type AttributionOptions struct {
 	Fingerprint string
+	// Indexes 为真时按 boundedBillingIndex 校验后写入 prompt/turn 下标。
 	Indexes     bool
+	PromptIndex int
+	TurnIndex   int
 	Subagent    bool
 	PromptID    string
 	TurnOrigin  string
+	PrevReqID   string
+	// IncludeCch / IncludeSubscriberFields 来自 APIGates，对应 attributionGates。
+	IncludeCch              bool
+	IncludeSubscriberFields bool
+}
+
+// APIGates 对应 src/constants/system.ts 的 attributionGates：只有第一方订阅者
+// 才带 cch 与订阅者字段，vertex 只带 cch，其余 provider 两者都不带。
+func APIGates(subscriber bool) (includeCch, includeSubscriberFields bool) {
+	switch apiProvider() {
+	case "vertex":
+		return true, false
+	case "firstParty":
+		return subscriber, subscriber
+	}
+	return false, false
+}
+
+func apiProvider() string {
+	switch {
+	case envTruthy("CLAUDE_CODE_USE_BEDROCK"):
+		return "bedrock"
+	case envTruthy("CLAUDE_CODE_USE_VERTEX"):
+		return "vertex"
+	case envTruthy("CLAUDE_CODE_USE_FOUNDRY"):
+		return "foundry"
+	}
+	return "firstParty"
 }
 
 func attributionEnabled() bool {
@@ -410,28 +449,33 @@ func attributionEnabled() bool {
 	return true
 }
 
-// Attribution 生成 CLI 计费头（cch=00000 占位）。
+// Attribution 生成 CLI 计费头（cch=00000 占位）。字段与顺序对齐
+// getAttributionHeader：cch 与订阅者字段都要先过 attributionGates。
 func Attribution(o AttributionOptions) string {
 	if !attributionEnabled() {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=00000;",
+	fmt.Fprintf(&b, "x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;",
 		CLIVersion(), o.Fingerprint, envOr("CLAUDE_CODE_ENTRYPOINT", "unknown"))
-	if w := os.Getenv("CLAUDE_CODE_WORKLOAD"); w != "" {
-		fmt.Fprintf(&b, " cc_workload=%s;", w)
+	if o.IncludeCch {
+		b.WriteString(" cch=00000;")
 	}
-	if o.Subagent {
+	subscriber := o.IncludeSubscriberFields
+	if o.Subagent && subscriber {
 		b.WriteString(" cc_is_subagent=true;")
 	}
-	if uuidRe.MatchString(o.PromptID) {
+	if subscriber && prevReqRe.MatchString(o.PrevReqID) {
+		fmt.Fprintf(&b, " cc_prev_req=%s;", o.PrevReqID)
+	}
+	if subscriber && uuidRe.MatchString(o.PromptID) {
 		fmt.Fprintf(&b, " cc_prompt_id=%s;", o.PromptID)
 	}
-	if turnOriginRe.MatchString(o.TurnOrigin) {
+	if subscriber && turnOriginRe.MatchString(o.TurnOrigin) {
 		fmt.Fprintf(&b, " cc_turn_origin=%s;", o.TurnOrigin)
 	}
-	if o.Indexes {
-		b.WriteString(" cc_prompt_index=0; cc_turn_index=1;")
+	if subscriber && o.Indexes && boundedBillingIndex(o.PromptIndex, 0) && boundedBillingIndex(o.TurnIndex, 1) {
+		fmt.Fprintf(&b, " cc_prompt_index=%d; cc_turn_index=%d;", o.PromptIndex, o.TurnIndex)
 	}
 	return b.String()
 }

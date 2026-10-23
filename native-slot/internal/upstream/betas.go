@@ -51,6 +51,9 @@ var (
 	midToolModels = set("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-4-8", "claude-opus-5",
 		"claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-mythos-5-1")
 	fastModeModels = set("claude-opus-4-8", "claude-opus-5", "claude-opus-5-5")
+	// midOutputModels：只有这些模型带 thread 时才需要 mid-conversation-output-config。
+	midOutputModels = set("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5", "claude-opus-5-5",
+		"claude-fable-5-1", "claude-mythos-5-1")
 )
 
 func set(items ...string) map[string]bool {
@@ -205,6 +208,10 @@ func WithRequestProtocolBetas(tokens []string, body *ojson.Object) []string {
 	}
 	if midToolModels[model] {
 		add(betaMidConvToolChanges)
+	}
+	// 官方 claude-code-betas.mjs：thread 只在特定模型上拉 mid-conversation-output-config。
+	if body.Get("thread") != nil && midOutputModels[model] {
+		add(betaMidConvOutputConfig)
 	}
 	oc := ojson.Obj(body.Get("output_config"))
 	if oc != nil && oc.Get("effort") != nil {

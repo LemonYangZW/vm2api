@@ -59,8 +59,11 @@ node scripts/fetch-payload.mjs --check
    `DIFF` 是已覆盖输入下的变化证据；没有 DIFF 只表示现有用例未发现差异。
    仍需核对 CLI 模块文本变化、环境变量和控制面调用点，新增行为必须补用例。
 2. **cli-node 优先做文本差分**。它是 UPX 打包的 Node 程序，解包后是普通 JS：
-   - 用 `work/` 里的方式解包，提取 `src/kin/` 模块；
-   - 和上一版逐文件 diff，改动通常很小（请求构造、缓存标记、环境变量）；
+   - 用 `work/` 里的方式解包（`upx -d`），再用 `reverse/kin-kernel/work/cli-node-moddiff.py`
+     两个解包 ELF/JS 做模块级差分，直接得到「新增/删除/改动」清单和逐模块 unified diff；
+   - 注意先看钉住资产的真身：2026-10-23 的「新版 cli-node」其实是对同一份
+     `b5054cb8` 的按字节原位修补（`5d6b33b6`，解包后只有 1106 字节不同，
+     全落在 `src/utils/cch.ts`）；文本差分能立刻看出这种「同名同大小小补丁」；
    - 直接读 diff 就能判断原生 `internal/upstream/` 要不要跟。
 3. **kernel 只做定向分析**。上游 kernel 更新少，地址/偏移每次都会变，但结构不变：
    - 先用 `strings` 对比新旧二进制：新增的环境变量名、错误消息、日志 `target`
@@ -73,6 +76,22 @@ node scripts/fetch-payload.mjs --check
    版本相关的中间产物。
 5. **把新行为固化**：在 `tools/upstream-probe/` 对应层补用例，内核假宿主场景同步修改
    `fake-cli.py`，再补 Go 单测 / e2e。下一次换版时这些用例就是现成的回归网。
+6. **用真 JS 当 CLI 层的 oracle**（2026-10-23 新增，强烈建议）：不必等 amd64 ELF
+   跑 QEMU，直接把解包出的 bundle 交给 `tools/bun-cli-host`，当成 `cli_diff.py`
+   的 `--upstream-cli`：
+
+   ```sh
+   upx -d -o cli-node.unpacked <pinned cli-node>
+   # 取 /$bunfs/root/cli.js 之后到最后一个 main2(); 之间的明文存成 cli-node.js
+   cd native-slot/tools/bun-cli-host
+   go build -ldflags="-X main.bundlePath=$PWD/../../../cli-node.js" -o /tmp/bun-cli-host .
+   CGO_ENABLED=0 go build -C ../../../.. -o /tmp/native-cli ./native-slot/cmd/cli-node
+   python3 ../../../native-slot/tools/upstream-probe/cli_diff.py \
+     --upstream-cli /tmp/bun-cli-host --native-cli /tmp/native-cli --output-dir .tmp/cli-diff
+   ```
+
+   这条路径比拼接 JS 模块更硬：跑的是**整份**真实 CLI，出站 URL/头/请求体字节与
+   返回帧逐字节对比。bundle 属闭源产物，只在本地/私有仓保留。
 
 一句话：**规格复用、差分定位、只逆向变化的那一小块**。
 
@@ -207,6 +226,17 @@ HTTP 切块只属于传输；JSON 字段顺序、转义、数字、错误和 tra
 - `cli-node-guard` 每 15s 杀掉命令行含 `cli-node` 的多余进程，探针二进制要改名。
 - 容器内 `/tmp` noexec；槽位 home 归属 uid 10001/10002/10003。
 - 上游 payload 资产可能被原地替换，永远以 `payload.json` 的 pin 为准。
+- 控制面 `crs-persona.stampBillingPromptId` 会把计费头 `cc_prompt_id` 改写成出站会话 id，
+  所以经 `/v1/messages` 的请求里 `x-claude-code-prompt-id` == session id 是**正常**的；
+  「prompt_id 不得等于 session」只在绕过控制面的槽位内部路径成立。
+  `integration_diff.captured_request(control=True)` 按这个契约分别断言。
+- `cached_microcompact_enabled=true` 会让**每条** messages 请求以
+  `cached_microcompact_unavailable` / 400 结束（这个 CLI 构建没有 cache-editing
+  实现）。面板默认必须是关；排查 400 先看 kernel.json 里这个键。
+- cch 只投影首个 canonical system 计费头。`messages`、工具结果、后续 system 里的
+  计费示例属于历史内容，改写它们会让上轮 prompt cache 前缀失效（#692）。
+- 本机显示工具可能把计费头一行截断/置空，核对源码请用 `od -c` / `grep -c`，
+  不要相信屏幕上的空字符串。
 
 ## 验收清单
 

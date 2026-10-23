@@ -63,8 +63,34 @@ def cases():
         "betas": ["mid-conversation-system-2026-04-07"],
         "output_config": {"effort": "medium"},
     })
+    # messages 里先出现计费示例、system 用字符串形态：只认首个 canonical system 头。
+    history = request("cch-history")
+    history["system"] = "cch=00000; prompt_version=<offline>;"
+    history["tools"] = [{"name": "Echo", "description": "回显",
+                         "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}}}]
+    history["messages"] = [
+        {"role": "user", "content": "offline-probe:cch-history"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "先调用工具。"},
+            {"type": "tool_use", "id": "toolu_01", "name": "Echo", "input": {"text": "hi"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01",
+                                      "content": "文档示例：cch=00000; 不应被改写"}]},
+    ]
+    # thread 只在 MID_OUTPUT_CONFIG_MODELS 上拉 mid-conversation-output-config。
+    thread = request("thread-output-config")
+    thread["thread"] = {"id": "thread-offline"}
+    thread_legacy = request("thread-legacy-model")
+    thread_legacy["model"] = "claude-opus-4-8"
+    thread_legacy["thread"] = {"id": "thread-offline"}
     return [
         {"name": "text", "request": base},
+        {"name": "cch_history", "request": history},
+        {"name": "thread_mid_output_config", "request": thread},
+        {"name": "thread_legacy_model", "request": thread_legacy},
+        # 面板打开 cached_microcompact_enabled：这个 CLI 构建没有 cache-editing 实现，
+        # 两侧都必须以 cached_microcompact_unavailable / 400 结束。
+        {"name": "cached_microcompact", "request": request("cached-mc"),
+         "kernel": {"cached_microcompact_enabled": True}},
         {"name": "tools_thinking", "request": tool, "response": "tools"},
         {"name": "cache_system_beta", "request": cache},
         {"name": "inference_scope", "request": request("inference"), "credential": "inference"},
@@ -199,9 +225,11 @@ def make_environment(home, mock_url, case):
     write_json(config / ".claude.json", global_config)
     write_json(home / ".claude.json", global_config)
     kernel = home / "kernel.json"
-    write_json(kernel, {"credential_path": str(config / "credentials.json"), "provider": "local_cli",
-                        "timezone": "Asia/Taipei", "persona_preset": "zero", "default_cache_ttl": "1h",
-                        "cch_enabled": True})
+    kernel_doc = {"credential_path": str(config / "credentials.json"), "provider": "local_cli",
+                  "timezone": "Asia/Taipei", "persona_preset": "zero", "default_cache_ttl": "1h",
+                  "cch_enabled": True}
+    kernel_doc.update(case.get("kernel") or {})
+    write_json(kernel, kernel_doc)
     # 使用白名单继承，避免把开发机的 token、代理或其他 Claude 设置带进子进程。
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "LD_LIBRARY_PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "QEMU_LD_PREFIX")}
     env.update({"HOME": str(home), "USERPROFILE": str(home), "TMPDIR": str(home),
@@ -337,7 +365,8 @@ def check_result(result, case):
         problems.append("未注册两个槽位")
     if any("_invalid_stdout" in x for x in frames):
         problems.append("stdout 包含非 JSON 帧")
-    expected = 2 if case.get("concurrent") else 1
+    gated = (case.get("kernel") or {}).get("cached_microcompact_enabled") is True
+    expected = 0 if gated else (2 if case.get("concurrent") else 1)
     if len(result["requests"]) != expected:
         problems.append("mock 出站请求数应为 " + str(expected) + "，实际 " + str(len(result["requests"])))
     for rec in result["requests"]:
@@ -365,14 +394,19 @@ def check_result(result, case):
     for frame in frames:
         if frame.get("job_id") in jobs:
             jobs[frame["job_id"]].append(frame)
-    for i in range(expected):
+    for i in range(2 if case.get("concurrent") else 1):
         job = jobs.get("job_" + str(i + 1).zfill(32), [])
         terminals = [x for x in job if x.get("type") in ("job_done", "job_error", "cancel_ack")]
         if len(terminals) != 1:
             problems.append("job 终结帧数量不为 1")
             continue
         terminal = terminals[0]
-        if case.get("response") == "hang":
+        if gated:
+            # 本构建没有 cache-editing 实现：面板开关打开后每条 messages 请求都以
+            # cached_microcompact_unavailable / 400 结束，且不发往上游。
+            if terminal.get("type") != "job_error" or terminal.get("code") != "cached_microcompact_unavailable"                     or terminal.get("status") != 400 or terminal.get("error_type") != "invalid_request_error":
+                problems.append("面板 cached_microcompact 开关未按 cached_microcompact_unavailable/400 拒绝")
+        elif case.get("response") == "hang":
             if terminal.get("type") != "cancel_ack":
                 problems.append("取消任务没有收到 cancel_ack")
         elif case.get("status", 200) != 200:

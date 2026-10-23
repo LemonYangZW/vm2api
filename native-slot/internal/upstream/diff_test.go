@@ -34,6 +34,11 @@ type diffCase struct {
 	Preserve    map[string]bool `json:"preserve,omitempty"`
 	Parts       json.RawMessage `json:"parts,omitempty"`
 	Model       string          `json:"model,omitempty"`
+	Fingerprint string          `json:"fingerprint,omitempty"`
+	Subscriber  bool            `json:"subscriber,omitempty"`
+	Opts        json.RawMessage `json:"opts,omitempty"`
+	// Env 为每个用例单独设置的进程环境；测试前后自动恢复。
+	Env map[string]*string `json:"env,omitempty"`
 }
 
 func runReference(t *testing.T, cases []diffCase) []string {
@@ -76,6 +81,34 @@ func mustParse(t *testing.T, raw json.RawMessage) any {
 }
 
 func goResult(t *testing.T, c diffCase) string {
+	switch c.Op {
+	case "apiGates", "attribution":
+		// 先清掉会影响 attribution 的变量，再按用例设置，避免宿主环境污染。
+		for _, k := range []string{"CLAUDE_CODE_VERSION", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_ATTRIBUTION_HEADER",
+			"CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_FOUNDRY"} {
+			prev, had := os.LookupEnv(k)
+			_ = os.Unsetenv(k)
+			defer func(k, prev string, had bool) {
+				if had {
+					_ = os.Setenv(k, prev)
+				} else {
+					_ = os.Unsetenv(k)
+				}
+			}(k, prev, had)
+		}
+		for k, v := range c.Env {
+			if v == nil {
+				_ = os.Unsetenv(k)
+				continue
+			}
+			_ = os.Setenv(k, *v)
+		}
+		if c.Op == "apiGates" {
+			cch, sub := APIGates(c.Subscriber)
+			return string(ojson.Marshal(map[string]bool{"includeCch": cch, "includeSubscriberFields": sub}))
+		}
+		return string(ojson.Marshal(Attribution(attributionOptions(t, c))))
+	}
 	switch c.Op {
 	case "cch":
 		var s string
@@ -133,6 +166,39 @@ func goResult(t *testing.T, c diffCase) string {
 	return ""
 }
 
+// attributionOpts 对应 getAttributionHeader 的 opts（prompt/turn 下标为可选）。
+type attributionOpts struct {
+	IncludeCch              bool   `json:"includeCch"`
+	IncludeSubscriberFields bool   `json:"includeSubscriberFields"`
+	IsSubagent              bool   `json:"isSubagent"`
+	PromptId                string `json:"promptId"`
+	PrevReqId               string `json:"prevReqId"`
+	TurnOrigin              string `json:"turnOrigin"`
+	PromptIndex             *int   `json:"promptIndex"`
+	TurnIndex               *int   `json:"turnIndex"`
+}
+
+func attributionOptions(t *testing.T, c diffCase) AttributionOptions {
+	t.Helper()
+	var o attributionOpts
+	if len(c.Opts) > 0 {
+		if err := json.Unmarshal(c.Opts, &o); err != nil {
+			t.Fatalf("parse opts %s: %v", c.Opts, err)
+		}
+	}
+	opts := AttributionOptions{
+		Fingerprint: c.Fingerprint, Subagent: o.IsSubagent, PromptID: o.PromptId,
+		TurnOrigin: o.TurnOrigin, PrevReqID: o.PrevReqId,
+		IncludeCch: o.IncludeCch, IncludeSubscriberFields: o.IncludeSubscriberFields,
+	}
+	if o.PromptIndex != nil && o.TurnIndex != nil {
+		opts.Indexes, opts.PromptIndex, opts.TurnIndex = true, *o.PromptIndex, *o.TurnIndex
+	}
+	return opts
+}
+
+func strp(s string) *string { return &s }
+
 func raw(s string) json.RawMessage { return json.RawMessage(s) }
 
 func jsonString(s string) json.RawMessage { b, _ := json.Marshal(s); return b }
@@ -171,8 +237,47 @@ func cchBodies() []diffCase {
 	return cases
 }
 
+// attributionCases：attributionGates 的 provider × 订阅者矩阵，以及
+// getAttributionHeader 的字段门控与 env 分支。
+func attributionCases() []diffCase {
+	full := raw(`{"includeCch":true,"includeSubscriberFields":true,"isSubagent":true,
+		"promptId":"6f1c0000-0000-4000-8000-000000000000","turnOrigin":"sdk_cli","promptIndex":0,"turnIndex":1}`)
+	keyOnly := raw(`{"isSubagent":true,"promptId":"6f1c0000-0000-4000-8000-000000000000","turnOrigin":"sdk_cli"}`)
+	cases := []diffCase{
+		{Op: "apiGates", Subscriber: true},
+		{Op: "apiGates", Subscriber: false},
+		{Op: "apiGates", Subscriber: true, Env: map[string]*string{"CLAUDE_CODE_USE_VERTEX": strp("1")}},
+		{Op: "apiGates", Subscriber: false, Env: map[string]*string{"CLAUDE_CODE_USE_VERTEX": strp("true")}},
+		{Op: "apiGates", Subscriber: true, Env: map[string]*string{"CLAUDE_CODE_USE_BEDROCK": strp("yes")}},
+		{Op: "apiGates", Subscriber: true, Env: map[string]*string{"CLAUDE_CODE_USE_FOUNDRY": strp("on")}},
+		{Op: "apiGates", Subscriber: true, Env: map[string]*string{
+			"CLAUDE_CODE_USE_VERTEX": strp("1"), "CLAUDE_CODE_USE_BEDROCK": strp("1")}},
+		{Op: "attribution", Fingerprint: "abc123", Opts: full},
+		{Op: "attribution", Fingerprint: "abc123", Opts: keyOnly},
+		{Op: "attribution", Fingerprint: "abc123", Opts: full,
+			Env: map[string]*string{"CLAUDE_CODE_ENTRYPOINT": strp("sdk-cli"),
+				"CLAUDE_CODE_VERSION": strp("2.1.303 (Claude Code)")}},
+		{Op: "attribution", Fingerprint: "abc123", Opts: full,
+			Env: map[string]*string{"CLAUDE_CODE_ENTRYPOINT": nil}},
+		{Op: "attribution", Fingerprint: "abc123", Opts: full,
+			Env: map[string]*string{"CLAUDE_CODE_ATTRIBUTION_HEADER": strp("0")}},
+		{Op: "attribution", Fingerprint: "abc123", Opts: full,
+			Env: map[string]*string{"CLAUDE_CODE_ATTRIBUTION_HEADER": strp(" off ")}},
+		{Op: "attribution", Fingerprint: "abc123", Opts: raw(`{"includeCch":true,"includeSubscriberFields":true,
+			"promptId":"not-a-uuid","turnOrigin":"sdk-cli"}`)},
+		{Op: "attribution", Fingerprint: "abc123", Opts: raw(`{"includeCch":true,"includeSubscriberFields":true,
+			"promptId":"6f1c0000-0000-4000-8000-000000000000","prevReqId":"req_abc-1","promptIndex":0,"turnIndex":1}`)},
+		{Op: "attribution", Fingerprint: "abc123", Opts: raw(`{"includeCch":true,"includeSubscriberFields":true,
+			"prevReqId":"bad id","promptIndex":20000000,"turnIndex":1}`)},
+		{Op: "attribution", Fingerprint: "abc123", Opts: raw(`{"includeCch":true,"includeSubscriberFields":true,
+			"promptIndex":0,"turnIndex":0}`)},
+	}
+	return cases
+}
+
 func TestDifferentialAgainstOfficialModules(t *testing.T) {
 	cases := cchBodies()
+	cases = append(cases, attributionCases()...)
 	cases = append(cases,
 		diffCase{Op: "merge", Tokens: []string{"x-1", "effort-2025-11-24", "claude-code-20250219"}},
 		diffCase{Op: "merge", Tokens: []string{}},
