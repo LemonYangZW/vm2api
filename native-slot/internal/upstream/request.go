@@ -25,7 +25,7 @@ var nativeOwnedFields = map[string]bool{
 	"top_p": true, "top_k": true, "stop_sequences": true, "betas": true, "wireMessages": true,
 	"request_context": true, "output_config": true, "context_management": true, "safeguards": true,
 	// 规格要求移除的内核内部字段。
-	"wireBody": true, "auto_compact_window": true,
+	"wireBody": true, "auto_compact_window": true, "kin_outbound_shape": true,
 }
 
 var callerOptionalFields = []string{"tools", "tool_choice", "thinking", "temperature", "top_p",
@@ -108,9 +108,12 @@ func Build(in BuildInput) (*Built, error) {
 			IncludeSubscriberFields: includeSubFields,
 		})
 	}
+	// kin_outbound_shape=lean：控制面已按官方 2.1.303 形状组装（缓存标记也在
+	// 控制面完成），CLI 只把计费头的 cch 原地归零。字段本身绝不发给上游。
+	lean := ojson.Str(wire.Get("kin_outbound_shape")) == "lean"
 	var kinWire []any
 	if rc == nil {
-		kinWire = wireSystemBlocks(wire.Get("system"))
+		kinWire = wireSystemBlocks(wire.Get("system"), lean)
 	}
 	switch {
 	case kinWire != nil:
@@ -152,8 +155,8 @@ func Build(in BuildInput) (*Built, error) {
 	}
 	requestBetas = append(append([]string(nil), requestBetas...), callerBetas...)
 
-	// 缓存标记
-	if rc == nil {
+	// 缓存标记（lean 形状由控制面负责，宿主不再改动）
+	if rc == nil && !lean {
 		requestTTL := explicitCacheTTL(system, allTools, messages)
 		panelTTL, _ := panelSettings()
 		ttl := requestTTL

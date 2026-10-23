@@ -82,8 +82,17 @@ def cases():
     thread_legacy = request("thread-legacy-model")
     thread_legacy["model"] = "claude-opus-4-8"
     thread_legacy["thread"] = {"id": "thread-offline"}
+    # 1.3.221+：lean 形状（控制面负责缓存标记），CLI 只把计费头 cch 原地归零，
+    # 且 kin_outbound_shape 绝不发往上游。
+    lean = request("lean-profile")
+    lean["system"] = [{"type": "text", "text": "x-anth" + "ropic-billing-header: cc_version=2.1.303; cc_entrypoint=cli; cch=abcde;"}]
+    lean["kin_outbound_shape"] = "lean"
+    # 面板 cli_version 必须进入计费头与 UA。
+    versioned = request("cli-version-profile")
     return [
         {"name": "text", "request": base},
+        {"name": "lean_profile", "request": lean},
+        {"name": "cli_version_profile", "request": versioned, "kernel": {"cli_version": "2.1.303"}},
         {"name": "cch_history", "request": history},
         {"name": "thread_mid_output_config", "request": thread},
         {"name": "thread_legacy_model", "request": thread_legacy},
@@ -377,6 +386,8 @@ def check_result(result, case):
             problems.append("mock 未收到指定虚拟凭据")
         if rec["method"] != "POST" or not rec["url"].endswith("/v1/messages?beta=true"):
             problems.append("Messages 方法或路径不符")
+        if "kin_outbound_shape" in rec["body"]:
+            problems.append("kin_outbound_shape 泄漏到上游")
         cch = verify_cch(rec["body"])
         rec["cch_validation"] = cch
         if not cch["valid"]:

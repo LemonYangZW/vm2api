@@ -36,6 +36,7 @@ type diffCase struct {
 	Model       string          `json:"model,omitempty"`
 	Fingerprint string          `json:"fingerprint,omitempty"`
 	Subscriber  bool            `json:"subscriber,omitempty"`
+	Profile     bool            `json:"profile,omitempty"`
 	Opts        json.RawMessage `json:"opts,omitempty"`
 	// Env 为每个用例单独设置的进程环境；测试前后自动恢复。
 	Env map[string]*string `json:"env,omitempty"`
@@ -127,8 +128,10 @@ func goResult(t *testing.T, c diffCase) string {
 		return string(ojson.Marshal(finalizeZeroBilling(c.Text)))
 	case "cchPlaceholder":
 		return string(ojson.Marshal(withCchPlaceholder(c.Text)))
+	case "cchPlaceholderInPlace":
+		return string(ojson.Marshal(withCchPlaceholderInPlace(c.Text)))
 	case "wire":
-		w := wireSystemBlocks(mustParse(t, c.System))
+		w := wireSystemBlocks(mustParse(t, c.System), c.Profile)
 		if w == nil {
 			return "null"
 		}
@@ -275,9 +278,49 @@ func attributionCases() []diffCase {
 	return cases
 }
 
+// leanCases：1.3.221+ 的 profile(lean) 形状 —— 计费头 cch 原地归零，
+// 以及 withCchPlaceholderInPlace 的三种分支（有 cch / 有 cc_entrypoint / 都没有）。
+func leanCases() []diffCase {
+	// 用拼接构造计费头字面量，避免任何编辑器/终端把这一行截断。
+	head := "x-anth" + "ropic-billing-header: "
+	billing := head + "cc_version=2.1.303; cc_entrypoint=cli; cch=abcde;"
+	tight := head + "cc_version=2.1.303; cc_entrypoint=cli;cch=abcde;"
+	twoCch := head + "cc_version=2.1.303; cch=abcde; cch=fedcb;"
+	noCch := head + "cc_version=2.1.303; cc_entrypoint=cli;"
+	bare := "nothing to normalize"
+	cases := []diffCase{
+		{Op: "cchPlaceholderInPlace", Text: billing},
+		{Op: "cchPlaceholderInPlace", Text: tight},
+		{Op: "cchPlaceholderInPlace", Text: twoCch},
+		{Op: "cchPlaceholderInPlace", Text: noCch},
+		{Op: "cchPlaceholderInPlace", Text: bare},
+		{Op: "cchPlaceholderInPlace", Text: "  no fields at all  "},
+		{Op: "cchPlaceholder", Text: billing},
+		{Op: "cchPlaceholder", Text: noCch},
+	}
+	system := func(text string, marked bool) json.RawMessage {
+		block := map[string]any{"type": "text", "text": text}
+		if marked {
+			block["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
+		}
+		b, _ := json.Marshal([]any{block})
+		return b
+	}
+	for _, profile := range []bool{false, true} {
+		cases = append(cases,
+			diffCase{Op: "wire", Profile: profile, System: system(billing, true)},
+			diffCase{Op: "wire", Profile: profile, System: system(twoCch, false)},
+			diffCase{Op: "wire", Profile: profile, System: system(noCch, true)},
+			diffCase{Op: "wire", Profile: profile, System: system("普通文本", true)},
+		)
+	}
+	return cases
+}
+
 func TestDifferentialAgainstOfficialModules(t *testing.T) {
 	cases := cchBodies()
 	cases = append(cases, attributionCases()...)
+	cases = append(cases, leanCases()...)
 	cases = append(cases,
 		diffCase{Op: "merge", Tokens: []string{"x-1", "effort-2025-11-24", "claude-code-20250219"}},
 		diffCase{Op: "merge", Tokens: []string{}},

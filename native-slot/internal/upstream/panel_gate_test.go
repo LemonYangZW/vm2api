@@ -260,3 +260,129 @@ func billingFromBody(t *testing.T, body []byte) string {
 	}
 	return ojson.Str(ojson.Obj(blocks[0]).Get("text"))
 }
+
+// readPanelCliVersion：面板 cli_version 优先；键缺失重置（回落 env），非法值沿用。
+func TestReadPanelCliVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kernel.json")
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"cli_version": "2.1.303"}`)
+	if v := readPanelCliVersion(path); v != "2.1.303" {
+		t.Fatalf("panel version = %q", v)
+	}
+	// 带空白也能识别
+	write(`{"cli_version": " 2.1.296 "}`)
+	if v := readPanelCliVersion(path); v != "2.1.296" {
+		t.Fatalf("trimmed panel version = %q", v)
+	}
+	// 非法值：沿用上次
+	write(`{"cli_version": "2.1"}`)
+	if v := readPanelCliVersion(path); v != "2.1.296" {
+		t.Fatalf("invalid must keep previous, got %q", v)
+	}
+	// 键缺失：重置
+	write(`{"other": 1}`)
+	if v := readPanelCliVersion(path); v != "" {
+		t.Fatalf("missing key must reset, got %q", v)
+	}
+}
+
+// CLIVersion：面板 cli_version > CLAUDE_CODE_VERSION > 编译期默认。
+func TestCLIVersionPrecedence(t *testing.T) {
+	writeKernelConfig(t, map[string]any{"cli_version": "2.1.303"})
+	t.Setenv("CLAUDE_CODE_VERSION", "2.1.400 (Claude Code)")
+	if v := CLIVersion(); v != "2.1.303" {
+		t.Fatalf("panel must win, got %q", v)
+	}
+	writeKernelConfig(t, map[string]any{})
+	if v := CLIVersion(); v != "2.1.400" {
+		t.Fatalf("env fallback, got %q", v)
+	}
+	t.Setenv("CLAUDE_CODE_VERSION", "")
+	if v := CLIVersion(); v != fingerprintVersion {
+		t.Fatalf("compiled default, got %q", v)
+	}
+}
+
+// lean(kin_outbound_shape=lean)：宿主不碰缓存标记（上限裁剪也交给控制面），
+// 并把该字段从出站请求里删掉。
+func TestBuildLeanShapeSkipsCacheMarkers(t *testing.T) {
+	writeKernelConfig(t, map[string]any{"default_cache_ttl": "1h"})
+	cred := testCredential(t, true, "user:inference", "user:profile")
+	t.Setenv("CLAUDE_CODE_SYSTEM_LAYOUT", "identity")
+	// 五个带显式 TTL 的块：非 lean 会被裁剪到 4 个，lean 原样保留。
+	blocks := ""
+	for i := 0; i < 5; i++ {
+		if i > 0 {
+			blocks += ","
+		}
+		blocks += `{"type":"text","text":"b` + string(rune('0'+i)) + `","cache_control":{"type":"ephemeral","ttl":"1h"}}`
+	}
+	body := `{"model":"claude-sonnet-5-5","messages":[{"role":"user","content":[` + blocks + `]}],` +
+		`"system":[{"type":"text","text":"` + "x-anth" + `ropic-billing-header: cch=abcde;"}],"max_tokens":16}`
+	lean := strings.Replace(body, `"max_tokens":16`, `"max_tokens":16,"kin_outbound_shape":"lean"`, 1)
+
+	built, err := buildRaw(t, cred, lean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(built.Body), "kin_outbound_shape") {
+		t.Fatalf("kin_outbound_shape leaked upstream")
+	}
+	if n := strings.Count(string(built.Body), "cache_control"); n != 5 {
+		t.Fatalf("lean must keep caller markers untouched, got %d (body len %d)", n, len(built.Body))
+	}
+
+	built, err = buildRaw(t, cred, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(built.Body), "cache_control"); n > 4 {
+		t.Fatalf("non-lean must cap markers at 4, got %d", n)
+	}
+}
+
+// withCchPlaceholderInPlace 的四个分支（期望值取自现网 1.3.221 输出）。
+func TestWithCchPlaceholderInPlace(t *testing.T) {
+	head := "x-anth" + "ropic-billing-header: "
+	cases := []struct{ name, in, want string }{
+		{"existing cch", head + "cch=abcde;", head + "cch=00000;"},
+		{"two cch leaves trailing space", head + "cch=abcde; cch=fedcb;", head + "cch=00000; "},
+		{"no cch appends", "nothing", "nothing; cch=00000;"},
+		{"empty", "", "; cch=00000;"},
+	}
+	for _, c := range cases {
+		if got := withCchPlaceholderInPlace(c.in); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+	// 有 cc_entrypoint 但没有 cch：插在 entrypoint 之后。
+	entry := head + ""
+	got := withCchPlaceholderInPlace(entry)
+	if !strings.Contains(got, "cch=00000;") || !strings.HasPrefix(got, head) {
+		t.Errorf("entrypoint branch: %q", got)
+	}
+}
+
+// 面板 cli_version 必须进入出站计费头（cc_version）与 User-Agent。
+func TestBuildUsesPanelCLIVersion(t *testing.T) {
+	cred := testCredential(t, true, "user:inference", "user:profile")
+	t.Setenv("CLAUDE_CODE_SYSTEM_LAYOUT", "identity")
+	writeKernelConfig(t, map[string]any{"cch_enabled": true, "cli_version": "2.1.303"})
+	built, err := buildRaw(t, cred, `{"model":"claude-sonnet-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":16}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	billing := billingFromBody(t, built.Body)
+	if !strings.Contains(billing, "2.1.303") {
+		t.Errorf("billing must carry the panel cli version: %q", billing)
+	}
+	if ua := built.Header.Get("User-Agent"); !strings.Contains(ua, "/2.1.303") {
+		t.Errorf("user-agent must follow the panel cli version: %q", ua)
+	}
+}

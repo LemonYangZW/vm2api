@@ -84,9 +84,13 @@ var (
 	cchFieldRe        = regexp.MustCompile(`(?i)\s*\bcch=[^;]*;?`)
 	trailingSpaceRe   = regexp.MustCompile(`\s+$`)
 	promptIDFieldRe   = regexp.MustCompile(`\bcc_prompt_id=`)
-	uuidRe            = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	turnOriginRe      = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
-	prevReqRe         = regexp.MustCompile(`^req_[A-Za-z0-9_-]{1,36}$`)
+	entrypointFieldRe = regexp.MustCompile(`\bcc_entrypoint=[^;]*;`)
+	// cchInPlaceRe 与现网 profile 路径一致：不吞掉 cch 前面的空白，多个 cch 时
+	// 第二个被删掉会留下空格。
+	cchInPlaceRe = regexp.MustCompile(`(?i)\bcch=[^;]*;?`)
+	uuidRe       = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	turnOriginRe = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
+	prevReqRe    = regexp.MustCompile(`^req_[A-Za-z0-9_-]{1,36}$`)
 )
 
 // finalizeZeroBilling 实现 zero 布局计费头的六步重写。
@@ -109,6 +113,30 @@ func finalizeZeroBilling(attribution string) string {
 		header += " cc_prompt_id=" + stablePromptID() + ";"
 	}
 	return header + " cch=00000; prompt_version=<" + IdentitySentence + ">"
+}
+
+// withCchPlaceholderInPlace 对齐现网 profile(lean) 路径：保留计费头原有字段
+// 与顺序，只把第一个 cch 原地归零；无 cch 时插在 cc_entrypoint 之后，再退化为
+// 末尾追加。
+func withCchPlaceholderInPlace(header string) string {
+	found := false
+	reset := cchInPlaceRe.ReplaceAllStringFunc(header, func(m string) string {
+		if found {
+			return ""
+		}
+		found = true
+		return "cch=00000;"
+	})
+	if found {
+		return reset
+	}
+	if loc := entrypointFieldRe.FindStringIndex(reset); loc != nil {
+		return reset[:loc[1]] + " cch=00000;" + reset[loc[1]:]
+	}
+	if !strings.HasSuffix(reset, ";") {
+		reset += ";"
+	}
+	return reset + " cch=00000;"
 }
 
 // withCchPlaceholder 只把 cch 重置为 00000。
@@ -212,7 +240,7 @@ func jsString(v any) string {
 func blockText(b *ojson.Object) string { return ojson.Str(b.Get("text")) }
 
 // wireSystemBlocks 透传非空文本块数组；计费头只重置 cch。
-func wireSystemBlocks(system any) []any {
+func wireSystemBlocks(system any, profile bool) []any {
 	arr, ok := system.([]any)
 	if !ok || len(arr) == 0 {
 		return nil
@@ -237,7 +265,11 @@ func wireSystemBlocks(system any) []any {
 		next := ojson.NewObject()
 		next.Set("type", "text")
 		if billingLeadRe.MatchString(text) {
-			next.Set("text", withCchPlaceholder(text))
+			if profile {
+				next.Set("text", withCchPlaceholderInPlace(text))
+			} else {
+				next.Set("text", withCchPlaceholder(text))
+			}
 		} else {
 			next.Set("text", text)
 		}
@@ -456,8 +488,9 @@ func Attribution(o AttributionOptions) string {
 		return ""
 	}
 	var b strings.Builder
+	// 现网 1.3.221+ 的 getAttributionHeader 把 entrypoint 写死成 "cli"（不再读环境变量）。
 	fmt.Fprintf(&b, "x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;",
-		CLIVersion(), o.Fingerprint, envOr("CLAUDE_CODE_ENTRYPOINT", "unknown"))
+		CLIVersion(), o.Fingerprint, "cli")
 	if o.IncludeCch {
 		b.WriteString(" cch=00000;")
 	}
@@ -504,7 +537,12 @@ func envOr(k, def string) string {
 var versionRe = regexp.MustCompile(`(\d+\.\d+\.\d+)`)
 
 // CLIVersion 从 CLAUDE_CODE_VERSION 提取 x.y.z，缺省 2.1.296。
+// CLIVersion 对齐 officialCliVersion：内核 kernel.json 的 cli_version（面板下发的
+// profile 版本）优先，其次 CLAUDE_CODE_VERSION，最后编译期默认值。
 func CLIVersion() string {
+	if v := PanelCliVersion(); v != "" {
+		return v
+	}
 	if m := versionRe.FindString(strings.TrimSpace(os.Getenv("CLAUDE_CODE_VERSION"))); m != "" {
 		return m
 	}

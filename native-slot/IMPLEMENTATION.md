@@ -68,6 +68,10 @@ go test ./...
   `cached_microcompact_unavailable` / 400 / `invalid_request_error`，且不出网
   （这个 CLI 构建没有 cache-editing 实现）；
 - `thread` 只在 `MID_OUTPUT_CONFIG_MODELS` 集合内追加 `mid-conversation-output-config`；
+- 计费头 `cc_version` 取 `kernel.json` 的 `cli_version`（面板 profile 版本）→
+  `CLAUDE_CODE_VERSION` → 默认 2.1.296；`cc_entrypoint` 自 1.3.221 起固定 `cli`；
+- `kin_outbound_shape=lean` 时宿主不改写缓存标记，计费头 cch 用原位归零
+  （`withCchPlaceholderInPlace`），并把该字段从出站请求删除；
 - 面板登录以 `KIN_PANEL_LOGIN` 无参数启动时进入授权流程，继续复用宿主凭据文件；
 - 发往上游前 `upstream.Preflight` 最后把关：缓存标记规则同控制面 `validateCacheBreakpoints`，
   外加 messages 非空、role/content 形状、按合并后 turn 判 tool_use/tool_result 配对与 id 唯一；

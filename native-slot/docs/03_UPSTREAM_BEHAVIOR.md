@@ -492,6 +492,28 @@ provider 只由 `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` /
 选项，因此槽位路径永远不带该字段（早前实现读 `CLAUDE_CODE_WORKLOAD`，
 上游从未读过这个变量，已删除）。
 
+#### 版本与 lean 形状（1.3.221+）
+
+计费头里的 `cc_version` 用 **CLI 版本**，取值顺序：
+
+```text
+kernel.json 的 cli_version（面板按 persona profile 下发，例如 official_303 → 2.1.303）
+  → CLAUDE_CODE_VERSION
+  → 编译期默认值 2.1.296
+```
+
+面板值必须是 `^\s*(\d+\.\d+\.\d+)\s*$`，键缺失时回到 env；非法值沿用上一次。
+`cc_entrypoint` 从 1.3.221 起**固定写 `cli`**，不再读 `CLAUDE_CODE_ENTRYPOINT`
+（User-Agent 与 turn origin 的回退仍看该环境变量）。
+
+控制面给槽位下发 `kin_outbound_shape: "lean"` 时（official_303 persona + lean 模型）：
+
+| 行为 | 普通形状 | lean 形状 |
+| --- | --- | --- |
+| 计费头 cch | `withCchPlaceholder`：删掉所有 cch 字段，末尾追加 `cch=00000;` | `withCchPlaceholderInPlace`：只把**第一个** cch 原地写成 `cch=00000;`（保留其它字段与顺序；无 cch 时插在 `cc_entrypoint` 之后，再退化为末尾追加） |
+| 缓存标记 | 宿主补 TTL、去 thinking 标记、裁剪到 4 个 | **不碰**：标记由控制面组装好 |
+| `kin_outbound_shape` 字段 | — | 必须从出站请求里删除，绝不发给上游 |
+
 #### cch 的计算范围（重要）
 
 `cch` 只投影**首个 canonical system 计费头块**：

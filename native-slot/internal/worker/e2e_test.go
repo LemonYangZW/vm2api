@@ -332,7 +332,7 @@ func TestEndToEndStreamAndUpstreamShape(t *testing.T) {
 	}
 	billing := sys[0].(map[string]any)["text"].(string)
 	if !strings.HasPrefix(billing, "x-anthropic-billing-header: cc_version=2.1.296.") || strings.Contains(billing, "cch=00000") ||
-		!strings.Contains(billing, "cc_entrypoint=sdk-cli;") || !strings.Contains(billing, "cc_prompt_id="+promptID+";") ||
+		!strings.Contains(billing, "cc_entrypoint=cli;") || !strings.Contains(billing, "cc_prompt_id="+promptID+";") ||
 		!strings.HasSuffix(billing, "prompt_version=<You are a Claude agent, built on Anthropic's Claude Agent SDK.>") {
 		t.Errorf("billing block = %q", billing)
 	}

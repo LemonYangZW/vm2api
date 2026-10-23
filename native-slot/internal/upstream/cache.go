@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,6 +166,55 @@ var (
 	autoCompactMu   sync.Mutex
 	lastPanelWindow any
 )
+
+var (
+	cliVersionMu      sync.Mutex
+	lastPanelCliVer   any
+	panelCliVersionRe = regexp.MustCompile(`^\s*(\d+\.\d+\.\d+)\s*$`)
+)
+
+// readPanelCliVersion 对应 readPanelCliVersion：面板写的 cli_version 优先，
+// 键缺失时重置为未设置（回落到 CLAUDE_CODE_VERSION），非法值沿用上次。
+func readPanelCliVersion(path string) string {
+	b, err := os.ReadFile(path)
+	cliVersionMu.Lock()
+	defer cliVersionMu.Unlock()
+	fallback := func() string {
+		if s, ok := lastPanelCliVer.(string); ok {
+			return s
+		}
+		return ""
+	}
+	if err != nil {
+		return fallback()
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(b, &raw) != nil {
+		return fallback()
+	}
+	v, present := raw["cli_version"]
+	if !present {
+		lastPanelCliVer = nil
+		return ""
+	}
+	var decoded any
+	if json.Unmarshal(v, &decoded) != nil {
+		return fallback()
+	}
+	switch x := decoded.(type) {
+	case string:
+		if m := panelCliVersionRe.FindStringSubmatch(x); m != nil {
+			lastPanelCliVer = m[1]
+			return m[1]
+		}
+	case nil:
+		// null 等同于缺失：沿用 lastPanelCliVer（与现网 `String(parsed.cli_version ?? "")` 一致）。
+	}
+	return fallback()
+}
+
+// PanelCliVersion 供 CLIVersion 使用：面板 cli_version 优先，未设置返回空串。
+func PanelCliVersion() string { return readPanelCliVersion(kernelConfigPath()) }
 
 // validAutoCompactWindow 对应 validAutoCompactWindow：整数且在
 // [1e5, 1e6] 区间内，否则视为未设置。
