@@ -1148,3 +1148,40 @@ telemetry apply enabled=true  → 200 {"applied":true,"scope":"native_claude_lau
 telemetry apply enabled=false → 409
 内核 health: worker_version 2.1.321, session_slots 1, healthy true
 ```
+
+### 16.7 fork 工作流：上游合并 + 补丁文件化
+
+部署形态固定为：**上游镜像 + 我们自己的内核与授权服务**。所以每次上游发版都要做三件事，
+不能只 `docker pull`：
+
+```sh
+# 1) 跟上上游（main 只允许快进）
+git checkout main && git merge --ff-only origin/main && cat VERSION
+
+# 2) 内核分支 rebase（native-slot/ 在上游已删除，纯新增，永远零冲突）
+git checkout feat/cragv2-rs-main && git rebase origin/main
+
+# 3) 面板补丁按新版本重打（关键步骤）
+IMG=ghcr.io/dofastted/vm2api:v<新版本>-amd64
+mkdir -p /tmp/pw/src/lib/vm
+docker run --rm --entrypoint cat $IMG /opt/vm2api/src/lib/vm/crag-license.mjs \
+  > /tmp/pw/src/lib/vm/crag-license.mjs
+docker run --rm --entrypoint cat $IMG /opt/vm2api/src/lib/vm/crag-subscription.mjs \
+  > /tmp/pw/src/lib/vm/crag-subscription.mjs
+docker run --rm -v /tmp/pw:/w -v $PWD/tools:/t node:22-alpine \
+  node /t/panel-patches.mjs --root /w --write-patches /w/patches
+cp /tmp/pw/src/lib/vm/*.mjs /opt/docker/vm2api/patches/   # 沙盒侧
+```
+
+`tools/panel-patches.mjs` 的设计要点：
+
+| 点 | 原因 |
+| :--- | :--- |
+| 只做**单行替换 + 锚点断言** | 不整份覆盖，避免把上游新代码悄悄回退 |
+| 幂等（有 marker 就跳过） | 重复执行不会叠加 |
+| 锚点缺失即失败退出 | 上游改写该行时立刻暴露，而不是留下半成品 |
+| 打完跑 `node --check` | 唯一能挡住面板 crash loop 的关口（正则转义丢反斜杠那次的教训） |
+| `--write-patches` 从**当前文件**反推 diff | 补丁文件由实现生成，永不漂移；提交到 `patches/*.patch` 供审阅与 `git apply` |
+
+`patches/0001-panel-activation-url.patch` / `0002-panel-subscription-origin.patch`
+是这条流程的产物，已在原始上游文件上验证 `git apply` 干净通过。
