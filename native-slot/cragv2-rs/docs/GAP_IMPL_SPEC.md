@@ -952,3 +952,57 @@ fs.writeFileSync(p,JSON.stringify(m));' "$D/manifest.json" "$H"
    ```
 
    重建后 `docker inspect --format '{{.HostConfig.Memory}}'` 应变成目标值（实测 2147483648）。
+
+## 16. 自建兑换码闭环（不依赖厂商授权服务）
+
+我们用自己签的包，因此**授权链本身就在我们手里**：包内 `crag-license-public.pem`
+是我们的 ed25519 公钥，`manifest.payload.key_id` 是我们的载荷密钥哈希。
+只要用对应私钥签许可证，面板与槽位就会认。缺的只是"发行兑换码"这一环。
+
+### 16.1 协议真值（读面板 `src/lib/vm/crag-license.mjs` 得到）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 兑换码 | `CRAGR1.<32 字节 base64url>`（43 字符），本身不携带信息 |
+| 许可证 | `CRAGL1.<base64url(JSON)>.<base64url(ed25519 签名)>` |
+| 签名对象 | `"CRAG-LICENSE-V1\0" \|\| JSON 原始字节` |
+| 有效期 | `term ∈ {1m,3m,6m,1y}`，`expires_at` 必须等于 `calendarExpiry(issued_at,term)`（自然月进位） |
+| 载荷密钥封装 | X25519 临时密钥 + HKDF-SHA256（salt=`payload_key_id` hex，info=`"CRAG-LICENSE-KEYWRAP-V1\0"`）+ AES-256-GCM（AAD=`${vm_id}\0${machine_id_hash}\0${device_public_key}\0${payload_key_id}`） |
+| 机器码 | `CRAGM1.<base64url({version,product,vm_id,machine_id_hash,device_public_key})>` |
+| 接口 | `POST {base}/resolve`、`POST {base}/redeem`；`base` 默认 `https://crag.fkcodex.com/v1/device-activation` |
+
+### 16.2 我们的实现（`native-slot/cragv2-rs/tools/`）
+
+| 文件 | 作用 |
+| :--- | :--- |
+| `license-authority.mjs` | 核心：读 keys、签 `CRAGL1`、封装载荷密钥、`calendarExpiry` |
+| `activation-server.mjs` | 本地授权服务：`resolve`/`redeem`，一码一机、重放幂等、可吊销 |
+| `mint-voucher.mjs` | 发码 / `--list` 查绑定 / `--revoke` 吊销 |
+| `mint-license.mjs` | 离线兜底：拿 machine_code 直接出证，无需服务 |
+| `test-authority.mjs` | 闭环自检：**用面板自己的 `verifyCragRegistration`** 验证我们签的证 |
+
+面板侧只加了一处环境变量覆盖（零行为变更）：
+
+```js
+const DEVICE_ACTIVATION_URL =
+  (process.env.CRAG_ACTIVATION_URL || '').trim().replace(/\/+$/, '') || 'https://crag.fkcodex.com/v1/device-activation'
+```
+
+### 16.3 自检与实测
+
+```
+✓ 面板验证通过 — valid          （到期 2027-11-17，1y）
+✓ 载荷密钥 id 不匹配被拒 — license_payload_key_mismatch
+✓ 换机器被拒 — license_binding_mismatch
+✓ 篡改到期时间被拒 — license_invalid
+✓ 过期后失效 — license_expired
+
+服务端：resolve 200 device / redeem 200 replayed=false
+        重放 200 replayed=true（同一张证）
+        换机器 409 redeem_conflict / 错密钥 400 payload_key_unknown
+```
+
+要点：
+- **重放必须返回逐字节相同的证**（面板会拿它和磁盘上的 `registration.code` 比对，
+  重新签名会被判成 `license_redeem_target_changed`），所以服务端把首次签发的证存库复用。
+- 离线路径与在线路径用的是同一个 `mintRegistration`，因此两边出的证完全等价。
