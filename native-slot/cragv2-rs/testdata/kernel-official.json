@@ -1,0 +1,9 @@
+{
+  "_note": "slot 模式 + 官方 Claude Code bundle（与上游 crag v2 同构）",
+  "dataplane": "crag",
+  "crag_kernel_version": "v2",
+  "slots_per_worker": 2,
+  "upstream_mode": "slot",
+  "cli_bin": "/opt/crag/claude.sh",
+  "cli_args": []
+}

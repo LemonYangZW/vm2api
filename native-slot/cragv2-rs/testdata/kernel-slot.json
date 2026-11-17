@@ -1,0 +1,7 @@
+{
+  "dataplane": "crag",
+  "slots_per_worker": 2,
+  "upstream_mode": "slot",
+  "cli_bin": "/bin/sh",
+  "cli_args": ["testdata/fake-cli.sh"]
+}

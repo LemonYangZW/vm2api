@@ -1,0 +1,878 @@
+# CRAG v2 功能对齐实现规格（GAP_IMPL_SPEC）
+
+> 目的：把 `native-slot/cragv2-rs` 与官方 CRAG v2 原生内核的**功能差异**收敛成可验收的实现条目。
+> 范围只谈功能等价，**不谈** TLS/h2 字节级一致（那条需要官方内核的 golden 流量，见 §9）。
+
+---
+
+## 0. 基线与证据来源
+
+| 类别 | 来源 | 用途 |
+| :--- | :--- | :--- |
+| 控制面契约（权威） | `dofastted/vm2api` **v1.4.117**（`87ddea0b`）`src/lib/transport/*`、`src/lib/vm/*` | 内核必须满足的接口/字段 |
+| 官方内核配置（权威） | 出厂包内 `kernel.json.example`（1208 B，明文） | 27 个配置键的真实默认值 |
+| JS 时代参考实现 | `share/crag-v2` @ `8423bb81`（归档 ref `archive/crag-plaintext-8423bb81`） | `linux-tui-helper.mjs`、`linux-tui-tap.js`、`tui-request-options.mjs`、`gateway/v2-runtime.mjs` |
+| 实测 | 沙盒 192.168.1.109（详见本文件 §1） | 判定架构真伪 |
+
+---
+
+## 1. 实测结论（决定实现方向，勿再猜测）
+
+| # | 结论 | 证据 |
+| :--- | :--- | :--- |
+| 1 | 官方 2.1.321 **不认** `--single-process-subagents` / `--continuous-tool-loop` | `error: unknown option`（真二进制 341,910,032 B，sha256 与包内 manifest 一致） |
+| 2 | 官方二进制里 **无** `assertNative` / `native adapter` 串 | `grep -a` 各 0 命中 |
+| 3 | 因此 spec §5.2 的「native adapter 12 API」是**旧形态**（`2.1.88-v2` / Rust core 内嵌期），现行产品不用 | 上述 1+2，且归档明文 `runtime/worker.mjs` 才用 `native.ask()` / `assertNative()` |
+| 4 | 现行架构 = **TUI 驱动 + Bun preload tap** | `kernel.json.example` 的 `"transport": "tui"` + 归档 helper/tap |
+| 5 | tap 可注入成功：`{"tap":"on","mode":"fetch_session"}` | 沙盒实测（`--print` 与 TUI 两模式均出现） |
+| 6 | tap 只拷**主对话**流：条件为请求头 `x-claude-code-request-class: main` | `linux-tui-tap.js` 的 `maybeCapture()` |
+| 7 | 出站改写生效：`max_tokens` / `output_config.effort` / `cache_control.ttl` | 沙盒实测 stub 收到 `max_tokens=777`、`effort=high`、`ttl=5m`×3 |
+| 8 | kin-os 镜像**无** `bun`/`node`，只有 `script`；官方 CLI 是动态 glibc ELF | `command -v` + `ldd` |
+| 9 | vendor **不覆盖** base_url，且 `DISABLE_TELEMETRY=1` / `DISABLE_ERROR_REPORTING=1` | `gateway/v2-runtime.mjs:74-79` |
+| 10 | 就绪判定实际靠提示符字形 `❯`（`CRAG_READY` 在官方二进制与归档 bundle 中均为 0 命中） | `isReadyScreen()` + grep |
+| 11 | **`ANTHROPIC_BASE_URL` 在 TUI 模式被采纳**（本地 stub 收到请求并回投，TUI 显示 `PONG-STUB`） | 本机实测（§4.7） |
+| 12 | **真实 UA 是 `claude-cli/2.1.321 (external, cli)`**，不是 2.1.303 | 抓包（§4.7） |
+| 13 | **`x-claude-code-request-class` 在普通 TUI 主对话里不发**（抓包为 `null`，加 `--session-id`/`--mcp-config` 也不发）；其枚举为 `main/subagent/workflow/compaction/auxiliary/side_reply`，另有配套 `x-claude-code-agent-type` | 抓包 + 二进制字符串上下文 |
+| 14 | 因此**归档 tap 的 `main` 判据不可用**；放宽为「URL 命中 + `text/event-stream`」后成功抓到 9 行（open + 6 事件 + end:done） | 本机实测（§4.7） |
+
+---
+
+## 2. 架构对照
+
+```
+官方：控制面 NDJSON → crag-v2 native（TUI 驱动）
+                        ├─ spawn 官方 CLI（PTY via `script -qefc`）
+                        ├─ preload tap 改写三旋钮 + 拷 SSE → JSONL
+                        ├─ tail CC transcript → 判 user turn 入档
+                        └─ MCP 回调（--mcp-config 注入 crag server）
+
+我们：控制面 NDJSON → cragv2-rs
+                        ├─ direct：自控 h2/TLS + CCH 打戳（旧架构，441 向量已验证）
+                        └─ slot：NDJSON 驱动 CLI（旧 cli-node 风格）
+```
+
+**保留 direct 作为可选模式**（它是唯一可离线差分验证的形态）；新增 `transport: "tui"` 与之并存。
+
+---
+
+## 3. G-A：`kernel.json` 27 键对齐
+
+来源：出厂包 `kernel.json.example`。我们当前 `config.rs::KernelConfig` 只认 13 键。
+
+| 键 | 官方默认 | 我们 | 动作 |
+| :--- | :--- | :--- | :--- |
+| `vm_id` | `"crag-native"` | 未读 | 读入（诊断/日志） |
+| `socket_path` | `/run/kin/kernel.sock` | ✅ | — |
+| `internal_token` | `""` | 仅读 `token_path` 文件 | 增加：config 内直接给 token（文件优先） |
+| `claude_bin` | `""` | ❌ 读的是 `cli_bin` | **改读 `claude_bin`**（保留 `cli_bin` 兼容） |
+| `work_dir` | `/home/kincli` | 未读 | 读入（TUI cwd） |
+| `config_dir` | `/home/kincli/.claude` | 未读 | 读入（transcript 根） |
+| `credential_path` | `/home/kincli/.claude/credentials.json` | ✅ | — |
+| `asset_dir` | `/home/kincli/.claude/crag-native-assets` | 未读 | 读入 |
+| `license_dir` | `/run/kin/crag-license` | 未读 | 读入（纵深校验，见 §7） |
+| `transport` | `"tui"` | 未读 | **新增**：`tui` \| 我们的 `direct`/`slot` |
+| `delivery_mode` | `"realtime"` | 未读 | 读入（`realtime` \| `verified`） |
+| `slots_per_worker` | `20` | ✅ | — |
+| `session_slots` | `20` | 未读 | 读入（并发会话上限） |
+| `prewarm_enabled` | `false` | 未读 | 读入（预热一个 TUI 进程） |
+| `max_queue` | `40` | 未读 | 读入（排队上限） |
+| `request_timeout_seconds` | `0` | 未读 | 读入（0=不限） |
+| `first_byte_timeout_seconds` | `600` | 未读 | 读入 |
+| `idle_timeout_seconds` | `300` | 未读 | 读入 |
+| `session_idle_ttl_seconds` | `600` | 未读 | 读入 |
+| `tool_timeout_seconds` | `300` | 未读 | 读入（MCP 回调超时） |
+| `queue_timeout_seconds` | `30` | 未读 | 读入 |
+| `max_request_bytes` | `33554432` | 固定 16 MiB | 读入 |
+| `max_response_bytes` | `67108864` | 固定 64 MiB | 读入 |
+| `max_event_bytes` | `65536` | 读入（现为常量） | 读入 |
+| `default_model` | `""` | 未读 | 读入 |
+| `default_cache_ttl` | `"1h"` | 未读 | 读入（喂 tap 的 `CRAG_TUI_CACHE_TTL`） |
+| `thinking_display` | `"summarized"` | 未读 | 读入 |
+| `model_effort` | `{}` | 未读 | 读入（喂 `CRAG_TUI_EFFORT`） |
+| `persona_preset` | `"official_full"` | 未读 | 读入（决定 `cli_version`，见下） |
+| `system_layout` | `"identity"` | 只读 env | **改为 config 优先、env 兜底** |
+| `cch_enabled` | `true` | 未读（恒打 CCH） | 读入：false 时不打戳 |
+| `cc_entrypoint` | `"cli"` | 未读 | **no-op**（官方注明 `_compatibility_only`） |
+| `auto_compact_window` | `null` | 未读 | **no-op**（同上） |
+| `proxy_url` / `proxy_required` | `""` / false | ✅ | — |
+| `telemetry` | `null` | 未读 | 见 §7 |
+
+`cli_version` 虽不在 example 里，但控制面 `rust-kernel-supervisor.mjs` 恒下发（`profileForPreset(...).cliVersion`，当前 `OFFICIAL_PROFILES` 只有 `2.1.303`/`2.1.296`）→ **必须读入**，用于 UA 与 `cc_version`。
+
+---
+
+## 4. G-B1：TUI 传输（`transport: "tui"`）
+
+### 4.1 spawn
+
+```
+script -qefc "exec <claude_bin> --mcp-config <tempDir>/mcp.json --session-id <uuid>
+             [--model <model>] [--system-prompt|--append-system-prompt <text>]" /dev/null
+```
+
+- 不需要 PTY 库：`script` 自建 PTY；Rust 侧 `std::process::Command` 即可。
+- `stdio = pipe/pipe/pipe`，`detached = true`，`cwd = work_dir`。
+
+### 4.2 子进程环境（相对 `process.env`）
+
+| 变量 | 值 |
+| :--- | :--- |
+| `CRAG_TUI_TAP` | 每次运行新建的空文件，`0600`，位于 `tempDir` |
+| `BUN_OPTIONS` | 追加 `--preload=<tap.js 落地路径>`（幂等：已有的同名 preload 先剔除） |
+| `CRAG_TUI_MAX_TOKENS` / `CRAG_TUI_EFFORT` / `CRAG_TUI_CACHE_TTL` | 来自本次请求；**缺省不设** |
+| `CRAG_V2_RUN_ID` | 运行标识 |
+| `DISABLE_TELEMETRY` / `DISABLE_ERROR_REPORTING` | `1` / `1`（禁官方 CLI 自己外联上报） |
+| `CLAUDE_CONFIG_DIR` | = `config_dir`（transcript 根据此计算） |
+
+### 4.3 双 tail
+
+| 源 | 路径 | 轮询 | 数据 |
+| :--- | :--- | ---: | :--- |
+| transcript | `<config_dir>/projects/<sanitizePath(cwd)>/<sessionId>.jsonl` | 40 ms | 判 `row.type === "user"` 且 `sequence > 提交前序号` → 提交成功 |
+| tap | `<tempDir>/tap.jsonl` | 40 ms | `{s,open:true}` / `{s,e:<anthropic event>}` / `{s,end:"done"\|"cut"}` |
+
+`sanitizePath(v)` = 非 `[A-Za-z0-9]` 全替换为 `-`；长度 >200 时追加 `-<sha256[:12]>`。实测 `cwd=/lab` → 目录名 `-lab`。
+
+> **tap 的触发条件（实测修正）**：不要用 `x-claude-code-request-class === "main"`（官方 2.1.321 在 TUI 主对话根本不发这个头）。
+> 正确判据：`/\/v1\/messages(?:\?|$)/.test(url)` **且** 响应 `content-type` 以 `text/event-stream` 开头，然后 `response.body.tee()`。
+> 每个 TUI 进程只服务一轮主对话，取**首个**匹配请求即主对话，无需额外分类。
+
+### 4.4 提交（`send`）
+
+1. `materializePieces(content, tempDir)`：超长正文/附件落临时文件（`{path}`），短文本走 `{text}`；
+2. 每片：`writeRaw("\x1b[200~" + pasteable(片) + "\x1b[201~")`（**bracketed paste**），随后 `sleep(40ms)`；
+3. `writeRaw("\r")`；
+4. 等 transcript 出现新的 `type === "user"` 行（超时=就绪超时）→ 视为已提交；
+5. 结束后删除临时片。
+
+`pasteable(v)`：`\r\n?`→`\n`，剥离控制字符（保留 `\n\t`），若以 `/ * ! # &` 开头则前置一个 `\n`，空串回 `.`。
+
+### 4.5 就绪 / 拒绝判定
+
+- 就绪：屏幕含 `CRAG_READY`（官方无此串，留作兼容）**或** 匹配 `/(?:^|\n)\s*[❯›][ \t]?[^\n]*$/m`；就绪后再等一个候选窗口（避免输入框未就绪）。
+- 交互式拒绝：屏幕匹配
+  `/(?:sign\s*in|log\s*in|login\s*method|select\s*login|onboarding|trust\s*this\s*folder|permission\s*required|choose\s*the\s*text\s*style)/i`
+  → 立即以 `tui_interactive_required` 失败，不继续喂输入。
+
+### 4.6 常量
+`readyTimeout=30_000 ms`、`TRANSCRIPT_POLL_MS=40`、`TAP_POLL_MS=40`、`MAX_SCREEN_BYTES=32 KiB`、屏幕按 chunk 追加并截断。
+
+### 4.7 实测记录（本机 Docker Desktop，2026-11-16）
+
+环境：`ghcr.io/dofastted/kin-os-ubuntu:24.04` + 官方 `claude` 2.1.321（341,910,032 B，sha256 与包内 manifest 一致）+ 本地假上游（回定值 SSE）。
+
+| 步骤 | 结果 |
+| :--- | :--- |
+| `script -qefc "exec claude"` + bracketed paste + `\r` | TUI 正常拿到 prompt 并回复（屏幕出现 `●PONG-STUB` / `✻done`） |
+| 就绪判定 | 屏幕出现 `❯` 提示符，`isReadyScreen` 可命中 |
+| `ANTHROPIC_BASE_URL` 指向本地 stub | stub 收到 `POST /v1/messages?beta=true`，UA `claude-cli/2.1.321 (external, cli)` |
+| `CRAG_TUI_MAX_TOKENS=256` / `CRAG_TUI_EFFORT=low` | stub 收到 `max_tokens:256`、`output_config:{effort:"low"}` |
+| tap（原始 `main` 判据） | 只有 `{"tap":"on"}`，**不触发** |
+| tap（放宽为 URL+SSE） | **9 行**：`open` + `message_start` + `content_block_start` + `content_block_delta` + `content_block_stop` + `message_delta` + `message_stop` + `end:done` |
+| transcript | `<config>/.claude/projects/-lab/<uuid>.jsonl` 内含 `{"type":"user","message":{"role":"user","content":"…"}}` |
+
+必填环境（否则卡在向导）：`.claude.json` 预置 `theme` / `hasCompletedOnboarding` / `projects[cwd].hasTrustDialogAccepted` / `hasCompletedProjectOnboarding`，且容器 `-w` 必须与 trust 的 cwd 一致；首次启动仍可能弹一次主题/安全须知，需要补两次 `\r`。
+
+---
+
+## 5. G-B2：MCP 回调通道（工具执行）
+
+### 5.1 注入
+
+`<tempDir>/mcp.json`：
+
+```json
+{ "mcpServers": { "crag": { "command": "<kernel 自身路径>",
+                            "args": ["mcp-bridge", "--config", "<tempDir>/mcp.json"] } },
+  "crag": { "callbackUrl": "http://<host>:<port>/_crag-v2/mcp/<token>" } }
+```
+
+启动参数追加 `--mcp-config <tempDir>/mcp.json`。
+
+### 5.2 回调端点
+
+`POST /_crag-v2/mcp/<token>`（token 每次运行全新 UUID）：
+- 请求：`{ id, tool, arguments }`（形状以 `mcp-bridge`/`mcp.rs` 现有的 `tools/call` 为准）；
+- kernel：`pendingCalls.set(id, record)` → 上层产生 `tool_use` → 客户端在 `/internal/v1/messages` 下一轮带 `tool_result` → kernel 用 `id` 配对并**响应回该 HTTP 请求**；
+- 超时：`tool_timeout_seconds`（默认 300 s）；超时回 MCP 错误而不挂死；
+- 槽释放/取消：清空 `pendingCalls`，未完成的调用全部以错误结束。
+
+### 5.3 现状
+
+我们有 `mcp-bridge` 子命令（stdio JSON-RPC：initialize/tools/list/tools/call/ping），**缺**：回调 HTTP 服务、token 校验、`pendingCalls` 配对、超时。
+
+---
+
+## 6. G-C：自签包
+
+| 项 | 要求 | 现状 |
+| :--- | :--- | :--- |
+| `claude-code-2.1.321/claude` | **真实官方 CLI**（341,910,032 B，sha256 `426c3381…`） | 我们的是 139 B 占位 |
+| tap 脚本 | 包内**禁止** `.js`（`verifyCragV2Tree` 有正则拦截）→ 必须**编进内核**，运行时写到 `tempDir`（0700/0600） | 未做 |
+| 打包工具 | `selfsign-package.mjs --claude-bin <path>` | ✅ 已加 |
+
+⚠️ `LICENSES.txt` 明确：官方 Claude 2.1.321 是独立可执行文件，"Packaging does not establish redistribution permission" → **仅在自有机器打包，随仓库/镜像分发不可**。
+
+---
+
+## 7. G-D：health / telemetry / identity（功能缺口，非架构缺口）
+
+| 项 | 控制面期望 | 现状 |
+| :--- | :--- | :--- |
+| `active` / `waiting` / `queued` / `pids` | `rustKernelBusy()` 判定"忙" | 未上报 → 看门狗可能误重启在飞请求 |
+| `gateway_policy_v1` | true 才允许"槽满也接受 continuation/排队" | 未上报 → 走保守分支 |
+| `/internal/v1/telemetry/apply` | 返回 `{ok, applied, enabled, scope:"native_claude_launch"}` | 404 |
+| `vm_telemetry` / `telemetry_ready` / `telemetry{}` | 三者齐备才解锁槽内 native OAuth 路径 | false/false/null |
+| `/internal/identity` | `{ok, identity:{schema_version, runtime_kind, hostname, os_pretty, arch, goos, worker_version, collected_at, hardware}}` | 404 → `worker_identity_unsupported` |
+| CLI 重启计数 `cli_restarts` / `unhealthy_reason` | 看门狗依据 | null |
+| `license_dir` 纵深校验 | 官方内核自验授权 | 我们只靠控制面准入 |
+
+---
+
+## 8. 验收矩阵
+
+| ID | 条目 | 单测 | 沙盒验证 | 期望 |
+| :--- | :--- | :--- | :--- | :--- |
+| A1 | 27 键解析 | `config_parses_vendor_example`（用 example JSON 原样喂） | 面板重启后 `kernel.json` 落盘 | 所有键回读一致，两个 no-op 不产生行为 |
+| A2 | `cli_version` 生效 | `cli_version_from_config` | 抓出站头 | `cc_version=<config>.<fp>` |
+| A3 | `cch_enabled=false` | `no_cch_when_disabled` | 抓出站头 | 无 `cch=` 字段 |
+| A4 | `system_layout` config 优先 | `layout_config_beats_env` | 面板设 identity | system 布局切换 |
+| B1 | PTY 拉起 + 就绪 | `tui_ready_on_prompt_glyph` | `run-tui.sh` | 屏幕出现 `❯` 后 ready（**已实测**） |
+| B2 | bracketed paste 提交 | `paste_frames` | 同上 | transcript 出现 user 行（**已实测**） |
+| B3 | tap 改写三旋钮 | `tui_request_overrides` | `stub-headers.mjs` 抓包 | `max_tokens/effort/ttl` 生效（**已实测**） |
+| B4 | tap 拷主对话流 | `tap_captures_first_sse` | `run-tui-any.sh` | 9 行事件流（**已实测**；条件为 URL+SSE，非 request-class） |
+| B5 | refusal 检测 | `interactive_refusal` | 用未登录 HOME 启动 | `tui_interactive_required` |
+| C1 | MCP 回调配对 | `mcp_callback_roundtrip` | 客户端发 tools + tool_result | 一次工具调用闭环 |
+| C2 | 工具超时 | `tool_timeout_errors` | 故意不回 tool_result | 300 s 后 MCP 错误 |
+| D1 | busy 字段 | `health_busy_fields` | 长请求中查面板 | `active>0`、看门狗不重启 |
+| D2 | telemetry apply | `telemetry_apply_shape` | `POST /internal/v1/telemetry/apply` | 五个字段齐全 |
+| D3 | identity | `identity_shape` | `POST /vms/:id/collect-identity` | 200 + fingerprint 增长 |
+
+---
+
+## 9. 未知项与风险
+
+| 项 | 状态 |
+| :--- | :--- |
+| `x-claude-code-request-class` 何时出现 | 已定性：枚举 `main/subagent/workflow/compaction/auxiliary/side_reply` + `x-claude-code-agent-type`；**普通 TUI 主对话不发**，故实现不依赖它 |
+| 官方内核如何把 tap 的 `e` 行拼成 Anthropic 事件流 | 可从 `gateway/v2-runtime.mjs` 的 `onTuiTap` 反推（待做） |
+| `prewarm_enabled` / `session_slots` 的真实语义 | example 有键，行为未知 |
+| `official_full` persona 的具体差异 | 仅在 `OFFICIAL_PROFILES` 中体现为 profile 名 |
+| TLS/h2 字节级一致 | **不可验证**：需官方内核 golden 流量；但 TUI 方案下由官方 CLI 自己发，天然一致 |
+| 工具执行的真实 deltas | 需真实会话 + 真实工具 |
+
+---
+
+## 12. 实现决策：走原生 CLI，不自拼请求
+
+### 12.1 vendor 只有两种 transport，都不是自拼
+
+`gateway/v2-runtime.mjs:312` 的 `transport === "tui" ? [...] : [...]` 是二选一：
+
+| transport | 形态 | 谁发上游请求 |
+| :--- | :--- | :--- |
+| `tui` | PTY 拉起 CC，tap tee SSE | 官方 CLI |
+| 非 tui | `--print --input-format stream-json --output-format stream-json` | 官方 CLI |
+
+**没有第三种。** 我们原有的 `direct`（自控 HTTP/TLS + CCH 打戳 + persona）是 vendor 不存在的形态，
+只保留为**离线差分对照**（441 向量 oracle 验证协议表），不作为产品通路。
+
+### 12.2 非 tui transport 实测（推荐先做）
+
+2.1.321 + relay 实测通过，且比 TUI 少掉 PTY / tap / transcript / bracket paste 四套机制：
+
+```
+claude --print --input-format stream-json --output-format stream-json \
+       --include-partial-messages --replay-user-messages --verbose \
+       --no-session-persistence --strict-mcp-config --mcp-config <json> \
+       --session-id <uuid> [--model <m>] [--append-system-prompt <text>]
+```
+
+`--include-partial-messages` 让 CLI 把**真实上游 SSE 事件**原样吐成 `{"type":"stream_event","event":{…}}`，
+内核只需按序透传，不解读、不改写。一次完整对话的 12 行序列（夹具 `tests/fixtures/native-stream.ndjson`）：
+
+```
+system/init → system/status → user 回显
+→ stream_event×6 (message_start, content_block_start, content_block_delta×2,
+                   content_block_stop, message_delta, message_stop)
+→ assistant (整包) → result/success (stop_reason, total_cost_usd, usage)
+```
+
+已落地：`src/native.rs`（`Args::to_vec` 参数集 / `to_sse` 转接）+ `tests/native_stream.rs`（回放夹具）。
+
+### 12.3 TUI 参数集在 2.1.321 全部可用（后续要做时不必重查）
+
+`--session-id` `--strict-mcp-config` `--mcp-config` `--permission-mode` `--bare`
+`--tools ""`（禁全部内建工具，工具全走 MCP）`--no-chrome` `--append-system-prompt`
+`--system-prompt` `--no-session-persistence` `--replay-user-messages` 均存在。
+
+### 12.4 第三方中转的客户端门禁实测（用于判定指纹质量）
+
+对 `packyapi` 的「仅允许 Claude Code」分组做了消融（每次 1 个 haiku 请求）：
+
+| 变体 | 结果 |
+| :--- | :--- |
+| 裸 curl（无 CC 特征） | **403** `only accessible via the official Claude CLI` |
+| 只补 UA `claude-cli/2.1.321 (external, cli)` | 过层 1 |
+| `metadata.user_id` 缺失 | **400** `please use the correct Claude Code client` |
+| `metadata.user_id = "x"`（结构非法） | **400** |
+| `metadata.user_id` 结构合规（device_id 32 hex 或 64 hex、随机） | **200** |
+| 删全部 `x-stainless-*` | **200** |
+| 删 `x-app` / 删 `anthropic-beta` / 删 `tools` | **200** |
+| UA 改 `2.1.303` | **200** |
+
+结论：门只验「UA 形如 `claude-cli/*`」+「`metadata.user_id` 是 `{device_id,account_uuid,session_id}`
+的 JSON 字符串」；**不验真实身份、不校验版本号、不要求 stainless 头**。
+这也反向证明：走原生 CLI 时这些都天然满足，自拼才有风险。
+
+direct 回退路径已补 `wire::stamp_metadata`（原 `Identity::user_id()` 是死代码）。
+
+---
+
+## 附：沙盒复现脚本（192.168.1.109）
+
+```sh
+# 沙盒（192.168.1.109，无出网到 packyapi，仅能对本地 stub 验证）
+/root/lab-crag/extract-vendor-cc.sh      # 取官方 CC 2.1.321 + 对 manifest 校 sha256
+/root/lab-crag/probe-native-adapter.sh   # 证明 12-API/--single-process-* 不属于现行 CLI
+/root/lab-crag/verify-tap.sh             # tap 注入 + 三旋钮改写（--print 模式）
+
+# 本机（Docker Desktop，可出网到真实上游）
+D:/vm2api-lab/run-tui.sh                 # TUI + 真实上游（packyapi）跑通一轮对话
+D:/vm2api-lab/run-tui-args.sh            # 加 --session-id/--mcp-config 抓真实请求头
+D:/vm2api-lab/run-tui-any.sh             # tap 放宽判据 → 抓到主对话 9 行事件流
+D:/vm2api-lab/stub-headers.mjs           # 记录请求头与出站 body（验证 overrides）
+```
+
+### 12.5 已实现：进程层 + 端到端验证
+
+`kernel.json` 的 `transport` 复用 `upstream_mode` 键：`direct`（默认，内核自拼，仅离线差分）/ `native`（官方 CLI 发包）。
+
+```json
+{ "cli_bin": "/path/to/claude", "upstream_mode": "native", "upstream_base": "https://api.anthropic.com" }
+```
+
+内核行为（`src/native.rs` + `gateway::forward_native`）：
+
+1. 取 `messages` 里**最后一轮 user content**（会话由 CLI 自己维护，内核不重放历史）；
+2. `body.system` 拍平成 `--append-system-prompt`，`body.model` → `--model`；
+3. spawn `cli_bin`，写一帧 `{"type":"user","session_id":…,"message":{…}}` 后关 stdin；
+4. 逐行读 stdout：`stream_event` → 原样写成 SSE；`result` → 终止；`system`/`user`/`assistant` 不外发；
+5. 流式收尾补 `message_stop`；非流式回整包 `assistant.message`；失败回 `error` 事件或 502；
+6. `HOP_TIMEOUT`（180 s）兜底，`kill_on_drop` 保证子进程不泄漏，stderr 脱敏后仅用于诊断。
+
+端到端实测（容器内 `ghcr.io/dofastted/kin-os-ubuntu:24.04` + 官方 CC 2.1.321 + 第三方中转 + haiku 5.5）：
+
+```
+POST /internal/v1/messages → 200 text/event-stream
+event: message_start
+event: content_block_start
+event: content_block_delta   data: {"delta":{"text":"PONG","type":"text_delta"},…}
+event: content_block_stop
+event: message_delta
+event: message_stop
+```
+
+非流式（`stream:false`）→ `200 application/json` + `x-terminal-state: verified`；
+`/internal/health` → `hop_mode:"native"`。
+
+### 12.6 会话池（一进程多轮）
+
+实测地基：`--print --input-format stream-json` 下**连写两帧、同一 stdin，CLI 各产出一轮
+`result`**（每轮还会重发一次 `system/init`）。因此跨 hop 不需要重放历史 —— CLI 自己持有会话。
+
+| 机制 | 实现 |
+| :--- | :--- |
+| 池键 | `headers["x-claude-code-session-id"]` → `body.metadata.user_id.session_id` → `envelope.request_id`（依次降级；末级等于不复用） |
+| 复用 | 同键复用 live 进程，只写本轮那一帧 user 消息 |
+| 轮次隔离 | 每 hop 一个 `mpsc`；reader 任务按 `result` 收尾并清空当前轮次，之后的帧无人认领 |
+| 空闲回收 | 每次取会话时惰性清理：进程已死或 `last_used > 300 s` 即摘除 |
+| 打断 | `/internal/v1/cancel` → 按同一键杀进程并摘除 |
+| 健康 | `cli_pid` 取池内首个 live pid；`hop_mode:"native"` |
+
+失败诊断：本轮一个事件都没收到时，回投该会话的 stderr（脱敏、8 KiB 上限）。
+
+### 12.7 工具回环（已实现并实测）
+
+链路：CC 发起 MCP 调用 → 本进程的 `mcp-bridge` 子命令 → 内核自建回调 HTTP
+（`127.0.0.1:<port>/_crag-v2/mcp/<session>`）→ park → 合成 `tool_use` 回投控制面 →
+控制面执行后用**同一端点**带 `tool_result` 续跳 → 内核解开 park → CLI 继续。
+
+| 环节 | 实现要点 |
+| :--- | :--- |
+| 工具暴露 | 请求体 `tools` → MCP 定义（`input_schema`→`inputSchema`），写进每会话的 `mcp.json` |
+| CLI 参数 | `--strict-mcp-config --mcp-config <json> --tools "" --allowedTools mcp__crag --no-chrome` |
+| 权限坑 | 不加 `--allowedTools` 会得到 `system/permission_denied`，回调根本不发（实测） |
+| park | 调用 id 用 `crag_tool_<uuid>`（与 vendor 同形），300 s 超时回 504 |
+| 合成事件 | 标准 Anthropic SSE：`message_start` → `content_block_start(tool_use)` → `input_json_delta` → `content_block_stop` → `message_delta(stop_reason=tool_use)` → `message_stop` |
+| 续跳判定 | body 最后一条 user 消息里全是 `tool_result` 块；解不开则回 410 `unknown tool_result` |
+| 去重 | CC 自己的 `mcp__crag__*` 工具块连同其 delta/stop 一律不外发，控制面只见 `crag_tool_*` |
+
+端到端实测（容器内 + 官方 CC 2.1.321 + 真实上游 haiku）：
+
+```text
+hop1  200 | 12 events | tool_use: crag_tool_d1b10b68… name=get_time
+hop2  200 | 13 events | text: "The get_time tool returned exactly: TIME=2026-11-16T09:00:00Z"
+```
+
+面板侧**不需要改动**：vm2api 是纯转发（`src/lib/transport/*` 不构造任何 `tool_result`），
+工具由终端用户自己的 Claude Code 执行，`crag_tool_<uuid>` 对它只是不透明 id
+（`crs-persona.mjs` 里的 `toolResultOnlyMessage` 只用于计费索引，与路由无关）。
+
+仍未做：`is_error` 的端到端验证；续跳历史指纹校验（vendor 有 `continuationFingerprint`，
+我们只按 id 精确匹配）；面板 → 槽位 → 真实推理的整链回归。
+
+### 12.8 沙盒整链回归（1.109，新内核换入）
+
+把带 `native` 通路与工具回环的内核重新打进自签包，换到沙盒槽位 `vm-crag-01`：
+
+```sh
+# 1) 重打包（复用同一对权威密钥 → pem/key_id/public_key 不变，许可无需重签）
+node cragv2/tools/selfsign-package.mjs --bin /root/lab-crag/bin/crag-v2.next \
+  --arch amd64 --out /opt/docker/lab/pkg-next --keys /root/lab-crag/keys.json \
+  --claude-dir claude-code-2.1.321 --claude-bin /opt/docker/lab/vendor-cc/claude \
+  --vm-id vm-crag-01 --term 1m
+# 2) 覆盖 share 与槽位副本（4 个内核文件 + claude 目录）
+# 3) docker restart kin-crag-01
+```
+
+结果（面板 API 实测）：
+
+| 检查 | 结果 |
+| :--- | :--- |
+| share 包 `verifyCragV2Tree` | `ok:true`；`public_key_id 4997f00f…`、pem `e1668885…`（与换包前一致） |
+| 槽位 license | `status:"valid"`、`license_id 0bc9ef70…`、到期 2026-12-16 |
+| 槽位健康 | `engine:"rust"`、`resolved:"rust"`、`reachable:true`、`version:"2.1.303"`、`healthy:true` |
+| 面板请求 | 认证通过后停在 `503 pool_unavailable`（号池无账号），未触达槽位 |
+
+**换包两个必踩的坑**（都会让面板把许可判成 `license_unconfigured`）：
+
+1. `manifest.sha256` 覆盖 **全部** 文件，包括 `claude-code-<ver>/claude`。只覆盖 4 个内核文件会得到
+   `crag_v2_hash_mismatch: claude-code-2.1.321/claude`（槽位里那枚旧的还是占位 ELF `f88f22ee…`，
+   而 manifest 期望真实 CC `426c3381…`）。
+2. 包内可执行文件必须 `chmod 755`，否则 `verifyCragV2Tree` 报 `crag_v2_elf_invalid:
+   CRAG v2 executable permission is missing`。
+
+**真实推理整链未能跑通的原因**（环境限制，非实现缺陷）：
+
+- 面板号池为空 → `pool_unavailable`，请求在面板层就被挡回；
+- 1.109 出网分裂：`baidu 200` 但 `cloudflare/packyapi 000`（DNS 被污染成 `2a03:2880:…face:b00c…`，
+  用 DoH 拿到真实 A 记录 `104.18.24.163` 后 `--resolve` 依然不通），CF 前置的中转无法抵达。
+
+因此"面板 → 槽位 → native → 真实上游"这一段只能在有干净出网的机器上补；
+内核侧的等价链路（socket → 内核 → 官方 CLI → 真实上游 → SSE 回投，含工具回环）已在开发机容器内实测通过。
+
+### 12.9 追平上游 + 隐匿性约束（对齐上游 issue 的四个补丁）
+
+上游 issue 里与原生内核直接相关的故障，按「我们是否中招」判定后补了四项。
+**所有改动只有两种归宿：本机文件、或对控制面（本地 socket）可见。没有一项让出站请求多带一个字节。**
+
+| 补丁 | 对应上游 issue | 做法 | 出站影响 |
+| :--- | :--- | :--- | :--- |
+| 服务器工具不映射进 MCP | #1088（web_search 被 400 拒） | `mcp_tools()` 只保留带 `input_schema` 的客户端工具；`skipped_server_tools()` 供本地诊断 | 无（`--tools ""` 与 `--allowedTools` 都是本地 CLI 参数） |
+| park 超时摘除 | #1031（超时后 409 死锁） | 回调 504 前 `pool.forget(id)`，杜绝泄漏与「后到续跳解开无人等的调用」 | 无 |
+| tool id 带会话标签 | #1114 / #1035（续跳派到别的槽） | id 形如 `crag_tool_<会话FNV32>_<uuid>`；续跳标签不符回 **409 session mismatch**（而非笼统 410） | 无（id 只在我们与控制面之间流转） |
+| 本地观测产物 | #1119（上游靠 `provider-result.json` 定位） | 每跳一行 `/tmp/crag-obs/<会话标签>.jsonl`，仅 `at/continuation/streaming/events_last/parked/failure` | 无（只写本机；单测断言不含请求正文） |
+
+另外两项**性能**对齐：
+
+- 会话空闲回收从硬编码 300 s 改为跟随 `kernel.json` 的 `session_idle_ttl_seconds`（面板默认 600）。
+  原来比面板短，会在面板仍认为会话活着时杀掉 CLI，续跳直接 410。
+- `DISABLE_TELEMETRY=1` / `DISABLE_ERROR_REPORTING=1` 注入子进程环境（vendor 同样设置）。
+  这两项只有 0/1 两种取值，不构成新指纹，但少发两类出站请求。
+
+#### 隐匿性不变量（代码里必须一直成立）
+
+1. **native 通路不构造请求体**：`metadata`、`anthropic-beta`、`CCH`、UA 全由官方 CLI 自己产生；
+   内核侧唯一碰过的字段是 `system`（拍平成 `--append-system-prompt`）与 `model`（`--model`）。
+2. **不新增任何上游可见字段/头**：`suppress_mcp_tool_use` 只做**减少**（丢掉 CC 自己的 `mcp__crag__*` 块）。
+3. **观测产物不外出**：`crag-obs/*.jsonl` 与 stderr 诊断都只落本机。
+4. **不落会话文件**：`--no-session-persistence` 保持开启，槽内不留 transcript。
+5. 服务器工具不代执行、不伪造结果（宁可让客户端看到工具不可用，也不替上游编答案）。
+
+#### 仍然存在的上游问题（我们只能缓解、无法根治）
+
+- **#1114 / #1035 的根因在面板路由**：`pending` 表在进程内，面板若把续跳派到另一个槽，
+  那个槽只能回 409。要根治必须面板侧做会话粘槽，或把 pending 落到共享存储。
+- **#1080 资源**：我们每会话一个真实 CC 子进程（341 MB 二进制），比上游的进程内多会话更吃内存与 pid；
+  槽的 `mem_limit`/`pids_limit` 必须相应放大，否则先被杀的就是它。
+
+#### 12.9.1 补丁后的实测（容器内官方 CC 2.1.321 + 真实上游 haiku）
+
+```text
+启动      : native session idle ttl: 600s   ← 跟面板 session_idle_ttl_seconds 对齐
+warm hop  : 200 OK
+外来 tool id : 409 Unknown   ← 会话标签不符（上游 #1114 的可检测形态）
+工具回环 hop1: 9 events, tool_use = crag_tool_0e2506ea_0523…（带会话标签）
+工具回环 hop2: 11 events, text 含注入的 TIME=2026-11-16T09:00:00Z
+观测产物   : /tmp/crag-obs/0e2506ea.jsonl
+             {"at":…,"continuation":false,"streaming":true,"events_last":"message_stop","parked":true,"failure":null}
+             {"at":…,"continuation":true,…}          ← 两跳两行，无正文
+```
+
+### 12.10 能力对齐批次（按面板契约补齐）
+
+面板控制面实际会调的端点（`grep /internal/ src/lib`）：`health` `messages` `cancel` `identity` `oauth/usage` `models` `forward` `v1/codex/responses`。
+
+| 能力 | 补法 | 上游可见影响 |
+| :--- | :--- | :--- |
+| `/internal/identity` | 回本地身份（`runtime_kind/dataplane/worker_version/hop_mode/device_id 前 16 位/sessions`） | 无（只回控制面） |
+| `/internal/oauth/usage` | **501 `usage_unsupported_native`**：native 下凭据属于槽内 CLI，内核不额外查询额度 | 无（刻意不产生出站请求） |
+| `/internal/forward` | **501 `forward_unsupported`** | 无 |
+| `/internal/v1/codex/*` | **404 `codex_unsupported`** | 无 |
+| `/internal/v1/telemetry/{events,apply}` | 接收、只回 `{ok:true}`，**不转发** | 无 |
+| health 字段 | 补 `provider/cli_pid/pids/active/waiting/queued/cli_restarts/telemetry_ready/telemetry/vm_telemetry` | 无 |
+| SSE 保活 | 每 15 s 无事件即写 `event: ping`（对应上游 #997） | 无 |
+| 错误码细分 | `cli_spawn_failed` / `cli_hop_timeout` / `cli_unavailable` / `upstream_error`（上游 #1041 的本地版） | 无 |
+| 续跳形状指纹 | `history_fingerprint`：只哈希 role + 块类型 + `tool_use` id，**不哈希正文**；不符回 400 `tool_result history mismatch` | 无（摘要只在本机内存） |
+| 池容量 | `session_slots`（默认 20）触发 LRU 摘除；`tool_timeout_seconds`（默认 300）用于 park 上限 | 无 |
+| 配置键 | 补读 `claude_bin/cli_version/session_slots/session_idle_ttl_seconds/tool_timeout_seconds/provider/system_layout/cch_enabled/license_dir` 等 | 无 |
+
+比上游更保守的一处：上游 `continuationFingerprint` 用**全文**哈希，客户端等价改写就会误拒；
+我们只比形状，既能抓到"续跳派错槽/历史被改"，又不会因文案差异翻车。
+
+#### 12.10.1 实测（容器内 + 真实上游 haiku）
+
+```text
+启动          : native pool: idle=600s max_sessions=20 tool_timeout=300s
+health        : hop_mode=native provider=local_cli active=0 waiting=0 pids=[] cli_restarts=0 telemetry_ready=false
+health(有会话): active=1 pids=[27] cli_pid=27
+identity      : 200 {"runtime_kind":"docker","dataplane":"crag","hop_mode":"native","device_id":"8174481b…"}
+oauth/usage   : 501 usage_unsupported_native
+forward       : 501 forward_unsupported
+codex         : 404 codex_unsupported
+工具跳        : 200 callId=crag_tool_12a18df9_36c2…
+篡改历史形状  : 400 history mismatch   ← 指纹生效
+正确续跳      : 200 "The current time is 10:00:00 UTC on November 16, 2026."
+```
+
+### 12.11 策略修订：以"与官方同形"为准，而不是"少发特征"
+
+**结论修正**：此前把 `DISABLE_TELEMETRY`、拒绝 TUI 当作隐匿收益，方向错了。
+判据换成一句话 —— **只发官方本来就会发的特征，不发官方不会发的特征**。
+在合规地区，官方特征本身是"正常用户"，缺失它们才是异常。
+
+据此三处改动：
+
+| 项 | 旧做法 | 新做法 | 理由 |
+| :--- | :--- | :--- | :--- |
+| 子进程遥测 | `DISABLE_TELEMETRY=1` / `DISABLE_ERROR_REPORTING=1` | **不设置** | 官方安装默认上报；关掉才是异常（vendor 关了，属于它的选择） |
+| TUI 通路 | 判定为"负收益"，不做 | **实现** | `cc_entrypoint=cli` + 完整 `safeguards` 才是真实交互式会话的形态 |
+| 额度探测 | 501 不支持 | **实现**（见 §12.12） | 官方 CLI 自己就会调 `/api/oauth/usage`，同形调用不构成新特征 |
+
+#### TUI 通路实现要点
+
+| 环节 | 做法 |
+| :--- | :--- |
+| 启动 | `script -qefc "exec '<cli>' <args>" /dev/null`（PTY），`stdin` 可写 |
+| 参数 | `--session-id <会话键> --permission-mode default --no-chrome [--model] [--append-system-prompt]` |
+| tap 注入 | `BUN_OPTIONS=--preload=<temp>/tap.js` + `CRAG_TUI_TAP=<temp>/tap.jsonl` |
+| tap 钩子 | **必须替换 `Bun.FetchSession` 类**（官方 CLI 用 FetchSession，不走全局 `fetch`）；用 `Object.defineProperty(response,"body")` 换成本身的 tee 分支，**不能新建 Response** |
+| 就绪 | 屏幕出现 `❯`/`›` 再静默 500 ms；出现主题向导/信任弹窗直接失败（不猜着敲） |
+| 提交 | bracketed paste `\x1b[200~…\x1b[201~` + 40 ms + `\r` |
+| 回投 | 只转 `{s,e}` 行（上游真实 SSE），`{s,end:"done"}` 收尾；`ping` 丢弃 |
+
+实测（内核级，对本地 stub 零成本）：注入后 tap 报 `{"tap":"on","mode":"fetch_session"}`，
+CLI 侧 `Bun.FetchSession` 被成功替换。此前的失败版本用全局 `fetch` 钩子 —— tap 已 armed
+但抓不到任何事件，正是"官方走 FetchSession"的直接证据。
+
+#### 12.11.1 TUI 通路实测（内核级，对本地 stub 零成本）
+
+```text
+一跳  : 200 OK
+events: message_start → content_block_start → content_block_delta →
+        content_block_stop → message_delta → message_stop
+text  : "PONG-STUB"
+二跳(同会话复用 PTY 进程): 200 OK，事件序列相同
+出站请求: /v1/messages?beta=true   cc_entrypoint=cli     ← 与真实安装同形
+tap    : {"tap":"on","mode":"fetch_session"} → {"s":1,"open":true} → 事件…
+```
+
+实现中踩到并固化的四条硬约束：
+
+1. **tap 必须替换 `Bun.FetchSession` 类**。只钩 `globalThis.fetch` 时 tap 会 armed 但零事件
+   —— 官方 CLI 不经过全局 fetch。改 body 也只能用 `Object.defineProperty(response,"body")`，
+   新建 `Response` 会改变语义。
+2. **每 CLI 进程一个全新 `--session-id`**。复用旧 id 会 `Error: Session ID … is already in use`
+   直接退出；而就绪检测可能已在 splash 里匹配到 `❯`，于是把 prompt 粘进一个将死的进程。
+   现在额外加了致命屏幕识别（`already in use` / `command not found`）与"尾部出现 Error 就不认提示符"。
+3. **粘贴与回车之间需要 1000 ms**，并在 250 ms 后补一次回车。40 ms 时文本能进输入框但回车被吞。
+4. **TUI 模式不再起槽位 CLI**（旧参数 `--single-process-subagents` 在 2.1.321 不存在）。
+
+已知副作用：官方 CLI 会**自动升级**（实测把 2.1.325 装进 `$HOME/.local/share/claude/versions/`）。
+这是真实安装的正常行为，但它会让"基线版本"漂移；需要固定版本时应显式指定 `cli_bin`。
+
+#### 12.11.2 工具暴露方式：现代 CC 用「延迟工具 + ToolSearch」
+
+`--tools ""` 既不必要也不安全，实测结论如下（本地 stub，零上游成本）：
+
+| 配置 | MCP bridge 是否启动 | 请求里的 `tools` |
+| :--- | :--- | :--- |
+| `--tools ""`（+`--allowedTools`） | ✅ | **只剩 MCP 工具** → 中转判 403「客户端异常」 |
+| 无 `--tools ""`（任意 `--strict-mcp-config`/`--allowedTools`/显式 `type:stdio`/项目级 `.mcp.json` 组合） | print 模式 **❌ 不启动**；TUI 模式 **✅ 启动** | 12 个内建 + `DeferredToolPlaceholder` |
+
+2.1.321 起，MCP 工具**不再预先声明**，而是通过内建 `ToolSearch` 工具按需检索
+（`tools` 里能看到 `ToolSearch` 和 `DeferredToolPlaceholder`）。
+因此正确做法是：
+
+- **保留内建工具表**（官方形状，不会被风控判异常）；
+- 照常挂 `--mcp-config`，让 bridge 起来；
+- 由模型在需要时用 `ToolSearch` 找到 `mcp__crag__*` 再调用 —— 之后仍走我们的 park/续跳。
+
+`--tools ""` 只在"强制 MCP-only"的旧语义下有意义，代价是空工具表这个显眼的异常特征。
+
+### 12.11.3 tap 必须放过未改写的请求
+
+实测（2.1.321 + Bun 编译版 CLI）：tap 里即使没有任何覆盖（`CRAG_TUI_MAX_TOKENS=0` /
+`EFFORT=""` / `TTL=""`），只要把 `init` 或 `Request` 摊平成普通对象
+（`{...init, body}`）传给 `super.fetch`，底层就会发出畸形请求，中转直接回 **429**
+（CC 侧表现为 `Retrying in N` 倒计时，最终 `Unable to connect to API`）。
+
+规则：**改写前后字节相同就原样放行**（`if (body === init.body) return [input, init]`）。
+`tee()` + `defineProperty(response,"body")` 本身没有问题（厂商 tap 同样做法），
+出问题的只有请求侧的对象替换。
+
+### 12.11.4 musl 产物必须用独立 target 目录
+
+Windows 宿主跑 `cargo build --release`（glibc）与容器内 musl 构建**共用 `target/`** 时，
+两套对象文件会混进同一次链接：产物能生成，但一启动就 **SIGSEGV**
+（实测 `--version` 即崩，`cargo test` 却是全绿）。
+
+构建脚本：`tools/build-musl.sh`（强制 `CARGO_TARGET_DIR=/src/target-musl`）。
+验证：新二进制必须能跑 `--version` 输出 `2.1.321 (CRAG v2 native kernel; rust)`。
+
+### 12.11.5 tap 用 TransformStream 直通，不用 tee
+
+`response.body.tee()` 会把响应体分流：CC 侧读到的是分流后的分支，实测在网络抖动
+时会看到不完整的流并重试。改为 `body.pipeThrough(new TransformStream(...))` ——
+单读一遍、原样下发，观察在 `transform` 里做（零改动、零复制）。
+
+`prepare()` 同样只在真的改写时才替换请求对象：字节没变就 `return [input, init]`。
+
+## 12.12 构建产物形态（实测）
+
+- **glibc** 产物在 `ghcr.io/dofastted/kin-os-ubuntu:24.04` 里正常，作为槽位内核直接可用。
+- **musl 静态**产物当前会启动即 SIGSEGV（`--version` 也崩），与 `target/` 混用无关
+  （独立 `CARGO_TARGET_DIR` 重建后依旧）。要在 alpine 用 musl，需先单独复查这条链路。
+
+### 12.11.6 构建陷阱：宿主 `cargo build --release` 产出的是 .exe
+
+Windows 宿主上 `cargo build --release` 生成 `target/release/crag-v2.exe`（PE），
+而仓库里那个没有后缀的 `target/release/crag-v2` 是**上次容器构建留下的旧 Linux 文件**，
+`cargo` 不会覆盖它。把旧文件拷进容器 → 改的代码根本没生效（本次排查因此空转一小时）。
+
+规则：
+- 要跑容器，只能用 `tools/build-musl.sh`（或等价 Docker 构建），产物是
+  `target-lin/release/crag-v2`；
+- 部署前用 `--version` 自证：必须打印 `2.1.321 (CRAG v2 native kernel; rust)`；
+- 判断"改没生效"先看 `ls -la target/release/crag-v2{,.exe}` 的 mtime 与后缀。
+
+### 12.11.7 TUI 通路可用（transcript 观察，零干扰）
+
+关掉 tap 预加载、改由 transcript 观察后，端到端跑通：
+
+```
+本地 stub：200 OK  message_start→…→message_stop  text="PONG-STUB"
+真实中转（cf.api.fan + claude-sonnet-5-5）：
+  200 OK  完整 SSE  text="HTTP cache headers (like Cache-Control, ETag, and Vary) …"
+```
+
+同会话多跳（2026-11-17 最终验证，真实中转 cf.api.fan + claude-sonnet-5-5）：
+
+```
+hop1 「My secret word is ORANGE. Remember it.」  200 OK  5.4s   "That's already saved…"
+hop2 「What was my secret word? Reply with one word.」 200 OK 10.7s  "ORANGE"
+```
+
+第二跳曾长期失败，根因是三个同源 bug（都已修）：
+1. tap 关掉后 pump 读不到行，每轮等满 `HOP_TIMEOUT`(180s) 才释放 `busy` → 第二跳 502；
+   改为按 transcript「stop_reason 已定的 assistant 行数增加」判定回合结束。
+2. 回合结束判定用**本轮新 uuid** 拼 transcript 路径，而复用进程时会话 id 不变 → 永远等不到；
+   改为 spawn 时算好存进 `Live`。
+3. 兜底读取同样用了新 uuid → 第二跳必然 30s 后 `tui_no_output`；
+   改为由 `TuiPool::transcript_for(key)` 暴露进程自己的路径。
+另外：兜底遇到 `stop_reason=tool_use` 的行必须**跳过**（工具轮次不是最终回答），
+早先直接 `return None` 会让整轮误报成无输出。
+
+结论：`--preload` tap 完全不是必需的；transcript 通道对 CC 零改动，
+更符合"只发官方会发的东西"的隐匿性要求。工具回合仍待实现（见 §12.11.2）。
+
+### 12.11.8 musl 产物不稳定 → 用 glibc 产物（已验证可跑）
+
+同一份源码用 `rust:1-alpine`（musl 静态）构建，产物时好时坏：
+`4797632` 能跑、`4805824` 启动即 SIGSEGV，且与 target 目录隔离无关。
+槽位镜像本身就是 Ubuntu，直接用 `rust:1`（glibc）构建的产物，行为稳定：
+
+    docker run --rm -v $PWD:/src -w /src -e CARGO_TARGET_DIR=/src/target-gnu \
+      rust:1 sh -c 'cargo build --release && cp target-gnu/release/crag-v2 target/crag-v2-linux'
+
+部署前必须 `--version` 自证能启动。
+
+实测结论（2026-11-17）：
+- `rust:1`（Debian）产物是**动态链接** glibc，在 `kin-os-ubuntu:24.04` 里正常
+  （`--version` → `2.1.321 (CRAG v2 native kernel; rust)`）；
+- `rust:1-alpine` musl 静态产物在同一镜像里**启动即 SIGSEGV**，且同一份源码时而能跑时而不能，
+  不可用于交付；
+- `file` 一眼分辨：`static-pie linked` = musl（不要），`dynamically linked` = 可交付。
+
+### 12.11.9 TUI 工具回合：桥能调到，但 park 不成立
+
+真实中转实测（`tools/lab/tool-loop.mjs`）结论：CC **确实**走了桥——
+
+```
+assistant stop=tool_use  types: tool_use:ToolSearch
+assistant stop=tool_use  types: tool_use:mcp__crag__get_time
+```
+
+但 transcript 里**没有对应的 tool_result**，说明桥的响应没有回来。原因：
+`Pool::park(key, …)` 走的是 `sessions.get_mut(key)`，而 TUI 模式从不创建 native 会话，
+键（这里是 FNV32 会话标签）查不到 → `park` 返回 `None` → 桥回 404 → CC 该轮悬空。
+
+修法（未实现）：给 Pool 加一个「游离 park」表（按会话标签索引），
+`park` 在 sessions 里找不到时落到这张表；`resolve`/`pending_calls` 同时查两处。
+改动约 30 行，验证仍需一次真实模型调用（stub 无法驱动模型决定调工具）。
+
+## 13. CRAG 3.1.4 适配（上游 2026-11-17）
+
+上游把签名 payload 从 3.1.3 提到 **3.1.4**（kernel 894,472 B，sha256 `bf987f22…`），
+并在 #1162「preserve CRAG 3.1.4 behavior」里改了三类东西。按「内核 / 面板」分清：
+
+### 13.1 面板侧（我们的 Rust 内核不需要跟）
+
+- `crs-persona.mjs`：system 注入改为 `insertSystemAfterUser()` —— 插在「最后一个相关 user」
+  之后、assistant 之前；若前面已是 system 则**合并内容**而不是再插一条。
+  zero-billing 分支走同一函数。
+- `pool-scheduler.mjs`：仅"配额窗口耗尽"的排队返回 `pool_rate_limited`，其它一律透传原因。
+- `upstream-error-policy.mjs`：**请求作用域**的 429 不再触发 `/usage` 探测。
+
+### 13.2 内核侧（必须跟）
+
+`rust-kernel-supervisor.mjs` 现在会给 `runtime_variant: "crag-v2"` 的配置写
+`session_slots = min(请求值, slots_per_worker)`，并按此核对健康回报。我们已对齐：
+
+- `TuiPool` 增加并发上限（之前**完全没有**，TUI 模式会无限起 CLI 进程），
+  超限时按 `last_used` 摘除最久未用者并连带杀掉其 CLI；
+- `NativePool::slots()` / `TuiPool::slots()` 暴露该值；
+- `/internal/health` 回报 `session_slots`，供面板收敛判断。
+
+### 13.3 工具回环 120 秒假死的真因：异步上下文里的阻塞休眠
+
+现象：TUI 模式下 MCP 工具调用永远要等 **120 秒**才被 CC 接受，模型最终拿到的是
+「工具超时已转入后台任务」。内核侧 park→resolve 只要 30 ms，桥也确实把回包写了出去。
+
+排查过程中被排除的假设（都实测过，别再重复）：
+
+| 假设 | 实测结果 |
+| :--- | :--- |
+| `initialize` 回包 id 需省略/回显 | 无影响 |
+| 回包分帧要用 `Content-Length` | 无影响（两种都能被 CC 解析） |
+| 缺 `notifications/progress` | 无影响（且厂商桥也不发，已移除） |
+| PTY 尺寸过小（CC 日志报 19x80） | 无影响（仍显式设为 50x200） |
+| `--allowedTools mcp__crag` 匹配不到完整工具名 | 无影响（已改为 `mcp__crag__*`） |
+| 厂商自己的 JS 桥 `runtime_mcp-bridge.mjs` | **同样卡 120 秒**，与桥实现无关 |
+| CLI 版本 2.1.321 的 `mcp runtime arm: v2` | v2 本身正常（假回包时 14 秒就能走完回环） |
+
+真因：`tui.rs` 里 `answer_after()` / `transcript_answer_file()` 在 **async 函数里用
+`std::thread::sleep` 轮询 transcript**。容器里运行时实际只有一个可用 worker，
+这种阻塞休眠会把 executor 整个卡死到轮询截止时间，于是：
+
+```
+detached send at t+31ms      （oneshot 已把工具结果发给回调任务）
+callback woke after 122.18s  （直到 #timeout 定时器到期，任务才被重新调度）
+```
+
+改成 `tokio::time::sleep(...).await` 后：
+
+```
+POST-START → POST-DONE = 163~177ms
+hop2: "The tool returned exactly: `TIME=2026-11-16T09:00:00Z`"
+```
+
+清理诊断代码后又连跑两轮，均通过（`hop2 含结果: ✅`）。
+
+> **踩过的流程坑**：验证脚本必须先把新构建拷进 runner（`target/crag-linux` →
+> 实验目录的 `crag-linux`），否则测的是上一轮的产物。中间有几轮「同一份代码时通时不通」
+> 就是这个原因，白排查了很久。凡是「改完没变化/结果跳变」，先查二进制时间戳。
+
+**纪律**：内核里任何轮询/等待都不得用 `std::thread::sleep`；需要同步等待就丢进
+`spawn_blocking`，否则会把整个 worker 占死，表现为「毫秒级的通道唤醒延迟到超时窗口」。
+
+### 13.4 沙盒部署记录（192.168.1.109）
+
+`vm-crag-01` 的运行时二进制是 `cli-home/.kin/crag-v2/crag-v2`（`kin-kernel` 只是个
+`exec` 包装脚本，`kin-kernel.bin` 是厂商内核备份，都不参与运行）。热更新即替换该文件：
+
+```sh
+# 本机
+cat target/crag-linux | ssh root@192.168.1.109 'cat > /tmp/crag-v2-new'
+# 沙盒（宿主机是 busybox，没有 install/scp-server）
+D=/opt/docker/vm2api/vms/vm-crag-01/cli-home/.kin/crag-v2
+cp -a "$D/crag-v2" "$D/crag-v2.bak-20261117"
+cp /tmp/crag-v2-new "$D/crag-v2"; chmod 755 "$D/crag-v2"; chown 10001:987 "$D/crag-v2"
+docker exec kin-crag-01 "$D/crag-v2" --version   # 自检通过再重启
+docker restart kin-crag-01
+```
+
+2026-11-17 部署 `sha256 9139d87f…`（4,700,920 B）。验证结果：
+
+- `--version` → `2.1.321 (CRAG v2 native kernel; rust)`
+- `/internal/health` → `ok/healthy true`、`engine rust`、`session_slots` 字段在
+- `/run/kin/kernel.json` 已带 **`session_slots: 20`**（面板 3.1.4 下发），内核按此限流
+- 面板 `/api/panel/vms` → `running`、`resolved_inference_engine: rust`、`crag_kernel_version: v2`
+- `ready_slots` 45 秒内稳定为 1，容器 0 重启；`/v1/models` 200（非推理端点，不耗额度）
+
+> 注意：`crag-v2/manifest.json` 里的 `sha256.crag-v2` 仍指向旧二进制。当前面板与内核都
+> 不校验该字段（只有备份模块读 manifest），所以热替换可用；但若要重新走"包安装"流程，
+> 必须用 `tools/selfsign-package.mjs` 重新签包，否则会被判为脏目录。
+
+## 14. 出站身份按上游核对（2026-11-17，官方 CLI 2.1.321 实测）
+
+抓法：让内核 TUI 跑官方 CLI，`ANTHROPIC_BASE_URL` 指向本地 stub（同网络命名空间，
+`http://127.0.0.1:18082`），stub 落盘 `{url, headers, bodyRaw}`。
+
+### 14.1 实测头（真实 CLI 发出的）
+
+```
+user-agent:                     claude-cli/2.1.321 (external, cli)
+x-app:                          cli
+x-stainless-lang/os/arch/runtime: js / Linux / x64 / node
+x-stainless-runtime-version:    v26.12.1
+x-stainless-package-version:    0.128.0
+x-stainless-retry-count:        0
+x-stainless-timeout:            600
+anthropic-version:              2023-06-01
+accept:                         application/json        ← 即使 body.stream=true
+accept-encoding:                gzip, deflate, br, zstd
+x-claude-code-session-id:       <uuid>
+anthropic-dangerous-direct-browser-access: true
+（**没有** x-client-request-id，**没有** x-claude-code-request-class）
+```
+
+system[0]：`x-anthropic-billing-header: cc_version=2.1.321.483; cc_entrypoint=cli;`
+（四段版本 + 构建号；这条请求**没有** `cch=`）
+system[1]：`You are Claude Code, Anthropic's official CLI for Claude.`
+metadata.user_id：`{"device_id":"<64 hex>","account_uuid":"","session_id":"<uuid>"}`
+
+### 14.2 我们改了什么
+
+| 项 | 改前 | 改后 | 依据 |
+| :--- | :--- | :--- | :--- |
+| `VERSION`（`--version`/日志/health） | 2.1.303 | **2.1.321** | 包内 CLI 目录 `claude-code-2.1.321` |
+| `x-stainless-package-version` | 0.74.0 | **0.128.0** | 实测 + 厂商 `WRAP_OFFICIAL_STAINLESS` |
+| `x-stainless-runtime-version` | v26.3.0 | **v26.12.1** | 实测 |
+| `x-stainless-timeout` | 不发 | **600** | 实测 |
+| `accept` | 流式时 `application/json, text/event-stream` | **`application/json`** | 实测（SSE 由 body 决定） |
+| `x-client-request-id` | 补 UUID | **删掉** | 实测官方 CLI 不发 |
+| `IDENTITY` 系统串 | `You are a Claude agent, … Agent SDK.` | **`You are Claude Code, Anthropic's official CLI for Claude.`** | 实测 system[1] |
+
+### 14.3 仍未对齐（不猜、只记录）
+
+- **`cc_version` 第四段**：实测是 `2.1.321.483`（构建号）。我们只发三段，
+  因为构建号无法从版本号推导；面板下发的 `cli_version` 也只有三段。
+- **`accept-encoding`**：官方发 `gzip, deflate, br, zstd`，我们不发（内核不解压）。
+  补上就必须实现解压，否则响应体是压缩的会解析失败。
+- **`cch`**：厂商 JS 侧是占位 `00000`，官方真实值由 Bun 原生 HTTP 层按请求重写。
+  我们沿用占位（与厂商一致）。
+- **`x-claude-code-request-class`**：厂商 *wrap-cli* 会注入（`main`/`subagent`/…），
+  但**官方 CLI 自己不发**。我们的 crag 路线不注入——若面板仍下发 `request_class`，
+  那就是多出来的头，属于可识别的偏差，应置空。

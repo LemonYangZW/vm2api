@@ -1,0 +1,12 @@
+{
+  "dataplane": "crag",
+  "crag_kernel_version": "v2",
+  "slots_per_worker": 4,
+  "upstream_mode": "direct",
+  "upstream_base": "https://api.anthropic.com",
+  "credential_path": "/home/kincli/.claude/credentials.json",
+  "oauth_token_url": "https://platform.claude.com/v1/oauth/token",
+  "refresh_skew_seconds": 300,
+  "cli_bin": "claude",
+  "cli_args": []
+}

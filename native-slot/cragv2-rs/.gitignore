@@ -1,0 +1,11 @@
+# Rust 构建产物（容器内编译输出，勿入库）
+/target/
+/target-linux/
+/dist-linux/
+/target-lin/
+/target-lin2/
+/target-lin3/
+/target-lin4/
+/target-l4/
+/target-musl/
+/target-gnu/

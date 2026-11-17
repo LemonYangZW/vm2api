@@ -1,0 +1,32 @@
+[package]
+name = "cragv2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "CRAG v2 native kernel (Rust) — 2.1.303 outbound wire with CCH stamping"
+publish = false
+
+[[bin]]
+name = "crag-v2"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "process", "sync", "signal", "fs"] }
+regex = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+h2 = "0.4"
+http = "1"
+bytes = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
