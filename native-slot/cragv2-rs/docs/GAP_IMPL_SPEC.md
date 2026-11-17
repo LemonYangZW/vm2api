@@ -925,3 +925,30 @@ fs.writeFileSync(p,JSON.stringify(m));' "$D/manifest.json" "$H"
 
 `crag-license.mjs` 只校验 issuer（`authorization.public_key_id`）与树完整性，
 不读 `payload.plaintext_sha256`，因此改这一项不会破坏许可证判定。
+
+### 15.2 面板升级实战（1.4.130 → 1.4.132）
+
+两条踩坑记录：
+
+1. **GHCR 的多架构标签可能缺失**。v1.4.132 的 release 工作流里
+   `image-arm64` 任务失败，导致多架构 manifest 没生成——`v1.4.132` 标签 404，
+   但 `v1.4.132-amd64` 存在。x86_64 机器直接用它：
+   `VM2API_IMAGE_TAG=v1.4.132-amd64`。
+   （另外 `latest` 标签滞后，实测停在 1.4.117，**不要用 latest 判断是否升级成功**。）
+
+2. **升级后面板要调槽位内存，可能失败并杀掉槽位**。日志：
+
+   ```
+   [slot-capacity] memory_raise_failed vm-crag-01 {"want":"2g","code":"memory_diverged"}
+   → kin-crag-01 Exited (137)
+   ```
+
+   已有容器带着旧的内存上限，原地 update 核验不过。恢复方式：删掉容器让面板按新配置重建。
+
+   ```sh
+   docker rm -f kin-crag-01
+   # 用面板自己的入口重建（会重新解包源树、写入正确内存）
+   curl -X POST -H "Authorization: Bearer $T" http://127.0.0.1:8787/api/panel/vms/vm-crag-01/start
+   ```
+
+   重建后 `docker inspect --format '{{.HostConfig.Memory}}'` 应变成目标值（实测 2147483648）。
