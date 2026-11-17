@@ -12,7 +12,7 @@
 | 控制面契约（权威） | `dofastted/vm2api` **v1.4.117**（`87ddea0b`）`src/lib/transport/*`、`src/lib/vm/*` | 内核必须满足的接口/字段 |
 | 官方内核配置（权威） | 出厂包内 `kernel.json.example`（1208 B，明文） | 27 个配置键的真实默认值 |
 | JS 时代参考实现 | `share/crag-v2` @ `8423bb81`（归档 ref `archive/crag-plaintext-8423bb81`） | `linux-tui-helper.mjs`、`linux-tui-tap.js`、`tui-request-options.mjs`、`gateway/v2-runtime.mjs` |
-| 实测 | 沙盒 192.168.1.109（详见本文件 §1） | 判定架构真伪 |
+| 实测 | 沙盒 192.168.1.x（详见本文件 §1） | 判定架构真伪 |
 
 ---
 
@@ -329,10 +329,10 @@ direct 回退路径已补 `wire::stamp_metadata`（原 `Identity::user_id()` 是
 
 ---
 
-## 附：沙盒复现脚本（192.168.1.109）
+## 附：沙盒复现脚本（192.168.1.x）
 
 ```sh
-# 沙盒（192.168.1.109，无出网到 packyapi，仅能对本地 stub 验证）
+# 沙盒（192.168.1.x，无出网到 packyapi，仅能对本地 stub 验证）
 /root/lab-crag/extract-vendor-cc.sh      # 取官方 CC 2.1.321 + 对 manifest 校 sha256
 /root/lab-crag/probe-native-adapter.sh   # 证明 12-API/--single-process-* 不属于现行 CLI
 /root/lab-crag/verify-tap.sh             # tap 注入 + 三旋钮改写（--print 模式）
@@ -797,14 +797,14 @@ hop2: "The tool returned exactly: `TIME=2026-11-16T09:00:00Z`"
 **纪律**：内核里任何轮询/等待都不得用 `std::thread::sleep`；需要同步等待就丢进
 `spawn_blocking`，否则会把整个 worker 占死，表现为「毫秒级的通道唤醒延迟到超时窗口」。
 
-### 13.4 沙盒部署记录（192.168.1.109）
+### 13.4 沙盒部署记录（192.168.1.x）
 
 `vm-crag-01` 的运行时二进制是 `cli-home/.kin/crag-v2/crag-v2`（`kin-kernel` 只是个
 `exec` 包装脚本，`kin-kernel.bin` 是厂商内核备份，都不参与运行）。热更新即替换该文件：
 
 ```sh
 # 本机
-cat target/crag-linux | ssh root@192.168.1.109 'cat > /tmp/crag-v2-new'
+cat target/crag-linux | ssh root@192.168.1.x 'cat > /tmp/crag-v2-new'
 # 沙盒（宿主机是 busybox，没有 install/scp-server）
 D=/opt/docker/vm2api/vms/vm-crag-01/cli-home/.kin/crag-v2
 cp -a "$D/crag-v2" "$D/crag-v2.bak-20261117"
@@ -1007,7 +1007,7 @@ const DEVICE_ACTIVATION_URL =
   重新签名会被判成 `license_redeem_target_changed`），所以服务端把首次签发的证存库复用。
 - 离线路径与在线路径用的是同一个 `mintRegistration`，因此两边出的证完全等价。
 
-### 16.4 沙盒部署配方（192.168.1.109，已于 2026-11-17 验证）
+### 16.4 沙盒部署配方（192.168.1.x，已于 2026-11-17 验证）
 
 ```sh
 # 1) 工具与密钥（keys.json 就是 selfsign-package.mjs 的 --keys 产物）
