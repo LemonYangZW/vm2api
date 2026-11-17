@@ -1185,3 +1185,23 @@ cp /tmp/pw/src/lib/vm/*.mjs /opt/docker/vm2api/patches/   # 沙盒侧
 
 `patches/0001-panel-activation-url.patch` / `0002-panel-subscription-origin.patch`
 是这条流程的产物，已在原始上游文件上验证 `git apply` 干净通过。
+
+### 16.8 跟进 1.4.136（2026-11-17）
+
+上游 1.4.136 只有一个修复：`fix(crag): 在确定 thinking 后清洗采样参数`
+（`go-worker-client.mjs` 在 `print` 路径调 `alignSamplingWithThinking(body)`，
+`anthropic-policy.mjs` 的该函数 1.4.135 已存在）。
+
+**对我们无影响**：改的是 Go worker 的请求组装，我们走 Rust 内核（TUI/native 模式），
+内核不构建请求；`payload.json` 与 `rust-kernel-client/supervisor` 均未变 → **不重建二进制**。
+
+面板补丁锚点在 1.4.136 文件上仍成立，`patches/*.patch` 内容未变（行号也没动）。
+
+实测：
+
+```
+面板 1.4.136（v1.4.136-amd64）
+订阅 active / available_seats 10
+槽位 running；env 覆盖指向 127.0.0.1:8099
+内核 30d62ca76eef791a（源树与槽位一致），--version 2.1.321
+```
