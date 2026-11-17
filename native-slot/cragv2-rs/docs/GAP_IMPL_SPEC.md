@@ -876,3 +876,41 @@ metadata.user_id：`{"device_id":"<64 hex>","account_uuid":"","session_id":"<uui
 - **`x-claude-code-request-class`**：厂商 *wrap-cli* 会注入（`main`/`subagent`/…），
   但**官方 CLI 自己不发**。我们的 crag 路线不注入——若面板仍下发 `request_class`，
   那就是多出来的头，属于可识别的偏差，应置空。
+
+## 15. 跟随上游 1.4.13x 的分支与部署纪律
+
+上游已把整个 `native-slot/` 删除，我们的 Rust 内核因此是**纯新增**，不再需要跟着
+老分支（落后 1100+ 提交、11 处冲突）走。
+
+| 分支 | 用途 |
+| :--- | :--- |
+| `main` | 上游代码，只做 `git merge --ff-only origin/main` |
+| `feat/cragv2-rs-main` | 从 `origin/main` 起，只包含 `native-slot/cragv2-rs/**` |
+
+上游对内核的契约（1.4.131 核对）：
+
+- 启动形态仍是 `<bin> --gateway-worker --config <json>`，配置仍带 `slots_per_worker`
+  与 CRAG 3.1.4 新增的 `session_slots`；
+- health 读的是 `health.capacity`（我们没有该字段时回退配置文件），`worker_version`
+  仅作展示；`rust-kernel-client.mjs` 在本轮 128 个提交里没有改动；
+- 槽位杀进程按 `*--gateway-worker*` 命令行匹配，我们被正确覆盖。
+
+### 15.1 载荷树必须自洽（否则新版面板会拒绝重建槽位）
+
+`verifyCragV2Tree()`（`src/lib/vm/wrap-cli-runtime.mjs`）校验的是**树内自洽**：
+`manifest.sha256` 里每个文件的哈希必须与磁盘一致，且不允许有未列出的文件。
+它不比对 `deploy/payload.json` 的官方 pin。
+
+所以热替换内核后，如果面板要重建/重装槽位，必须同步更新 manifest：
+
+```sh
+D=/opt/docker/vm2api/vms/vm-crag-01/cli-home/.kin/crag-v2
+H=$(sha256sum "$D/crag-v2" | cut -d' ' -f1)
+# 沙盒宿主机是 busybox，没有 python3：借面板容器里的 node 改 JSON
+docker exec vm2api node -e 'const fs=require("fs");const p=process.argv[1];
+const m=JSON.parse(fs.readFileSync(p,"utf8"));m.sha256["crag-v2"]=process.argv[2];
+fs.writeFileSync(p,JSON.stringify(m));' "$D/manifest.json" "$H"
+```
+
+`crag-license.mjs` 只校验 issuer（`authorization.public_key_id`）与树完整性，
+不读 `payload.plaintext_sha256`，因此改这一项不会破坏许可证判定。
