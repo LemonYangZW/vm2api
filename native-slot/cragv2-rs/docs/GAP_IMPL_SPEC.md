@@ -901,6 +901,17 @@ metadata.user_id：`{"device_id":"<64 hex>","account_uuid":"","session_id":"<uui
 `manifest.sha256` 里每个文件的哈希必须与磁盘一致，且不允许有未列出的文件。
 它不比对 `deploy/payload.json` 的官方 pin。
 
+**而且必须改源树**：面板启动/重建槽位时会用
+`share/crag/kernels/v2/amd64/` 重新解包覆盖 `vms/<slot>/cli-home/.kin/crag-v2/`
+（实测：只改槽位目录，重启面板后内核被还原成旧包）。两处都要改：
+
+```sh
+SRC=/opt/docker/vm2api/share/crag/kernels/v2/amd64
+SLOT=/opt/docker/vm2api/vms/vm-crag-01/cli-home/.kin/crag-v2
+cp 新内核 "$SRC/crag-v2"; cp 新内核 "$SLOT/crag-v2"
+# 两个 manifest.json 的 sha256.crag-v2 都要改成新哈希
+```
+
 所以热替换内核后，如果面板要重建/重装槽位，必须同步更新 manifest：
 
 ```sh
