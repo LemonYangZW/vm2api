@@ -9,3 +9,6 @@
 /target-l4/
 /target-musl/
 /target-gnu/
+
+# Windows 上 sh 重定向把 C:\ 当转义符时会生成这种垃圾文件名
+C:Users*
