@@ -1099,3 +1099,52 @@ docker exec crag-authority node /app/mint-host-entitlement.mjs \
 ```
 
 槽位自己的设备许可（`scope: device`）不受影响，仍是 `valid`；内核 `healthy`。
+
+### 16.6 跟进 1.4.133（2026-11-17）
+
+上游 1.4.133 改了两处与我们相关的东西：
+
+**① 内核遥测契约（必须跟）** — `rust-kernel-client.mjs` 新增
+`verifyCragTelemetryPolicy()`，要求 `/internal/v1/telemetry/apply` 回：
+
+```json
+{"ok":true,"applied":true,"enabled":<请求值>,"scope":"native_claude_launch","upload_confirmed":false}
+```
+
+否则回 `409` 且 `error.type ∈ {telemetry_policy_not_published,
+telemetry_native_settings_blocked, telemetry_restart_required}`；回 `telemetry_restart_required`
+面板会排空并重启内核后再验一次。
+
+我们的实现（`gateway.rs::telemetry_apply_response`）：
+
+- `enabled:true` → 200 `applied:true`（我们本来就不干预官方遥测，动作在官方 CLI 自己那边）
+- `enabled:false` → 409 `telemetry_native_settings_blocked`
+  （**不伪造已应用**：关掉官方遥测本身才是可识别异常特征）
+
+**② 面板补丁要按新版本重打** — 1.4.133 给 `crag-subscription.mjs` 加了 205 行，
+我们挂载的是**整份文件**副本，直接用旧补丁会把上游改动回退掉。流程：
+
+```sh
+docker run --rm --entrypoint cat $IMG /opt/vm2api/src/lib/vm/{crag-license,crag-subscription}.mjs > /tmp/pw/
+docker run --rm -v /tmp/pw:/w node:22-alpine node /w/patch.mjs   # 幂等，锚点缺失会报错
+node --check 两个文件；再放 /opt/docker/vm2api/patches/ 并 compose up -d
+```
+
+> 踩坑：补丁里的 `.replace(/\/+$/, '')` 经 shell/heredoc 传递会丢反斜杠，变成 `//+$/`
+> 的非法正则，面板直接 crash loop。改用字符类 `.replace(/[/]+$/, '')`，并**在容器里
+> 跑 `node --check` 再上线**。
+
+**③ `memory_raise_failed … memory_diverged` 是宿主限制** — 面板要求容器 swap 上限等于
+requested memory，但该宿主 `docker info` 报 `WARNING: No swap limit support`，
+Docker 只能把 `MemorySwap` 报成 `-1`，这个检查在这台机器上永远不满足。内存本身已按
+2g 生效（`HostConfig.Memory=2147483648`），仅日志噪音。
+
+实测（1.4.133 + 内核 `30d62ca7`）：
+
+```
+面板 VERSION 1.4.133（v1.4.133-amd64，注意多架构标签因 arm64 任务失败仍缺失）
+available_seats: 10（自建宿主席位仍生效）
+telemetry apply enabled=true  → 200 {"applied":true,"scope":"native_claude_launch",…}
+telemetry apply enabled=false → 409
+内核 health: worker_version 2.1.321, session_slots 1, healthy true
+```

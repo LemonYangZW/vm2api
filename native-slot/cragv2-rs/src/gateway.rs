@@ -576,13 +576,46 @@ async fn handle_conn(mut stream: Stream, state: Arc<GatewayState>) -> std::io::R
             )
             .await
         }
-        ("POST", "/internal/v1/telemetry/events") | ("POST", "/internal/v1/telemetry/apply") => {
+        ("POST", "/internal/v1/telemetry/events") => {
             respond(&mut stream, 200, "application/json", br#"{"ok":true}"#, &[]).await
+        }
+        ("POST", "/internal/v1/telemetry/apply") => {
+            let wanted = serde_json::from_slice::<Value>(&request.body)
+                .ok()
+                .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+                .unwrap_or(true);
+            let (status, payload) = telemetry_apply_response(wanted);
+            let body = serde_json::to_vec(&payload).unwrap_or_default();
+            respond(&mut stream, status, "application/json", &body, &[]).await
         }
         (method, _) if method != "GET" && method != "POST" => {
             respond(&mut stream, 405, "application/json", br#"{"ok":false}"#, &[]).await
         }
         _ => respond(&mut stream, 404, "application/json", br#"{"ok":false,"error":"not_found"}"#, &[]).await,
+    }
+}
+
+/// 上游 1.4.133 起的遥测契约：确认原生遥测启动策略。
+///
+/// 我们**不干预官方行为**——要求开启就如实回报"已生效"（动作在官方 CLI 自己那边）；
+/// 要求关闭则明确拒绝，因为"关掉官方遥测"本身才是可识别异常。
+fn telemetry_apply_response(enabled: bool) -> (u16, Value) {
+    if enabled {
+        (
+            200,
+            json!({
+                "ok": true,
+                "applied": true,
+                "enabled": true,
+                "scope": "native_claude_launch",
+                "upload_confirmed": false,
+            }),
+        )
+    } else {
+        (
+            409,
+            json!({"ok": false, "error": {"type": "telemetry_native_settings_blocked"}}),
+        )
     }
 }
 
@@ -2024,6 +2057,21 @@ impl Assembler {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn telemetry_apply_matches_upstream_contract() {
+        let (status, body) = telemetry_apply_response(true);
+        assert_eq!(status, 200);
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["scope"], "native_claude_launch");
+        assert_eq!(body["upload_confirmed"], false);
+
+        // 要求关闭官方遥测：明确拒绝，不伪装成已应用。
+        let (status, body) = telemetry_apply_response(false);
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["type"], "telemetry_native_settings_blocked");
+    }
     use super::*;
 
     #[test]
