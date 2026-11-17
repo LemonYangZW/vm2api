@@ -59,6 +59,44 @@ pub struct KernelConfig {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// 每个常驻会话的官方 CLI 内存预算（上游实测约 280 MB，见 issue #1092）。
+/// 留出余量取 320 MB，并把内核自身与面板探测算进固定开销。
+pub const SESSION_MEMORY_BUDGET: u64 = 320 * 1024 * 1024;
+/// 内核自身 + 运行时杂项预留。
+pub const KERNEL_RESERVE: u64 = 192 * 1024 * 1024;
+
+/// 容器内存上限（cgroup v2 `memory.max`，回落 v1 `memory/memory.limit_in_bytes`）。
+/// 返回 `None` 表示无限制/读不到。
+pub fn cgroup_memory_limit() -> Option<u64> {
+    const CANDIDATES: [&str; 2] = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ];
+    for path in CANDIDATES {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let text = text.trim();
+        if text == "max" || text.is_empty() {
+            return None;
+        }
+        if let Ok(bytes) = text.parse::<u64>() {
+            // v1 无限制时是一个巨大的哨兵值，视同无限。
+            if bytes >= 1 << 60 {
+                return None;
+            }
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// 由内存上限推导容量：`(limit - 预留) / 每会话预算`，至少 1。
+pub fn capacity_from_limit(limit: u64) -> usize {
+    let usable = limit.saturating_sub(KERNEL_RESERVE);
+    (usable / SESSION_MEMORY_BUDGET).max(1) as usize
+}
+
 impl KernelConfig {
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
@@ -175,11 +213,26 @@ impl KernelConfig {
     }
 
     /// 会话并发上限（面板写 `session_slots` 或 `slots_per_worker`），默认 20。
+    ///
+    /// 同时受两道限制：本文件声明的范围（1–20，与 `slots()` 一致）和**容器 cgroup 内存
+    /// 上限**。上游内核遇到超容配置直接以 `session_slots exceeds physical capacity` 退出
+    /// （issue #1179 因此槽位反复重启），我们改为**截断并告警**，保持可启动。
     pub fn session_slots(&self) -> usize {
-        self.extra_u64("session_slots")
+        let requested = self
+            .extra_u64("session_slots")
             .or_else(|| self.extra_u64("slots_per_worker"))
-            .map(|v| v.clamp(1, 128) as usize)
-            .unwrap_or(20)
+            .map(|v| v.clamp(1, 20) as usize)
+            .unwrap_or(20);
+        requested.min(Self::capacity_slots())
+    }
+
+    /// 按 cgroup 内存上限推导的会话容量（每会话预算 [`SESSION_MEMORY_BUDGET`]）。
+    /// 读不到 cgroup 时返回 `usize::MAX`（不限制），避免在非容器环境误伤。
+    fn capacity_slots() -> usize {
+        let Some(limit) = cgroup_memory_limit() else {
+            return usize::MAX;
+        };
+        capacity_from_limit(limit)
     }
 
     /// MCP 工具等待上限（面板写 `tool_timeout_seconds`），默认 300 s。
@@ -313,6 +366,18 @@ mod tests {
         assert_eq!(config.slots(), 20);
         config.slots_per_worker = Some(0);
         assert_eq!(config.slots(), 1);
+    }
+
+    #[test]
+    fn session_slots_never_exceed_cgroup_capacity() {
+        // 2 GiB 容器：预留 192 MB 后 / 320 MB 预算 = 5 个会话（配置写 20 也只能用 5）。
+        assert_eq!(capacity_from_limit(2 * 1024 * 1024 * 1024), 5);
+        // 512 MiB 连一个都放不下，也要保底 1（不能启动 0 个会话）。
+        assert_eq!(capacity_from_limit(512 * 1024 * 1024), 1);
+        // 上限与本文件 slots() 的 20 对齐。
+        let mut config = KernelConfig::default();
+        config.extra.insert("session_slots".into(), serde_json::json!(128));
+        assert!(config.session_slots() <= 20);
     }
 
     #[test]

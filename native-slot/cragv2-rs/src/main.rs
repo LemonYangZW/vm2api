@@ -27,8 +27,12 @@ struct Args {
     socket: Option<String>,
     /// 内建假 CLI（离线演示/联调用）。
     fake_cli: bool,
+    /// 打印能力声明后退出（面板用它探测宿主订阅支持，见 vm-runtime.mjs）。
+    license_capabilities: bool,
     version: bool,
     help: bool,
+    /// 无法识别的参数：必须报错退出，不能默默起网关（会被探测方当成挂住的子进程）。
+    unknown: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -36,8 +40,10 @@ fn parse_args() -> Args {
         config: None,
         socket: None,
         fake_cli: false,
+        license_capabilities: false,
         version: false,
         help: false,
+        unknown: Vec::new(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -45,6 +51,7 @@ fn parse_args() -> Args {
             "--config" | "-c" => args.config = iter.next(),
             "--socket" | "-s" => args.socket = iter.next(),
             "--fake-cli" => args.fake_cli = true,
+            "--license-capabilities" => args.license_capabilities = true,
             "--version" | "-V" => args.version = true,
             "--help" | "-h" => args.help = true,
             // 控制面固定传入，语义由配置文件承载。
@@ -55,7 +62,7 @@ fn parse_args() -> Args {
             other if other.starts_with("--socket=") => {
                 args.socket = Some(other.trim_start_matches("--socket=").to_string())
             }
-            _ => {}
+            other => args.unknown.push(other.to_string()),
         }
     }
     args
@@ -74,6 +81,7 @@ OPTIONS:
         --fake-cli        用内建假 CLI 起槽位（离线联调）
     -V, --version         打印版本
     -h, --help            打印帮助
+        --license-capabilities  打印能力声明（JSON）后退出
 
 SUBCOMMANDS:
     mcp-bridge --config <mcp.json>   stdio JSON-RPC 工具桥（crag_tools）
@@ -104,6 +112,16 @@ rl.on('line', (line) => {
 });
 "#;
     vec!["node".to_string(), "-e".to_string(), script.to_string()]
+}
+
+/// 能力声明：面板用 `crag-v2 --license-capabilities` 探测，期望一行 JSON 后退出。
+///
+/// 只声明**真实**能力：宿主订阅读（CRAGH1）与席位由面板 + 自建授权服务承载，
+/// 内核不参与席位回收，所以 `host_subscription_reclaim` 报 0。
+/// 报 `host_subscription: 0` 与当前面板行为一致（探测失败即不支持），
+/// 避免修一个进程泄漏的同时改变槽位准入逻辑。
+fn license_capabilities_json() -> &'static str {
+    r#"{"host_subscription":0,"host_subscription_reclaim":0}"#
 }
 
 #[tokio::main]
@@ -184,6 +202,19 @@ async fn main() -> ExitCode {
     if args.version {
         println!("{VERSION} (CRAG v2 native kernel; rust)");
         return ExitCode::SUCCESS;
+    }
+    if args.license_capabilities {
+        // 面板用 `docker exec ... crag-v2 --license-capabilities` 探测能力，
+        // 期望 stdout 是一行 JSON 后立即退出（vm-runtime.mjs 里 assertCragSubscriptionTarget）。
+        // 我们只声明真正具备的能力：宿主订阅（CRAGH1 / 席位）由面板侧与自建授权服务承载，
+        // 内核不参与席位回收，因此 reclaim 报 0。
+        println!("{}", license_capabilities_json());
+        return ExitCode::SUCCESS;
+    }
+    if !args.unknown.is_empty() {
+        eprintln!("[crag] unknown argument(s): {}", args.unknown.join(" "));
+        eprint!("{HELP}");
+        return ExitCode::from(2);
     }
 
     let config = match args.config.as_deref() {
@@ -474,5 +505,22 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::license_capabilities_json;
+
+    #[test]
+    fn license_capabilities_is_one_line_json() {
+        let raw = license_capabilities_json();
+        let parsed: serde_json::Value = serde_json::from_str(raw).expect("valid json");
+        assert!(parsed.get("host_subscription").and_then(|v| v.as_u64()).is_some());
+        assert!(parsed
+            .get("host_subscription_reclaim")
+            .and_then(|v| v.as_u64())
+            .is_some());
+        assert!(!raw.contains("\n"), "panel parses a single line");
     }
 }

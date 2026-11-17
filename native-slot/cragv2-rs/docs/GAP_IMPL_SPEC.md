@@ -1205,3 +1205,81 @@ cp /tmp/pw/src/lib/vm/*.mjs /opt/docker/vm2api/patches/   # 沙盒侧
 槽位 running；env 覆盖指向 127.0.0.1:8099
 内核 30d62ca76eef791a（源树与槽位一致），--version 2.1.321
 ```
+
+### 16.9 内核查漏补缺：能力探测泄漏、容量上限、配置精简（2026-11-17）
+
+按上游 issue 与提交历史做了一轮对照审计，发现两处真实缺陷并修复。
+
+#### ① `--license-capabilities` 未实现 → 子进程泄漏（已修）
+
+面板 `vm-runtime.mjs:403` 用
+`docker exec <slot> /home/kincli/.kin/crag-v2/crag-v2 --license-capabilities`
+探测宿主订阅能力，期望**一行 JSON 后立即退出**。我们的 `parse_args` 把未知参数
+静默忽略，于是这个探测变成"启动一个完整网关并永久阻塞"：
+
+| 指标 | 修复前 | 修复后 |
+| :--- | :--- | :--- |
+| `crag-v2` 进程数 | **79** | 1 |
+| `pids.current` / `pids.max` | **398 / 448（89%）** | 8 / 448 |
+| 容器 `memory.current` | 61 MB | 1.7 MB |
+
+进程状态全是 `S`（活着、阻塞），不是僵尸；父进程是执行 `docker exec` 的面板进程，
+`sh()` 的 5 s 超时只杀了 exec 客户端，容器内进程留在原地。继续累积就会撞
+`pids.max`，之后所有 fork 失败 → 502，与上游 issue #1080 的表现一致。
+
+修法：
+- 实现 `--license-capabilities` → 打印
+  `{"host_subscription":0,"host_subscription_reclaim":0}` 并退出 0；
+  报 0 与修复前面板行为**完全一致**（探测失败即不支持），不会顺手改变槽位准入逻辑。
+  内核确实不参与席位回收，声明 1 属于伪造能力。
+- **未知参数一律报错退出（码 2）**，不再"带病启动"。这是根治：任何未来探测
+  都不会再变成挂住的网关进程。
+
+#### ② 缺物理容量校验 → 可能照配置开满会话（已修）
+
+上游 issue #1179 / #1123：`session_slots` 超过物理容量时，厂商内核以
+`crag-v2: session_slots exceeds physical capacity` **拒绝启动**，导致槽位反复重启、
+阻断在线扩容。我们这边相反——只 `clamp(1,128)` 就照开，且与 `slots()` 的 20 上限
+不一致，等于保留了 #1080 的 OOM 路径。
+
+改成：`session_slots = min(配置值.clamp(1,20), cgroup 容量)`，
+容量 = `(memory.max - 192 MB 预留) / 320 MB 每会话`（读 cgroup v2 `memory.max`，
+回落 v1；读不到则不限制）。**截断 + 单测**而不是拒绝启动：可启动性优先，
+配置超容属于控制面问题，不该让槽位瘫痪。
+
+2 GiB 容器 → 容量 5 个会话；512 MiB → 保底 1。
+
+#### ③ 配置面盘点：只有两个旋钮真正影响内存
+
+| 旋钮 | 作用 | 建议 |
+| :--- | :--- | :--- |
+| `slots_per_worker` | 常驻 CLI 进程上限 = **峰值内存 = N × ~280 MB** | 保留，唯一容量旋钮 |
+| `session_idle_ttl_seconds` | 空闲 CLI 存活时长（默认 600 s，为 prompt cache 保留） | 保留，第二个内存杠杆 |
+| `session_slots` | 与 `slots_per_worker` 面板侧已 `min()` 成相等 | 可合并，见下 |
+| `tool_timeout_seconds` / `claude_bin` / `provider` / `cli_version` | 不涉及内存 | 保留 |
+
+**结论：可以精简成一个容量旋钮。** 面板 `writeKernelConfig` 已经保证
+`session_slots = min(requested, slots_per_worker)`，内核再读两个键属于重复；
+保留 `min()` 兼容老配置即可，新配置只写 `slots_per_worker`。
+
+#### ④ "用系统原生机制划分服务"能不能省内存？—— 不能，省的是爆炸半径
+
+- 内存由官方 CLI 进程本身决定（上游实测 ~280 MB/会话，#1092），划分方式不改变它。
+- 我们的内核**没有 prewarm**（不做预启动），空闲时容器只有 1 个 1.7 MB 的进程，
+  这已经是最省的形态；真正的浪费来自"常驻不回收"，由 TTL 控制。
+- 每会话一个 cgroup v2 子树（或 systemd transient scope）的收益是：
+  OOM 只杀该会话、`pids.max` 按会话隔离、内存计量变真实。
+  代价是多一层 cgroup 管理与代码。**只有出现级联 OOM 才值得做**；
+  当前 `slots_per_worker=1`、容器 2 GiB、容量上限 5，没有这个必要。
+- 反过来，"把内核拆成多进程/多容器"会增加常驻内存（每个进程一份运行时），不建议。
+
+#### ⑤ 上游 issue 对照（我们是否需要跟）
+
+| issue | 上游结论 | 我们的状态 |
+| :--- | :--- | :--- |
+| #1080 512m/256 pids 装不下 20 会话 | 按套餐配槽数/内存/pids | 已由 ② 的容量截断覆盖 |
+| #1123 / #1179 `session_slots` 超容量 | 面板侧 `min()` + 内核拒绝启动 | 我们改为截断（更稳） |
+| #1092 按主机内存压力准入 | 面板侧 `host-memory-pressure.mjs` | 面板已有，内核无需参与 |
+| #1122 包信任缓存，避免每槽重校验 | 面板侧缓存 | 与我们内核无关 |
+| #965 内存提升改异步 | 面板侧 | 我们沙盒的 `memory_diverged` 是宿主无 swap 限制，非此项 |
+| #739 对话结束释放 session 槽 | 池化回收 | 我们 `TuiPool` LRU + TTL 已覆盖 |
