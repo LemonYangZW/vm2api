@@ -1053,3 +1053,49 @@ curl -X POST http://127.0.0.1:8787/api/panel/vms/vm-crag-01/crag-license \
 实测结果：`{"ok":true, license.status:"valid", term:"1y", expires_at:1826433861}`（2027-11-17），
 许可证落到 `vms/vm-crag-01/run/crag-license/registration.code`（`CRAGL1.…`），
 重启槽位后仍为 `valid`、内核 `healthy:true`。
+
+### 16.5 宿主席位额度（面板里的“剩余可激活槽位”）
+
+面板 `/api/panel/crag-subscription` 返回的 `available_seats` 就是它：
+
+```
+available_seats = slot_limit - used_slots
+```
+
+`slot_limit` 来自宿主授权 `CRAGH1`（签名域 `"CRAGH1\0"`，**同一个 ed25519 授权私钥**），
+`used_slots` 来自授权服务的 `status` 响应。两者我们都能自建。
+
+授权服务的 `POST /v1/host-subscriptions/{status,refresh}` 返回：
+
+```json
+{ "ok": true, "data": { "entitlement": "CRAGH1.…", "revision": 1, "expires_at": …, 
+                        "used_slots": 0, "available_slots": 10, "reclaim_supported": false } }
+```
+
+面板侧需要 `CRAG_SUBSCRIPTION_ORIGIN` 指向我们（默认仍是厂商），同样用 override 挂补丁文件。
+
+签发命令：
+
+```sh
+docker exec crag-authority node /app/mint-host-entitlement.mjs \
+  --keys /data/keys.json --machine-id "$(tr -d '\n' < /etc/machine-id)" --slots 10 --days 365 \
+  --out-dir /data/subscription
+# 落盘：<data>/crag-subscription/public/{host_id,entitlement.code}
+```
+
+**三个必须同时满足，否则面板直接 `state: unavailable`**：
+
+| 条件 | 踩坑 |
+| :--- | :--- |
+| `host_id` **恰好 64 字节** | 多一个换行就 `crag_subscription_storage_unavailable`（用 `tr -d '\n'` 或工具新版本） |
+| `private/credential` 存在且 43 字节、600 权限 | 只有 `host_id` 没有 credential 会 `fail()` |
+| `public`/`private` 目录权限 755/700、属主为面板进程用户 | `storage()` 逐项精确校验（`(mode & 0o777) !== mode` 直接失败） |
+
+实测结果：
+
+```json
+{"state":"active","slot_limit":10,"used_slots":0,"available_slots":10,"available_seats":10,
+ "activated_slots":[{"vm_id":"vm-crag-01","scope":"device","expires_at":1826433861}]}
+```
+
+槽位自己的设备许可（`scope: device`）不受影响，仍是 `valid`；内核 `healthy`。

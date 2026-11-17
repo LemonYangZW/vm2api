@@ -9,6 +9,7 @@
 
 import http from 'node:http'
 import { loadAuthority, mintRegistration, openStore, isVoucher } from './license-authority.mjs'
+import { handleHostSubscription } from './host-subscriptions.mjs'
 
 const flag = (name, fallback) => {
   const at = process.argv.indexOf(`--${name}`)
@@ -17,6 +18,7 @@ const flag = (name, fallback) => {
 
 const keysFile = flag('keys', process.env.CRAG_AUTHORITY_KEYS || '')
 const storeFile = flag('store', process.env.CRAG_VOUCHER_STORE || '')
+const hostEntitlementFile = flag('host-entitlement', process.env.CRAG_HOST_ENTITLEMENT || '/data/subscription/entitlement.code')
 const port = Number(flag('port', process.env.PORT || 8099))
 const host = flag('host', process.env.HOST || '0.0.0.0')
 if (!keysFile || !storeFile) {
@@ -39,7 +41,26 @@ const deny = (res, status, code) => send(res, status, { ok: false, error: { code
 const server = http.createServer((req, res) => {
   // 面板调用的是 `${base}/${action}`，即 /v1/device-activation/{resolve,redeem}。
   const path = String(req.url || '').split('?')[0]
-  if (req.method !== 'POST' || !path.startsWith('/v1/device-activation')) return deny(res, 404, 'not_found')
+  if (req.method !== 'POST') return deny(res, 404, 'not_found')
+  // 宿主席位（订阅）接口：面板算“剩余可激活槽位”要用 status。
+  if (path.startsWith('/v1/host-subscriptions/')) {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      let body = {}
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch {}
+      const action = path.slice('/v1/host-subscriptions/'.length)
+      try {
+        const out = handleHostSubscription({ action, body, entitlementFile: hostEntitlementFile })
+        return send(res, out.status, out.body)
+      } catch (error) {
+        console.log('[host] failed', error?.message)
+        return deny(res, 503, 'crag_subscription_authority_unavailable')
+      }
+    })
+    return
+  }
+  if (!path.startsWith('/v1/device-activation')) return deny(res, 404, 'not_found')
   const routed = path.slice('/v1/device-activation'.length).replace(/^\//, '')
   const chunks = []
   let bytes = 0
