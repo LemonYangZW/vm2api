@@ -1006,3 +1006,50 @@ const DEVICE_ACTIVATION_URL =
 - **重放必须返回逐字节相同的证**（面板会拿它和磁盘上的 `registration.code` 比对，
   重新签名会被判成 `license_redeem_target_changed`），所以服务端把首次签发的证存库复用。
 - 离线路径与在线路径用的是同一个 `mintRegistration`，因此两边出的证完全等价。
+
+### 16.4 沙盒部署配方（192.168.1.109，已于 2026-11-17 验证）
+
+```sh
+# 1) 工具与密钥（keys.json 就是 selfsign-package.mjs 的 --keys 产物）
+D=/opt/docker/vm2api/data/crag-authority
+mkdir -p $D/tools && tar xzf - -C $D/tools < tools.tar.gz
+cp /root/lab-crag/keys.json $D/keys.json && chmod 600 $D/keys.json
+printf '{"vouchers":{}}' > $D/vouchers.json && chmod 600 $D/vouchers.json
+
+# 2) 常驻授权服务（host 网络，面板 127.0.0.1:8099 可达）
+docker run -d --name crag-authority --restart unless-stopped --network host \
+  -w /app -v $D:/data -v $D/tools:/app node:22-alpine \
+  node /app/activation-server.mjs --keys /data/keys.json --store /data/vouchers.json --port 8099
+
+# 3) 面板指向本地服务（.env）
+CRAG_ACTIVATION_URL=http://127.0.0.1:8099/v1/device-activation
+
+# 4) 面板代码里那 3 行补丁——镜像是上游构建的，必须挂进去：
+#    /opt/docker/vm2api/docker-compose.override.yml
+services:
+  vm2api:
+    volumes:
+      - ./patches/crag-license.mjs:/opt/vm2api/src/lib/vm/crag-license.mjs:ro
+```
+
+发码 / 查绑定 / 吊销，以及离线出证：
+
+```sh
+docker exec crag-authority node /app/mint-voucher.mjs --store /data/vouchers.json --term 1y
+docker exec crag-authority node /app/mint-voucher.mjs --store /data/vouchers.json --list
+docker exec crag-authority node /app/mint-voucher.mjs --store /data/vouchers.json --revoke CRAGR1.…
+node tools/mint-license.mjs --keys keys.json --machine-code CRAGM1.… --term 1y
+```
+
+面板兑换（脚本调用必须带 `Origin`，否则 `sameOriginPost` 直接 403）：
+
+```sh
+curl -X POST http://127.0.0.1:8787/api/panel/vms/vm-crag-01/crag-license \
+  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -H "Origin: http://127.0.0.1:8787" -H "Host: 127.0.0.1:8787" \
+  -d '{"registration_code":"CRAGR1.…"}'
+```
+
+实测结果：`{"ok":true, license.status:"valid", term:"1y", expires_at:1826433861}`（2027-11-17），
+许可证落到 `vms/vm-crag-01/run/crag-license/registration.code`（`CRAGL1.…`），
+重启槽位后仍为 `valid`、内核 `healthy:true`。

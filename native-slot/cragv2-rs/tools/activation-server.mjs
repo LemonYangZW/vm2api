@@ -57,7 +57,10 @@ const server = http.createServer((req, res) => {
     }
     const action = String(body.action || routed || '')
     const code = String(body.redemption_code || '')
-    if (String(body.issuer_public_key_id || '') !== authority.issuerId) return deny(res, 409, 'issuer_mismatch')
+    if (String(body.issuer_public_key_id || '') !== authority.issuerId) {
+      console.log(`[authority] issuer_mismatch got=${String(body.issuer_public_key_id || '').slice(0, 16)}… want=${authority.issuerId.slice(0, 16)}…`)
+      return deny(res, 409, 'issuer_mismatch')
+    }
     if (!isVoucher(code)) return deny(res, 404, 'redeem_unavailable')
 
     const data = store.read()
