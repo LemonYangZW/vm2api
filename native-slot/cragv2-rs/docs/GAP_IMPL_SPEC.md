@@ -1299,3 +1299,42 @@ cp /tmp/pw/src/lib/vm/*.mjs /opt/docker/vm2api/patches/   # 沙盒侧
 | #1122 包信任缓存，避免每槽重校验 | 面板侧缓存 | 与我们内核无关 |
 | #965 内存提升改异步 | 面板侧 | 我们沙盒的 `memory_diverged` 是宿主无 swap 限制，非此项 |
 | #739 对话结束释放 session 槽 | 池化回收 | 我们 `TuiPool` LRU + TTL 已覆盖 |
+
+### 16.10 程序级优化：transcript 轮询改成增量尾读（2026-11-17）
+
+`answer_after()` 在等 TUI 回合结束时每 150 ms 轮询一次 transcript，原实现每次
+`std::fs::read_to_string` 整份文件，再对**每一行**做 `serde_json::from_str`。
+短会话看不出来，长上下文是灾难——1M token 的 transcript 有几十 MB。
+
+实测（`tests/transcript_tail.rs::bench_incremental_scan`，30.0 MB / 264,347 行）：
+
+| 实现 | 每轮轮询耗时 |
+| :--- | :--- |
+| 旧：整读 + 逐行全量解析 | **1,358,488 µs（≈1.36 s）** |
+| 新：首次全扫（一次性） | 1,656,079 µs |
+| 新：之后每轮（无新增字节） | **1 µs** |
+
+后果不只是慢：单 worker Tokio 运行时上，每轮阻塞 1.36 s 会把**所有**其它任务
+（MCP 工具回包、SSE keepalive）一起饿住——和之前 120 s 卡顿是同一类事故，
+只是这次的触发条件是"上下文越长越严重"。
+
+改法（`tui.rs::scan_transcript`）：
+
+- 每份 transcript 记 `offset` / `carry`（未以换行结尾的残行）/ 两个计数，
+  只 `seek` 到 `offset` 读新增字节，O(新增) 而非 O(文件大小)。
+- **一次解析喂两个口径**：`count_text_answers` 与 `count_finished_assistant`
+  原来是两遍独立的全量解析，现在共用同一次逐行解析。
+- 便宜的前置过滤：整行不含 `assistant` 直接跳过，绝大多数行是 user / tool_result。
+- 文件长度回退（CLI 换会话重写）时自动重置缓存，避免计数永久偏高。
+- 对外 API 不变，调用点零改动。
+
+回归测试 `tests/transcript_tail.rs`（4 项）：追加可见、残行不计入、截断重置、
+重复轮询稳定。
+
+**剩余的同类热点**（尚未处理，按收益排序）：
+
+| 位置 | 现象 | 建议 |
+| :--- | :--- | :--- |
+| `transcript_answer_file` | 每轮结束整读一次（30 MB → ≈1.4 s） | 从文件尾部反向读若干 KB |
+| `gateway.rs:999` | 失败路径整读 `screen.log` | 只读尾部 N KB |
+| `emit_transcript_message` | 会把整个 message `Value` 克隆一次 | 按需借用/取子字段 |
