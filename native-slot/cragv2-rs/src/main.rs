@@ -454,18 +454,22 @@ async fn main() -> ExitCode {
     };
 
     let dataplane = config.dataplane.clone().unwrap_or_else(|| "crag".to_string());
+    let config_arc = std::sync::Arc::new(config.clone());
     let state = Arc::new(match (upstream, native_host) {
         (_, Some(pool)) => {
-            let mut state = GatewayState::native(pool, paths.internal_token(), &dataplane, slots);
+            let mut state = GatewayState::native(pool, paths.internal_token(), &dataplane, slots)
+                .with_config(std::sync::Arc::clone(&config_arc));
             if let Some(usage) = usage_config.clone() {
                 state = state.with_usage(usage);
             }
             state
         }
-        (Some(upstream), None) => GatewayState::direct(upstream, paths.internal_token(), &dataplane, slots),
+        (Some(upstream), None) => GatewayState::direct(upstream, paths.internal_token(), &dataplane, slots)
+            .with_config(std::sync::Arc::clone(&config_arc)),
         (None, None) if tui_pool.is_some() => {
             let pool = tui_pool.clone().expect("checked above");
-            let mut state = GatewayState::tui(pool, paths.internal_token(), &dataplane, slots);
+            let mut state = GatewayState::tui(pool, paths.internal_token(), &dataplane, slots)
+                .with_config(std::sync::Arc::clone(&config_arc));
             // 工具回调/park 的载体：同一个 Host，但 TUI 模式下不会 spawn 它。
             if let Some(native) = callback_pool.clone() {
                 state = state.with_native(native);

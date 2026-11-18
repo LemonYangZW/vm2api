@@ -1939,3 +1939,40 @@ const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shap
 **未声明的 8 个能力位**都是"声明了就要承担对应行为"的东西（例如 `provider_managed_tools_v1` 会让面板
 改写 provider 工具、`generation_controls_v3` 会改生成参数下发方式）。**宁可不声明**，也不假装支持——
 静默半支持比缺能力更糟。
+
+### 16.29 第三轮：机械清点 kernel.json 的 41 个键（并纠正前两轮的方法错误）
+
+**方法错误先说**：前两轮我按"源码里有没有这个字符串"来查，`config.rs` 用 serde 自动映射字段名，
+所以 `proxy_url` / `socket_path` / `internal_token` / `claude_bin` 这类**根本没带引号**的键被误判为"未读"。
+正确做法是拿面板**实际写的 kernel.json**（41 键）逐个在**全部 src 的标识符**里匹配。
+
+**真实差距（改前 9 个）**：`asset_dir` `auto_compact_window` `license_dir` `max_event_bytes`
+`max_response_bytes` `prewarm_enabled` `test_endpoints` `vm_id` `work_dir`。
+
+**这一轮接上的**（`3f40a40f`）：
+
+| 键 | 上游含义 | 实现 |
+| :--- | :--- | :--- |
+| `first_byte_timeout_seconds` | 首字节超时（600） | hop 默认值，`gateway_policy` 优先 |
+| `idle_timeout_seconds` | 流空闲超时（180） | 同上 |
+| `persona_preset` | `zero` 才 replace | 与 `crag_prompt.mode` 一起决定 replace/append |
+| `max_request_bytes` | 请求体上限（32MB） | 超限直接 413，不读进内存 |
+| `model_effort` | 按模型的 effort | 转发成 `--effort`（实测参数里出现 `--effort medium`） |
+| `thinking_display` | thinking 展示方式 | 转发成 `--thinking-display summarized` |
+| `work_dir` | 工作目录 | MCP 配置临时文件放这里，不再写 `/tmp` |
+| `vm_id` | 槽位标识 | `/internal/health` 上报（实测 `vm-crag-01`） |
+
+**仍未接的 7 个及理由**：
+
+| 键 | 为什么不接 |
+| :--- | :--- |
+| `license_dir` | 我们**不做**内核侧授权校验：授权由面板 + 自建 authority 服务负责。如果照厂商用 `crag-license-public.pem` 验签，我们自签的设备授权会被判非法，槽位直接起不来 |
+| `max_event_bytes` / `max_response_bytes` | 只做了请求体上限；事件/响应上限属于"超长输出保护"，我们目前靠 `max_tokens` 与 CLI 自身限制，未单独截断 |
+| `prewarm_enabled` | 当前面板写 `false`；语义是启动即预热一个 CLI。真值时的行为需要面板侧配合验证，先不猜 |
+| `asset_dir` / `auto_compact_window` / `test_endpoints` | 属厂商载荷解包、CLI 自动压缩窗口、codex 内核测试开关；native 通路无对应行为 |
+
+**验证**：165 测试通过；health `vm_id=vm-crag-01`、`capabilities` 5 项；CLI 参数实测带
+`--effort medium` 与 `--thinking-display summarized`；真实请求 200（无 403）。
+
+**上一轮那条"真 bug"也顺带说明**：`prewarm_enabled` 为 false 时，池子空闲报 `cli_pid: null` 是正常的，
+面板 1.4.139+ 靠 `execution_mode: "v2_process_pool"` 认可这种形态。

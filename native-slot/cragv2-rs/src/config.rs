@@ -33,6 +33,34 @@ pub struct KernelConfig {
     /// 上游基址（默认官方 api.anthropic.com）。
     #[serde(default)]
     pub upstream_base: Option<String>,
+    /// 面板下发的超时（秒）。gateway_policy 缺省时用它，别再写死 HOP_TIMEOUT。
+    #[serde(default)]
+    pub first_byte_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    /// 0 表示不限制。
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
+    /// 人设预设：`zero` 走 replace，其余（含 official_full）走 append——与上游一致。
+    #[serde(default)]
+    pub persona_preset: Option<String>,
+    /// 请求体上限。
+    #[serde(default)]
+    pub max_request_bytes: Option<u64>,
+    /// 每个模型的 effort 等级（面板下发）。
+    #[serde(default)]
+    pub model_effort: Option<std::collections::BTreeMap<String, String>>,
+    /// thinking 展示方式（`summarized` / `omitted` …）。
+    #[serde(default)]
+    pub thinking_display: Option<String>,
+    /// 槽位出口走代理时，CLI 需要拿到 HTTPS_PROXY。
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_required: Option<bool>,
+    /// 缓存 TTL 缺省值（请求里没带 cache_ttl 时用）。
+    #[serde(default)]
+    pub default_cache_ttl: Option<String>,
     /// hop 模式：`direct`（自控 h2/TLS，crag v2 原生形态）或 `slot`（交给槽位 CLI）。
     #[serde(default)]
     pub upstream_mode: Option<String>,
@@ -41,12 +69,6 @@ pub struct KernelConfig {
     /// 自定义根证书（企业代理 / 私有网关）；缺省用系统根证书。
     #[serde(default)]
     pub upstream_ca: Option<String>,
-    /// 出站代理：`socks5://` / `socks5h://` / `http://`（现网口径见 worker/internal/config）。
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-    /// 代理必需：为真且 `proxy_url` 为空时拒绝启动（不静默直连）。
-    #[serde(default)]
-    pub proxy_required: Option<bool>,
     /// 凭据文件路径（缺省 `/home/kincli/.claude/credentials.json`）。
     #[serde(default)]
     pub credential_path: Option<String>,

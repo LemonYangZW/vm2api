@@ -282,6 +282,10 @@ pub struct Args<'a> {
     /// `--allowedTools` 的前缀条目。print 模式下 MCP 工具默认**未授权**，
     /// 调用会返回权限错误（模型表现为"先把结果告诉你"），必须显式放行。
     pub allowed_tools: Vec<String>,
+    /// 面板 kernel.json 的 `model_effort`（按模型），转发成 `--effort`。
+    pub effort: Option<String>,
+    /// 面板 kernel.json 的 `thinking_display`，转发成 `--thinking-display`。
+    pub thinking_display: Option<String>,
 }
 
 impl Args<'_> {
@@ -302,6 +306,14 @@ impl Args<'_> {
         .collect();
         if self.bare {
             v.push("--bare".into());
+        }
+        if let Some(effort) = self.effort.as_deref().filter(|v| !v.trim().is_empty()) {
+            v.push("--effort".into());
+            v.push(effort.to_string());
+        }
+        if let Some(display) = self.thinking_display.as_deref().filter(|v| !v.trim().is_empty()) {
+            v.push("--thinking-display".into());
+            v.push(display.to_string());
         }
         if !self.allowed_tools.is_empty() {
             v.push("--allowedTools".into());
@@ -362,6 +374,8 @@ mod tests {
             bare: false,
             disallowed_tools: Vec::new(),
         allowed_tools: Vec::new(),
+        effort: None,
+        thinking_display: None,
         }
         .to_vec();
         let joined = args.join(" ");
@@ -383,6 +397,8 @@ mod tests {
             bare: true,
             disallowed_tools: Vec::new(),
         allowed_tools: Vec::new(),
+        effort: None,
+        thinking_display: None,
         }
         .to_vec();
         assert!(args.windows(2).any(|w| w[0] == "--system-prompt" && w[1] == "x"));

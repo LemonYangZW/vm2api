@@ -64,6 +64,8 @@ pub struct GatewayState {
     pub native: Option<Arc<crate::native::Pool>>,
     /// 声明的槽位数（直连模式下作为 `ready_slots` 上报）。
     pub slots: u32,
+    /// kernel.json（面板下发）。用它取超时、人设预设、effort 等，避免再写死。
+    pub config: Option<Arc<crate::config::KernelConfig>>,
     /// 在途 hop 数（两种通路通用；健康里的 `active`）。
     pub inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// TUI 通路（PTY 驱动官方 CLI）；`None` = 不走 TUI。
@@ -85,6 +87,7 @@ impl GatewayState {
             upstream: None,
             native: None,
             slots,
+            config: None,
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tui: None,
             usage: None,
@@ -101,6 +104,7 @@ impl GatewayState {
             upstream: Some(upstream),
             native: None,
             slots: slots.clamp(1, 20),
+            config: None,
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tui: None,
             usage: None,
@@ -109,6 +113,11 @@ impl GatewayState {
     }
 
     /// 原生 CLI 模式：请求交给官方 `claude` 自己发。
+    pub fn with_config(mut self, config: Arc<crate::config::KernelConfig>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     pub fn native(pool: Arc<crate::native::Pool>, token: Option<String>, dataplane: &str, slots: u32) -> Self {
         Self {
             host: None,
@@ -117,6 +126,7 @@ impl GatewayState {
             upstream: None,
             native: Some(pool),
             slots: slots.clamp(1, 20),
+            config: None,
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tui: None,
             usage: None,
@@ -134,6 +144,7 @@ impl GatewayState {
             native: None,
             tui: Some(pool),
             slots: slots.clamp(1, 20),
+            config: None,
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             usage: None,
             usage_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -235,6 +246,12 @@ impl GatewayState {
             "crag_telemetry_apply_v1": true,
             "gateway_policy_v1": true,
             "source": "rust-kernel",
+            "vm_id": self
+                .config
+                .as_ref()
+                .and_then(|c| c.extra.get("vm_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
             // 1.4.139 起面板认这个字段：进程池按需 spawn，空闲时 cli_pid=0 也算健康
             // （rust-kernel-supervisor.mjs: cli_pid > 0 || execution_mode === 'v2_process_pool'）。
             // 不报的话面板会认为内核"没起来"，反复重启槽位。
@@ -467,6 +484,25 @@ async fn handle_conn(mut stream: Stream, state: Arc<GatewayState>) -> std::io::R
         return Ok(());
     };
     let path = request.path.split('?').next().unwrap_or("/").to_string();
+
+    // 面板下发 `max_request_bytes`；超限直接 413，不把超大 body 读进内存再处理。
+    if let Some(limit) = state
+        .config
+        .as_ref()
+        .and_then(|c| c.max_request_bytes)
+        .filter(|v| *v > 0)
+    {
+        if request.body.len() as u64 > limit {
+            return respond(
+                &mut stream,
+                413,
+                "application/json",
+                br#"{"type":"error","error":{"type":"invalid_request_error","message":"request too large"}}"#,
+                &[("x-terminal-state", "error")],
+            )
+            .await;
+        }
+    }
 
     if !authorized(&state, &request.headers) {
         return respond(
@@ -749,7 +785,7 @@ async fn forward(
         return forward_tui(stream, pool, state.native.clone(), envelope, body).await;
     }
     if let Some(pool) = state.native.clone() {
-        return forward_native(stream, pool, envelope, body).await;
+        return forward_native(stream, pool, envelope, body, state.config.as_deref()).await;
     }
     if let Some(upstream) = state.upstream.clone() {
         return forward_upstream(stream, state, upstream, envelope, body).await;
@@ -1184,6 +1220,7 @@ async fn forward_native(
     pool: Arc<crate::native::Pool>,
     envelope: &Value,
     body: &Value,
+    config: Option<&crate::config::KernelConfig>,
 ) -> std::io::Result<()> {
     // `delivery_mode: "verified"`：面板要求"全部产出后再回"，**不允许提前发头**
     // （go-worker-client.mjs: only realtime exposes headers before completion）。
@@ -1292,8 +1329,14 @@ async fn forward_native(
                 )
                 .await;
             };
-            let config_path = std::env::temp_dir().join(format!("crag-mcp-{key}.json"));
-            let bridge_path = std::env::temp_dir().join(format!("crag-mcp-{key}-bridge.json"));
+            let tmp = config
+                .and_then(|c| c.extra.get("work_dir"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let config_path = tmp.join(format!("crag-mcp-{key}.json"));
+            let bridge_path = tmp.join(format!("crag-mcp-{key}-bridge.json"));
             let (for_cli, for_bridge) = crate::native::mcp_configs(
                 &crate::native::Pool::exe(),
                 &bridge_path,
@@ -1342,7 +1385,9 @@ async fn forward_native(
             replace_system = directive
                 .and_then(|d| d.get("mode"))
                 .and_then(|m| m.as_str())
-                == Some("replace");
+                == Some("replace")
+                // 面板的 persona_preset：`zero` 才 replace，其余（含 official_full）append。
+                || config.and_then(|c| c.persona_preset.as_deref()) == Some("zero");
             system = Some(match client_system {
                 Some(text) => format!("{text}{note}"),
                 None => note.trim_start().to_string(),
@@ -1356,6 +1401,11 @@ async fn forward_native(
             bare: false,
             disallowed_tools: if has_client_tools { crate::native::client_tool_names(body) } else { Vec::new() },
             allowed_tools: if has_client_tools { vec!["mcp__crag".to_string()] } else { Vec::new() },
+            effort: config
+                .and_then(|c| c.model_effort.as_ref())
+                .and_then(|m| m.get(&model))
+                .cloned(),
+            thinking_display: config.and_then(|c| c.thinking_display.clone()),
         }
         .to_vec();
         args.extend(extra);
@@ -1415,8 +1465,20 @@ async fn forward_native(
     let mut parked = false;
     let mut dropped: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut failure_code = "api_error";
-    let first_byte_timeout = policy_ms("first_byte_timeout_ms").unwrap_or(HOP_TIMEOUT);
-    let stream_idle_timeout = policy_ms("stream_idle_timeout_ms").unwrap_or(HOP_TIMEOUT);
+    let cfg_first = config
+        .and_then(|c| c.first_byte_timeout_seconds)
+        .filter(|s| *s > 0)
+        .map(std::time::Duration::from_secs);
+    let cfg_idle = config
+        .and_then(|c| c.idle_timeout_seconds)
+        .filter(|s| *s > 0)
+        .map(std::time::Duration::from_secs);
+    let first_byte_timeout = policy_ms("first_byte_timeout_ms")
+        .or(cfg_first)
+        .unwrap_or(HOP_TIMEOUT);
+    let stream_idle_timeout = policy_ms("stream_idle_timeout_ms")
+        .or(cfg_idle)
+        .unwrap_or(HOP_TIMEOUT);
     let mut first_event = true;
     let mut deadline = tokio::time::Instant::now() + first_byte_timeout;
     // SSE 保活：长 thinking 期间也要有字节下行，避免被客户端/中间层判死（对应上游 #997）。
