@@ -259,9 +259,11 @@ pub struct Args<'a> {
     /// (文本, 是否替换默认 system prompt)
     pub system_prompt: Option<(&'a str, bool)>,
     pub bare: bool,
-    /// 客户端带了工具时置真 → 传 `--tools ""`，只保留 MCP（客户端）工具。
-    /// 否则槽位 CLI 会用自己的内建 Bash/Read 在**容器里**执行，本地文件永远读不到。
-    pub no_builtin_tools: bool,
+    /// 客户端工具里与 CLI 内建同名的那些（Bash/Read…）。
+    ///
+    /// 用 `--disallowedTools` 只禁用**裸名**（内建），保留 `mcp__crag__*`（客户端工具）。
+    /// 早期用 `--tools ""` 会连 MCP 一起清掉，导致 park 永不发生、工具"消失"。
+    pub builtin_blocklist: Vec<String>,
 }
 
 impl Args<'_> {
@@ -283,11 +285,11 @@ impl Args<'_> {
         if self.bare {
             v.push("--bare".into());
         }
-        if self.no_builtin_tools {
-            // 对齐 vendor TUI 分支：清空内建工具，模型只能用 mcp__* 那些（回传给客户端执行）。
-            // 不带工具时不加，空工具表会被上游判为"客户端异常"。
-            v.push("--tools".into());
-            v.push(String::new());
+        if !self.builtin_blocklist.is_empty() {
+            v.push("--disallowedTools".into());
+            for name in &self.builtin_blocklist {
+                v.push(name.clone());
+            }
         }
         v.push("--strict-mcp-config".into());
         if let Some(path) = self.mcp_config {
@@ -334,7 +336,7 @@ mod tests {
             model: Some("claude-haiku-5-5"),
             system_prompt: Some(("be terse", false)),
             bare: false,
-            no_builtin_tools: false,
+            builtin_blocklist: Vec::new(),
         }
         .to_vec();
         let joined = args.join(" ");
@@ -354,7 +356,7 @@ mod tests {
             model: None,
             system_prompt: Some(("x", true)),
             bare: true,
-            no_builtin_tools: false,
+            builtin_blocklist: Vec::new(),
         }
         .to_vec();
         assert!(args.windows(2).any(|w| w[0] == "--system-prompt" && w[1] == "x"));

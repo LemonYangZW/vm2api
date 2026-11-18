@@ -1586,3 +1586,29 @@ function renderInitialPrompt(body, prompt) {
 
 对比：`cli-node` 数据面是纯转发（客户端自己的 CLI 执行工具），所以它天然没有这个问题；
 crag v2 必须由内核把客户端的工具转成 MCP 再回传，这条回路不完整就会表现为"工具消失"。
+
+### 16.18 工具回传：三轮实测与当前卡点（2026-11-17）
+
+目标：native 通路下，客户端（本地 Claude Code）带的工具必须**回传客户端执行**，
+不能落到容器的内建 Bash/Read 上。
+
+| 尝试 | 结果 | 结论 |
+| :--- | :--- | :--- |
+| 原样（不禁内建） | 文本 `/home/kincli` | 内建 Bash 在容器里执行 ❌ |
+| `--tools ""`（vendor TUI 写法） | 无容器路径，但 `stop_reason=tool_use` 且**无 tool_use 块** | `--tools ""` 把 MCP 工具也清掉了，park 永不发生 ❌ |
+| `--disallowedTools <客户端工具名>` + 系统提示说明 `mcp__crag__*` | `end_turn` 纯文本，模型未调用任何工具 | 模型没有把裸名映射到 MCP 工具 ❌ |
+
+已验证正常的部分：
+
+- MCP 配置写出正确：`mcpServers.crag.command = crag-v2 mcp-bridge --config …bridge.json`
+- 桥二进制在容器内可独立运行：`[crag-mcp] 1 tools -> http://127.0.0.1:…/_crag-v2/mcp/<session>`
+- 内核侧 park → `tool_use_sse` 合成分支存在（TUI 路径已用），native 路径也补了结尾 `pending_calls` 兜底
+
+**当前卡点**：模型侧始终不发起 MCP 调用。最可能的原因是**工具名不一致**——
+客户端 system prompt 写的是 `Bash`，而 CLI 侧只有 `mcp__crag__Bash`；
+上游的做法是用自己的 persona prompt（`crag-print-prompt`）**替换/追加** system，
+在其中按 MCP 名字描述工具，而不是原样透传客户端的 system prompt。
+
+下一步（确定性验证）：在容器内用**我们的完整参数**手跑一次 CLI，
+带上 `--mcp-config` 与 `--verbose`，观察它实际解析到的工具列表与 tool_use 决策——
+而不是继续靠改参数盲试。

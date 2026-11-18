@@ -1295,14 +1295,27 @@ async fn forward_native(
                 config_path.to_string_lossy().to_string(),
             ];
         }
-        let system = crate::native::system_text(body);
+        let mut system = crate::native::system_text(body);
+        if has_client_tools {
+            // 客户端 system prompt 里写的是裸工具名（Bash/Read…），而 CLI 侧这些工具以
+            // MCP 形式存在（mcp__crag__Bash）。不指明映射，模型会调用不存在的裸名，
+            // 结果是 stop_reason=tool_use 但没有任何可执行块（工具"消失"）。
+            const NOTE: &str = "
+
+# Tool routing
+Your tools are provided as MCP tools named `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the instructions above mention a tool such as `Bash`, always call the corresponding `mcp__crag__*` tool.";
+            system = Some(match system {
+                Some(text) => format!("{text}{NOTE}"),
+                None => NOTE.trim_start().to_string(),
+            });
+        }
         let mut args = crate::native::Args {
             session_id: &key,
             mcp_config: None,
             model: Some(model.as_str()).filter(|m| !m.is_empty()),
             system_prompt: system.as_deref().map(|text| (text, false)),
             bare: false,
-            no_builtin_tools: has_client_tools,
+            builtin_blocklist: if has_client_tools { crate::native::mcp_tools(body.get("tools").unwrap_or(&Value::Null)).iter().filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())).collect() } else { Vec::new() },
         }
         .to_vec();
         args.extend(extra);
@@ -1480,6 +1493,38 @@ async fn forward_native(
         if !diagnostics.trim().is_empty() {
             failure_code = "cli_unavailable";
             failure = Some(diagnostics);
+        }
+    }
+
+    // CLI 的 stream 结束时，MCP 桥可能刚好把调用 park 住，但 park 通知走的是另一条通道，
+    // 我们这边只看到通道关闭。这里补一次检查：还有挂起调用就合成 tool_use 回投，
+    // 否则客户端会收到 stop_reason=tool_use 却没有任何可执行的块（实测就是这种"工具消失"）。
+    if !parked {
+        let calls = pool.pending_calls(&key).await;
+        if !calls.is_empty() {
+            parked = true;
+            pool.remember_fingerprint(&key, crate::native::fingerprint_with_synthetic(body, &calls))
+                .await;
+            if streaming {
+                for (name, data) in crate::native::tool_use_sse(&model, &calls) {
+                    write_sse_raw(&mut stream, &name, &data).await?;
+                }
+            } else {
+                assistant = Some(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": calls
+                        .iter()
+                        .map(|(id, name, input)| json!({
+                            "type": "tool_use", "id": id, "name": name, "input": input,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "stop_reason": "tool_use",
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }));
+            }
         }
     }
 
