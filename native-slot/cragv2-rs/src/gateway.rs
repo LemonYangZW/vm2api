@@ -1267,24 +1267,17 @@ async fn forward_native(
         let mut system = client_system.clone();
         let mut replace_system = false;
         if has_client_tools {
-            // 对齐上游 crag-print-prompt：print worker 用 **replace** 的 persona，
-            // 明确告诉模型工具以 mcp__crag__<Name> 提供；原样透传客户端 system 时，
-            // 模型会调裸名（Bash），而裸内建已被禁用/或落到容器内，工具就"消失"了。
-            let mut persona = String::from(
-                "You are the CRAG v2 print worker running inside a Linux container.
-                 All actions must go through the MCP tools provided to you, whose names look like
-                 `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the client instructions
-                 below mention a tool such as `Bash` or `Read`, call the corresponding
-                 `mcp__crag__*` tool instead. You have no direct access to the user's filesystem.
-",
-            );
-            if let Some(text) = client_system.as_deref() {
-                persona.push_str("\n# Client instructions\n");
-                persona.push_str(text);
-                persona.push('\n');
-            }
-            system = Some(persona);
-            replace_system = true;
+            // 注意：**不能替换** system prompt。实测（§16.24）把 system 换成自家 persona 后，
+            // 中转会把带工具的请求一律判成"程序自动化/蒸馏"并 403；保留客户端原始 system、
+            // 只在末尾追加一小段工具路由说明，就恢复正常。
+            let note = "
+
+# Tool routing
+Every tool is exposed to you as an MCP tool named                         `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the instructions                         above mention a tool such as `Bash` or `Read`, call the corresponding                         `mcp__crag__*` tool; bare names are not available in this environment.";
+            system = Some(match client_system {
+                Some(text) => format!("{text}{note}"),
+                None => note.trim_start().to_string(),
+            });
         }
         let mut args = crate::native::Args {
             session_id: &key,

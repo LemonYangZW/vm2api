@@ -1789,3 +1789,31 @@ system 内容/体积、tools 数量与 schema 体积、渲染后 prompt 体积�
 
 **纪律补充**（接 §16.21）：出现 403 时不要"再试一条看看"，那本身就在加重判定；
 应当停下来等窗口过去，并用本地桩（`stub-upstream.mjs`）继续验证行为。
+
+### 16.24 中转 403 追查：把 system 改回 append（对齐上游），以及一次被自己污染的实验
+
+**上游怎么做的**（`src/lib/protocol/crag-print-prompt.mjs`）：
+
+```js
+const mode = preset === 'zero' ? 'replace' : 'append'   // 只有 zero 预设才 replace
+delete out.system                                        // 客户端 system 不原样透传
+out.crag_prompt = { mode, text: tail }                    // 交给内核以 append 注入
+```
+
+也就是说**默认一律 append**，只有 `zero` 预设才 replace。我们此前在"带工具"分支里
+把 system 整个替换成自家 persona（"You are the CRAG v2 print worker inside a Linux
+container…"），与上游相反 → 已改为 append，并在末尾附一小段工具路由说明
+（`mcp__crag__<Name>`）。
+
+**实验记录（含教训）**：用抓到的真实请求做二分时得到过"带工具就 403、去掉工具就通过"的结论
+（reqG 带 Bash → 403；reqH 同内容去掉 tools → 200，16 秒正常回答）。但继续二分十几条之后
+**连无工具的请求也开始 403**——说明二分过程本身把判定推到了账号/特征级，之前的"工具相关性"
+是**在阈值爬升过程中测到的，不可信**。
+
+结论：这条链路上**不能靠连续打真实请求做二分**。要判定形态问题，只能：
+
+1. 用本地桩（`native-slot/.tmp/lab/stub-upstream.mjs`）验证**出站请求的结构**
+   （system 是 append 还是 replace、tools 是否带、prompt 渲染形态），完全不消耗真实中转；
+2. 真实中转只在"改完之后确认一次"时打一条，且等判定窗口完全过去。
+
+**当前状态**：append 版本已部署（`6014775f`），但**未经真实链路验证**（部署后立刻遇到全局 403）。
