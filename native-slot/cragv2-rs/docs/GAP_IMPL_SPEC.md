@@ -1485,3 +1485,48 @@ native 的原因（见 §16.12），已改为启动时显式告警。
 - 绕过面板的配额/统计/多槽调度，仅适合单槽自用；
 - 容器 `bridge` 网卡是手工附加的，面板重建容器会丢失；
 - `tcp_listen` 写在内核配置里，DNAT 规则在 iptables 里，两者都不随面板迁移。
+
+### 16.15 修复：native 通路多轮失忆（移植 vendor 的 renderInitialPrompt）（2026-11-17）
+
+**根因**（三处叠加，缺一不成立）：
+
+1. `native::last_user_content()` 只取最后一条 user 消息；
+2. spawn 参数带 `--no-session-persistence`，CLI 既不读也不写会话；
+3. 于是客户端发来的 `messages`（完整历史）被整段丢弃，模型每轮只看到一句话。
+
+**上游怎么做的**（`.tmp/cragv2/legacy/share/crag-v2/gateway/v2-runtime.mjs`）：
+
+```js
+function renderInitialPrompt(body, prompt) {
+  const lastUser = [...messages].reverse().find(m => m?.role === "user");
+  const history  = messages.slice(0, messages.lastIndexOf(lastUser));
+  const renderedHistory = `<conversation_history>…</conversation_history>`;
+  return `${instructions}${renderedHistory}<current_turn>${current}</current_turn>`;
+}
+```
+
+即：**把历史渲染进 prompt**，每轮发一条自包含的完整 prompt。
+正因如此，`--no-session-persistence` 在上游是合理的——历史不依赖 CLI 保存。
+另有分支：请求里带 `tool_result` 时按 `continuationFingerprint` 匹配挂起的工具调用，
+只回填结果、不重发历史。这一分支我们已由 MCP park/resolve 覆盖。
+
+**移植**（`native::render_initial_prompt` + `render_message`/`render_content`/`render_block`）：
+
+- 历史 → `<conversation_history>`，每条按 `[role]` 前缀；
+- `tool_use` → `[tool call <name>]` + input JSON；
+- `tool_result` → `[tool result <id>]` + 内容；
+- 未知块 → `[unsupported content block: <type>]`（与上游同形）；
+- 最后一条 user 包进 `<current_turn>`。
+- **TUI 路径同样切换**（此前只拼最后一条的 text 块，同样会失忆）。
+
+**验证**（经 TCP 端点、模型 `claude-haiku-5-5`）：
+
+```
+请求 messages = [user: 请记住暗号 ORANGE-4271, assistant: OK, user: 暗号是什么]
+回答 = ORANGE-4271   ✔
+```
+
+修复前同样的两轮形状会答"这段对话里没有上一轮的内容"。
+
+单测：`render_initial_prompt_carries_history`（历史包含且本轮不重复）、
+`..._without_history_is_just_current_turn`、`..._renders_tool_blocks`（共 163 项通过）。

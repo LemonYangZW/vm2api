@@ -138,6 +138,92 @@ pub struct Host {
     pub tap_enabled: bool,
 }
 
+/// 把整段对话渲染成**一条自包含 prompt**，对齐 vendor `renderInitialPrompt`。
+///
+/// 为什么必须这么做：native 通路用 `--no-session-persistence` 起 CLI（每次都是
+/// 全新进程、不读也不写会话），CLI 自己不会保存历史。上游的做法是把
+/// `messages` 里除最后一条 user 以外的全部内容渲染进 `<conversation_history>`，
+/// 再把最后一条包进 `<current_turn>`，于是每轮都是一条完整、可独立理解的 prompt。
+///
+/// 我们早期只把最后一条 user 交给 CLI，等于把历史整段丢弃——多轮对话因此失忆。
+pub fn render_initial_prompt(body: &Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let last = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))?;
+    let current = render_content(messages[last].get("content").unwrap_or(&Value::Null));
+    if current.trim().is_empty() {
+        return None;
+    }
+    let history = &messages[..last];
+    let mut prompt = String::new();
+    if !history.is_empty() {
+        prompt.push_str("<conversation_history>\n");
+        let rendered: Vec<String> = history.iter().map(render_message).collect();
+        prompt.push_str(&rendered.join("\n\n"));
+        prompt.push_str("\n</conversation_history>\n\n");
+    }
+    prompt.push_str("<current_turn>\n");
+    prompt.push_str(&current);
+    prompt.push_str("\n</current_turn>");
+    Some(prompt)
+}
+
+fn render_message(message: &Value) -> String {
+    let role = message
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("message");
+    format!(
+        "[{role}]\n{}",
+        render_content(message.get("content").unwrap_or(&Value::Null))
+    )
+}
+
+fn render_content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(render_block)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn render_block(block: &Value) -> String {
+    let kind = block.get("type").and_then(|value| value.as_str());
+    match kind {
+        Some("text") => block
+            .get("text")
+            .and_then(|text| text.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        Some("tool_use") => format!(
+            "[tool call {}]\n{}",
+            block.get("name").and_then(|name| name.as_str()).unwrap_or("tool"),
+            block
+                .get("input")
+                .map(|input| input.to_string())
+                .unwrap_or_else(|| "{}".to_string())
+        ),
+        Some("tool_result") => format!(
+            "[tool result {}]\n{}",
+            block
+                .get("tool_use_id")
+                .and_then(|id| id.as_str())
+                .unwrap_or(""),
+            render_content(block.get("content").unwrap_or(&Value::Null))
+        ),
+        other => format!(
+            "[unsupported content block: {}]",
+            other.unwrap_or("unknown")
+        ),
+    }
+}
+
 /// 只把**最后一轮 user 消息**交给 CLI：会话由 CLI 自己维护。
 pub fn last_user_content(body: &Value) -> Option<Value> {
     body.get("messages")
@@ -1206,3 +1292,53 @@ async fn handle_callback(mut socket: tokio::net::TcpStream, pool: Arc<Pool>) -> 
     }
     Ok(())
 }
+
+    #[test]
+    fn render_initial_prompt_carries_history() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "暗号 ORANGE"},
+                {"role": "assistant", "content": [{"type": "text", "text": "记住了"}]},
+                {"role": "user", "content": [{"type": "text", "text": "暗号是什么"}]},
+            ]
+        });
+        let prompt = render_initial_prompt(&body).expect("应渲染出 prompt");
+        assert!(prompt.contains("<conversation_history>"), "{prompt}");
+        assert!(prompt.contains("[user]
+暗号 ORANGE"), "历史必须带上：{prompt}");
+        assert!(prompt.contains("[assistant]
+记住了"), "{prompt}");
+        assert!(prompt.contains("<current_turn>
+暗号是什么"), "{prompt}");
+        // 历史只到倒数第二条，不能把本轮重复一次。
+        assert_eq!(prompt.matches("暗号是什么").count(), 1);
+    }
+
+    #[test]
+    fn render_initial_prompt_without_history_is_just_current_turn() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let prompt = render_initial_prompt(&body).unwrap();
+        assert!(!prompt.contains("<conversation_history>"));
+        assert_eq!(prompt, "<current_turn>
+hello
+</current_turn>");
+    }
+
+    #[test]
+    fn render_initial_prompt_renders_tool_blocks() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "file body"}
+                ]},
+                {"role": "user", "content": "continue"},
+            ]
+        });
+        let prompt = render_initial_prompt(&body).unwrap();
+        assert!(prompt.contains("[tool call Read]"), "{prompt}");
+        assert!(prompt.contains("[tool result t1]"), "{prompt}");
+        assert!(prompt.contains("file body"), "{prompt}");
+    }

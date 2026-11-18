@@ -821,26 +821,13 @@ async fn forward_tui(
         .await;
     }
 
-    // TUI 只能喂纯文本：把最后一轮 user 的 text 块拼起来。
-    let Some(prompt) = crate::native::last_user_content(body).and_then(|content| {
-        let text = match content {
-            Value::String(text) => text,
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>()
-                .join("
-"),
-            _ => String::new(),
-        };
-        (!text.trim().is_empty()).then_some(text)
-    }) else {
+    // TUI 也走同一条渲染：CLI 每轮看到的是自包含的完整 prompt（含历史）。
+    let Some(prompt) = crate::native::render_initial_prompt(body) else {
         return respond(
             &mut stream,
             400,
             "application/json",
-            serde_json::to_string(&error_body("invalid_request_error", "messages 里没有可投递的 text"))
+            serde_json::to_string(&error_body("invalid_request_error", "messages 里没有可投递的 user 内容"))
                 .unwrap_or_default()
                 .as_bytes(),
             &[],
@@ -1246,7 +1233,7 @@ async fn forward_native(
             }
         }
     } else {
-        let Some(content) = crate::native::last_user_content(body) else {
+        let Some(prompt_text) = crate::native::render_initial_prompt(body) else {
             return respond(
                 &mut stream,
                 400,
@@ -1320,7 +1307,10 @@ async fn forward_native(
 
         let frame = match serde_json::to_value(StdinFrame::user(
             &key,
-            Message { role: "user".into(), content },
+            Message {
+                role: "user".into(),
+                content: Value::String(prompt_text),
+            },
         )) {
             Ok(frame) => frame,
             Err(error) => {
