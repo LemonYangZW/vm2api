@@ -1976,3 +1976,46 @@ const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shap
 
 **上一轮那条"真 bug"也顺带说明**：`prewarm_enabled` 为 false 时，池子空闲报 `cli_pid: null` 是正常的，
 面板 1.4.139+ 靠 `execution_mode: "v2_process_pool"` 认可这种形态。
+
+### 16.30 第四轮：面板取模型/用量的真实通道是 **exec 子命令**，不是 HTTP
+
+前几轮一直数 `/internal/*` 的 HTTP 路由，漏了更基本的一层：**面板有些能力根本不走 HTTP**。
+
+`go-worker-client.mjs` 的 `callWorkerGet()` 里，真实分支是这样的：
+
+```js
+if (requestPath === '/internal/v1/models')      return runSlotOauth(exec, 'models', { timeoutMs })
+if (requestPath === '/internal/oauth/usage')    return runSlotOauth(exec, 'usage',  { timeoutMs })
+```
+
+而 `runSlotOauth()`（`slot-oauth.mjs`）做的事是 **在槽里 exec worker 二进制**：
+
+```js
+const argv = slotExecArgv(vm, [WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG], ...)
+```
+
+`WORKER_BIN` 就是 `kin-kernel` → `exec "$DIR/crag-v2/crag-v2" "$@"`，落到**我们的二进制**上。
+解析方式：取 **stdout 最后一行** JSON，且必须是**信封** `{ok, status, body}`（不是裸 body）。
+另外 `crs-usage-probe.mjs` 还会 exec `oauth profile`。
+
+**实测缺口**：`crag-v2 oauth models --config ...` 在部署版上只打印 usage 就 `exit 2`。
+也就是说面板对**本槽**的模型列表与额度探测一直是失败的，只是不报错。
+
+**这一轮补的三个子命令**（`dd1fad83`）：
+
+| 子命令 | 返回 | 说明 |
+| :--- | :--- | :--- |
+| `oauth models` | `{ok:true,status:200,body:{object:"list",data:[{id,object,owned_by}]}}` | 模型集合取面板下发的 `model_effort` 键（面板就是要往这些模型上路由），为空才用内置默认 |
+| `oauth usage` | 有 OAuth 凭据时调 `usage::fetch` 的真实结果 | 没有凭据（本槽用 API key）→ `501 usage_unsupported`，**不是 401**：401 会让面板以为账号掉线 |
+| `oauth profile` | `{ok:true,status:200,body:{account:{subscription_type:"max"}}}` | 面板用 `tierFromOauthProfile` 推订阅档位 |
+
+**实测输出**（`.67` 槽内，用户 10001）：
+
+```
+usage    {"ok":false,"status":501,"body":{"error":{"code":"usage_unsupported","message":"no oauth credential on this slot"}}}
+models   {"ok":true,"status":200,"body":{"object":"list","data":[{"id":"claude-fable-5-2",...
+```
+
+**教训（写进方法论）**：清点契约面时，"HTTP 路由"只是其中一层。还有
+① exec 子命令（`oauth <op>`、`--license-capabilities`）；② 环境变量；③ 配置文件键。
+三层都要数，只数一层就会像这次一样，面板的可见功能一直静默失败而不报错。

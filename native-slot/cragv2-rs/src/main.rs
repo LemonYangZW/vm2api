@@ -114,6 +114,109 @@ rl.on('line', (line) => {
     vec!["node".to_string(), "-e".to_string(), script.to_string()]
 }
 
+
+fn oauth_invocation() -> Option<(String, Option<String>)> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(|v| v.as_str()) != Some("oauth") {
+        return None;
+    }
+    let op = argv.get(1)?.clone();
+    let cfg = argv
+        .iter()
+        .position(|a| a == "--config" || a == "-c")
+        .and_then(|i| argv.get(i + 1).cloned())
+        .or_else(|| {
+            argv.iter()
+                .find_map(|a| a.strip_prefix("--config=").map(|v| v.to_string()))
+        });
+    Some((op, cfg))
+}
+
+/// 面板（`slot-oauth.mjs`）不是走 HTTP 取模型/用量，而是 **exec 本二进制**：
+/// `crag-v2 oauth models|usage|profile --config <kernel.json>`，取 stdout **最后一行** 的
+/// JSON，且必须是 `{ok,status,body}` 信封（不是裸 body）。
+/// 缺这三个子命令时面板的用量面板 / 模型列表 / 订阅档位对本槽全废。
+fn run_oauth_subcommand(op: &str, config_path: Option<&str>) -> i32 {
+    let config = config_path
+        .and_then(|p| cragv2::config::KernelConfig::load(std::path::Path::new(p)).ok())
+        .unwrap_or_default();
+    let envelope = |ok: bool, status: u16, body: serde_json::Value| {
+        let payload = serde_json::json!({ "ok": ok, "status": status, "body": body });
+        println!("{}", serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into()));
+    };
+    match op {
+        "models" => {
+            // 面板把要路由到本槽的模型写在 model_effort 里，就用它作为可服务集合。
+            let mut ids: Vec<String> = config
+                .model_effort
+                .as_ref()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            if ids.is_empty() {
+                ids = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5"]
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect();
+            }
+            let data: Vec<serde_json::Value> = ids
+                .into_iter()
+                .map(|id| serde_json::json!({"id": id, "object": "model", "owned_by": "anthropic"}))
+                .collect();
+            envelope(true, 200, serde_json::json!({"object": "list", "data": data}));
+            0
+        }
+        "usage" => {
+            let store = cragv2::credential::Store::new(config.credential_path());
+            match store.load().map(|(v, _)| v) {
+                Ok(cred) if !cred.access_token.trim().is_empty() => {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(_) => return 1,
+                    };
+                    let ca = config.upstream_ca.clone().map(std::path::PathBuf::from);
+                    match rt.block_on(cragv2::usage::fetch(&config.usage_base(), &cred.access_token, ca.as_deref())) {
+                        Ok(probe) => {
+                            // UsageProbe 自带 status/body：直接用它的 body，别再包一层。
+                            let ok = (200..300).contains(&probe.status);
+                            envelope(ok, probe.status, probe.body);
+                            0
+                        }
+                        Err(err) => {
+                            envelope(false, 502, serde_json::json!({"error": {"code": "usage_probe_failed", "message": err.to_string()}}));
+                            0
+                        }
+                    }
+                }
+                _ => {
+                    // 本槽用 API key 认证、没有 OAuth 凭据 → 用量探测本就不适用。
+                    // 报 501 usage_unsupported（与 HTTP `/internal/oauth/usage` 同义），
+                    // 不要报 401：那会让面板以为账号掉线。
+                    envelope(false, 501, serde_json::json!({"error": {"code": "usage_unsupported", "message": "no oauth credential on this slot"}}));
+                    0
+                }
+            }
+        }
+        "profile" => {
+            // 面板用 tierFromOauthProfile(body) 推订阅档位；我们用身份自述。
+            let body = serde_json::json!({
+                "account": {
+                    "subscription_type": config
+                        .extra
+                        .get("subscription_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("max"),
+                },
+            });
+            envelope(true, 200, body);
+            0
+        }
+        other => {
+            envelope(false, 400, serde_json::json!({"error": {"code": "worker_op_invalid", "message": other}}));
+            2
+        }
+    }
+}
+
 /// 能力声明：面板用 `crag-v2 --license-capabilities` 探测，期望一行 JSON 后退出。
 ///
 /// 只声明**真实**能力：宿主订阅读（CRAGH1）与席位由面板 + 自建授权服务承载，
@@ -222,6 +325,11 @@ async fn main() -> ExitCode {
         println!("{VERSION} (CRAG v2 native kernel; rust)");
         return ExitCode::SUCCESS;
     }
+    // `oauth <op> --config <path>`：面板 exec 取 stdout JSON（见 run_oauth_subcommand 注释）。
+    if let Some((op, cfg)) = oauth_invocation() {
+        return ExitCode::from(run_oauth_subcommand(&op, cfg.as_deref()) as u8);
+    }
+
     if args.license_capabilities {
         // 面板用 `docker exec ... crag-v2 --license-capabilities` 探测能力，
         // 期望 stdout 是一行 JSON 后立即退出（vm-runtime.mjs 里 assertCragSubscriptionTarget）。
