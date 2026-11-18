@@ -227,6 +227,11 @@ async fn main() -> ExitCode {
         },
         None => KernelConfig::default(),
     };
+    if let Err(error) = config.validate() {
+        eprintln!("[crag] config: {error}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("[crag] hop mode = {}", config.mode_label());
     let paths = RuntimePaths::resolve(&config);
     let socket = args
         .socket

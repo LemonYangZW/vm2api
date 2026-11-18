@@ -1364,3 +1364,50 @@ cp /tmp/pw/src/lib/vm/*.mjs /opt/docker/vm2api/patches/   # 沙盒侧
 | :--- | :--- | :--- |
 | `gateway.rs:999` | 失败路径整读 `screen.log` | 只读尾部 N KB（同样是日志，非 JSONL） |
 | `emit_transcript_message` | 会把整个 message `Value` 克隆一次 | 按需借用/取子字段 |
+
+### 16.12 禁止静默降级（2026-11-17）
+
+真机验证时暴露：**通路会悄无声息地变成另一种**，行为变了却没有任何报错。三处一并修掉。
+
+**① 键名写错 → 静默回退 `direct`**
+
+`upstream_mode` 是唯一决定 hop 的键。写成 `hop_mode` / `transport` / `hop` 时，
+内核拿不到值就默认 `direct`（自己拼请求），只有一行日志容易漏看。
+
+现在 `KernelConfig::validate()` 在启动时硬校验：
+
+```
+[crag] config: 配置里有 "hop_mode"，但内核只认 "upstream_mode"（native / tui / direct）；拒绝启动，避免静默回退到 direct
+退出码 = 1
+```
+
+`upstream_mode` 取值也校验（拼错同样报错）。启动日志额外打印来源：
+`hop mode = native（来自 provider=local_cli）` / `…（未配置，使用默认值）`。
+
+**② 面板写 `provider: "local_cli"` 被完全忽略**
+
+面板表达"让槽内官方 CLI 发包"用的是 `provider: "local_cli"`（并附 `claude_bin`）。
+早期实现只看 `upstream_mode`，于是这类槽位**静默跑成 direct**——内核自己发请求，
+而面板指定的官方 CLI 从未启动过。这不仅违背"内核不构建请求"的既定决策，
+也让出站形态与官方不一致。
+
+现在 `effective_mode()`：显式 `upstream_mode` 优先，否则 `provider == local_cli`
+归一为 `native`。并新增矛盾校验：`upstream_mode=direct` + `provider=local_cli` 直接报错。
+
+**③ `claude_bin` 被解析但从不使用**
+
+`cli_bin()` 只看 `cli_bin` / `$CRAG_CLI_BIN` / `claude`（PATH）。面板写的绝对路径
+`claude_bin` 被忽略，而容器里通常没有 `claude` 在 PATH 上 → native 通路一 spawn 就失败。
+现在按文档语义排序：`claude_bin` → `cli_bin` → `$CRAG_CLI_BIN` → `claude`。
+
+**沙盒实测（1.4.136 面板 + 内核 `a9a1b90a`）**
+
+```
+[crag] hop mode = native（来自 provider=local_cli）
+[crag] hop mode: native cli -> /home/kincli/.kin/crag-v2/claude-code-2.1.321/claude
+[crag] 2.1.321 listening on /run/kin/kernel.sock (dataplane=crag)
+health: hop_mode="native"  ← 修复前这里是 "direct"
+```
+
+单测覆盖：键名笔误报错、`upstream_mode` 拼错报错、`provider=local_cli` 归一为 native、
+`direct` 与 `local_cli` 矛盾报错、`claude_bin` 优先于 `cli_bin`（共 160 项通过）。

@@ -114,7 +114,17 @@ impl KernelConfig {
         self.slots_per_worker.unwrap_or(20).clamp(1, 20)
     }
 
+    /// 槽内 CLI 可执行文件：`claude_bin`（面板声明，优先）→ `cli_bin` →
+    /// `$CRAG_CLI_BIN` → `claude`。
+    ///
+    /// 早期实现漏了 `claude_bin`，面板明明写了绝对路径，内核却去 PATH 里找
+    /// `claude`（容器里通常没有），一旦走 native 通路就会 spawn 失败。
     pub fn cli_bin(&self) -> String {
+        if let Some(path) = self.claude_bin() {
+            if !path.trim().is_empty() {
+                return path;
+            }
+        }
         self.cli_bin
             .clone()
             .or_else(|| std::env::var("CRAG_CLI_BIN").ok().filter(|v| !v.trim().is_empty()))
@@ -155,24 +165,84 @@ impl KernelConfig {
         crate::http::proxy::ProxySettings { url, required }
     }
 
-    /// 是否直连上游（自控 wire）。
-    pub fn direct(&self) -> bool {
-        self.upstream_mode
-            .as_deref()
-            .map(|mode| mode.eq_ignore_ascii_case("direct"))
-            .unwrap_or(true)
+    /// 生效的 hop 模式：**显式配置优先，其次看面板写的 `provider`**。
+    ///
+    /// 面板对"让槽内官方 CLI 发 hop"的写法是 `provider: "local_cli"`（并带
+    /// `claude_bin`）。早期实现只看 `upstream_mode`，于是这种配置被静默降级成
+    /// `direct`——内核自己拼请求，而面板要用的官方 CLI 从未启动。现在按 provider
+    /// 归一到 native。
+    pub fn effective_mode(&self) -> String {
+        if let Some(mode) = self.upstream_mode.as_deref() {
+            return mode.trim().to_ascii_lowercase();
+        }
+        if self.provider().as_deref() == Some("local_cli") {
+            return "native".to_string();
+        }
+        "direct".to_string()
     }
 
-    /// `transport`：`direct`（内核自拼 wire，默认）| `native`（官方 CLI 发包）。
+    /// 是否直连上游（自控 wire）。
+    pub fn direct(&self) -> bool {
+        self.effective_mode() == "direct"
+    }
+
+    /// `transport`：`direct`（内核自拼 wire）| `native`（官方 CLI 发包）| `tui`。
     pub fn transport(&self) -> String {
-        self.upstream_mode
-            .as_deref()
-            .map(|mode| mode.to_ascii_lowercase())
-            .unwrap_or_else(|| "direct".to_string())
+        self.effective_mode()
     }
 
     pub fn is_native(&self) -> bool {
-        self.transport() == "native"
+        self.effective_mode() == "native"
+    }
+
+    /// 校验影响通路的配置，**不允许静默降级**。
+    ///
+    /// 真实事故：把键写成 `hop_mode` / `transport` 时，内核拿不到 `upstream_mode`
+    /// 就默默回退到 `direct`，于是本该走官方 CLI 的槽位变成内核自己发请求——
+    /// 行为完全变了却没有任何报错，只有一行 `hop mode: direct` 容易被忽略。
+    pub fn validate(&self) -> Result<(), String> {
+        const ALLOWED: [&str; 3] = ["native", "tui", "direct"];
+        if let Some(mode) = self.upstream_mode.as_deref() {
+            let lowered = mode.trim().to_ascii_lowercase();
+            if !ALLOWED.contains(&lowered.as_str()) {
+                return Err(format!(
+                    "upstream_mode=\"{mode}\" 不认识；可选值：{}",
+                    ALLOWED.join(" / ")
+                ));
+            }
+        }
+        // 显式 direct + 面板要求本地 CLI：语义冲突，拒绝启动。
+        if self.upstream_mode.is_some()
+            && self.direct()
+            && self.provider().as_deref() == Some("local_cli")
+        {
+            return Err(
+                "配置矛盾：upstream_mode=\"direct\" 但 provider=\"local_cli\"（面板要求由槽内官方 CLI 发包）；                 请二选一，拒绝静默择一执行"
+                    .to_string(),
+            );
+        }
+        // 近义键名的笔误：直接报错并指出正确键名，而不是当作未知字段忽略。
+        for near_miss in ["hop_mode", "hop", "transport", "upstream", "mode"] {
+            if self.extra.contains_key(near_miss) {
+                return Err(format!(
+                    "配置里有 \"{near_miss}\"，但内核只认 \"upstream_mode\"（native / tui / direct）；\
+                     拒绝启动，避免静默回退到 direct"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 启动日志用：说明通路来自哪个键，缺省时明确标注"默认值"。
+    pub fn mode_label(&self) -> String {
+        let mode = self.effective_mode();
+        if self.upstream_mode.is_some() {
+            return format!("{mode}（来自 upstream_mode）");
+        }
+        if self.provider().as_deref() == Some("local_cli") {
+            return format!("{mode}（来自 provider=local_cli）");
+        }
+        format!("{mode}（未配置 upstream_mode / provider，使用默认值）")
     }
 
     /// `transport: "tui"`：PTY 驱动官方 CLI（出站请求与真实安装同形）。
@@ -393,3 +463,67 @@ mod tests {
         assert!(config.extra.contains_key("future_field"));
     }
 }
+
+    #[test]
+    fn rejects_unknown_upstream_mode() {
+        let mut config = KernelConfig::default();
+        config.upstream_mode = Some("natvie".into());
+        assert!(config.validate().is_err(), "拼错必须是硬错误");
+    }
+
+    #[test]
+    fn rejects_near_miss_key_instead_of_silent_fallback() {
+        // 写成 hop_mode 时过去会静默回退 direct；现在必须直接失败。
+        let mut config = KernelConfig::default();
+        config
+            .extra
+            .insert("hop_mode".into(), serde_json::json!("native"));
+        let error = config.validate().expect_err("必须报错");
+        assert!(error.contains("upstream_mode"), "错误信息要指出正确键名");
+    }
+
+    #[test]
+    fn accepts_known_modes_and_default() {
+        for mode in ["native", "TUI", "direct"] {
+            let mut config = KernelConfig::default();
+            config.upstream_mode = Some(mode.into());
+            assert!(config.validate().is_ok(), "{mode} 应被接受");
+        }
+        assert!(KernelConfig::default().validate().is_ok(), "缺省走 direct");
+        assert!(KernelConfig::default().mode_label().contains("默认值"));
+    }
+
+    #[test]
+    fn provider_local_cli_implies_native_not_silent_direct() {
+        // 面板写 provider=local_cli + claude_bin，就是要让官方 CLI 发包。
+        // 早期实现忽略 provider，静默跑成 direct（内核自己拼请求）。
+        let mut config = KernelConfig::default();
+        config
+            .extra
+            .insert("provider".into(), serde_json::json!("local_cli"));
+        assert_eq!(config.effective_mode(), "native");
+        assert!(config.is_native());
+        assert!(!config.direct());
+        assert!(config.mode_label().contains("provider=local_cli"));
+    }
+
+    #[test]
+    fn explicit_direct_with_local_cli_is_rejected() {
+        let mut config = KernelConfig::default();
+        config.upstream_mode = Some("direct".into());
+        config
+            .extra
+            .insert("provider".into(), serde_json::json!("local_cli"));
+        let error = config.validate().expect_err("矛盾配置必须报错");
+        assert!(error.contains("local_cli"));
+    }
+
+    #[test]
+    fn claude_bin_wins_over_generic_cli_bin() {
+        let mut config = KernelConfig::default();
+        config.cli_bin = Some("claude".into());
+        config
+            .extra
+            .insert("claude_bin".into(), serde_json::json!("/opt/claude"));
+        assert_eq!(config.cli_bin(), "/opt/claude", "面板声明的路径优先");
+    }
