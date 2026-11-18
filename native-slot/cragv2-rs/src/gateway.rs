@@ -1246,6 +1246,7 @@ async fn forward_native(
             .await;
         };
         let tools = crate::native::mcp_tools(body.get("tools").unwrap_or(&Value::Null));
+        let has_client_tools = !tools.is_empty();
         let mut extra: Vec<String> = Vec::new();
         if !tools.is_empty() {
             let Some(base) = pool.callback_base() else {
@@ -1301,6 +1302,7 @@ async fn forward_native(
             model: Some(model.as_str()).filter(|m| !m.is_empty()),
             system_prompt: system.as_deref().map(|text| (text, false)),
             bare: false,
+            no_builtin_tools: has_client_tools,
         }
         .to_vec();
         args.extend(extra);

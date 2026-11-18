@@ -259,6 +259,9 @@ pub struct Args<'a> {
     /// (文本, 是否替换默认 system prompt)
     pub system_prompt: Option<(&'a str, bool)>,
     pub bare: bool,
+    /// 客户端带了工具时置真 → 传 `--tools ""`，只保留 MCP（客户端）工具。
+    /// 否则槽位 CLI 会用自己的内建 Bash/Read 在**容器里**执行，本地文件永远读不到。
+    pub no_builtin_tools: bool,
 }
 
 impl Args<'_> {
@@ -279,6 +282,12 @@ impl Args<'_> {
         .collect();
         if self.bare {
             v.push("--bare".into());
+        }
+        if self.no_builtin_tools {
+            // 对齐 vendor TUI 分支：清空内建工具，模型只能用 mcp__* 那些（回传给客户端执行）。
+            // 不带工具时不加，空工具表会被上游判为"客户端异常"。
+            v.push("--tools".into());
+            v.push(String::new());
         }
         v.push("--strict-mcp-config".into());
         if let Some(path) = self.mcp_config {
@@ -325,6 +334,7 @@ mod tests {
             model: Some("claude-haiku-5-5"),
             system_prompt: Some(("be terse", false)),
             bare: false,
+            no_builtin_tools: false,
         }
         .to_vec();
         let joined = args.join(" ");
@@ -344,6 +354,7 @@ mod tests {
             model: None,
             system_prompt: Some(("x", true)),
             bare: true,
+            no_builtin_tools: false,
         }
         .to_vec();
         assert!(args.windows(2).any(|w| w[0] == "--system-prompt" && w[1] == "x"));

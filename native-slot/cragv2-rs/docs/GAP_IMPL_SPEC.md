@@ -1556,3 +1556,33 @@ function renderInitialPrompt(body, prompt) {
 
 > 注意口径：本表是"单条大字符串"的填充历史；真实 transcript 含大量
 > `tool_use` / `tool_result` 块，`Value` 树开销会更大，故给出 2–3 倍余量。
+
+### 16.17 工具执行位置：容器内建工具 vs 回传客户端（2026-11-17）
+
+现象：本地 Claude Code 通过 native 通路问"分析我的仓库"，模型却在容器里 `ls`，
+看到 `/home/kincli`，完全读不到用户磁盘。
+
+**实测确认原因**：native 分支没有禁用槽位 CLI 的**内建工具**。客户端带来的 `Bash/Read`
+被映射成 MCP 工具，但模型调用 `Bash` 时 CLI 解析到自己的内建 Bash，**在容器里执行**。
+证据（带 `Bash` 工具定义请求一条）：
+
+```
+修复前： 事件含 tool_use，最终文本 = "/home/kincli"   ← 容器内执行
+```
+
+上游的处理见 `v2-runtime.mjs` TUI 分支：`--permission-mode default --tools ""`
+（清空内建工具，只留 MCP）。我们此前因"空工具表触发中转 403"而整个去掉了该开关。
+
+**修复**：仅当客户端确实带了工具时传 `--tools ""`（空表场景不加，避免 403），
+只保留 MCP 工具。修复后同一条请求：
+
+```
+修复后： 无 "/home/kincli"，stop_reason = "tool_use"   ← 不再在容器内执行
+```
+
+**但仍有缺口**：此时响应只含 `thinking` / `text` 块，**没有 `tool_use` 块**，
+客户端拿不到可执行的工具调用。也就是说"容器内执行"被止住了，但"回传客户端执行"
+这条链还没接完——需要修 MCP park → tool_use SSE 的产出。
+
+对比：`cli-node` 数据面是纯转发（客户端自己的 CLI 执行工具），所以它天然没有这个问题；
+crag v2 必须由内核把客户端的工具转成 MCP 再回传，这条回路不完整就会表现为"工具消失"。
