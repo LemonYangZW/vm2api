@@ -482,6 +482,16 @@ async fn handle_conn(mut stream: Stream, state: Arc<GatewayState>) -> std::io::R
             respond(&mut stream, 200, "application/json", &body, &[]).await
         }
         ("POST", "/internal/v1/messages") | ("POST", "/v1/messages") => {
+            // 诊断开关：CRAG_DUMP=1 时把客户端原始请求（头 + 体）落盘一份。
+            // 用来比对"为什么客户端被中转判为蒸馏、而我们同样的模型同样的链路却通过"。
+            if std::path::Path::new("/tmp/crag-dump-on").exists()
+                || std::env::var("CRAG_DUMP").map(|v| v == "1").unwrap_or(false)
+            {
+                let stamp = crate::native::now_ms();
+                let _ = std::fs::write(format!("/tmp/crag-req-{stamp}.json"), &request.body);
+                let heads = serde_json::to_string(&request.headers).unwrap_or_default();
+                let _ = std::fs::write(format!("/tmp/crag-hdr-{stamp}.json"), heads);
+            }
             hop(stream, state, request.body).await
         }
         ("POST", "/internal/v1/cancel") => {

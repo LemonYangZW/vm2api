@@ -1758,3 +1758,34 @@ bind mount 会被 `readOnlySharedHostId()` 直接拒掉 → 身份不可用 → 
 `state:"unavailable"`（面板自算的 host_id 与我们的不一致，校验抛异常）。已回滚到
 `unredeemed` 基线。**要恢复 10 席位，得让面板自己能算出 host_id**（给它挂共享 fs 上的
 machine-id），而不是从外面塞文件。
+
+### 16.23 中转 403「疑似蒸馏」二次出现 → 自行恢复（含抓包开关）
+
+**经过**：§16.21 之后又一次出现，用户侧表现为 **100% 被拦**（客户端里直接看到那段中文），
+链路是同一条（CC → 内核 :18787 → cf.api.fan），模型 haiku-5-5。约半小时后**自行恢复**。
+
+**排除掉的**：
+
+| 怀疑 | 证据 |
+| :--- | :--- |
+| 我们自己的 vm2api 面板拦的 | 面板确有 `src/lib/core/distill-detect.mjs`，但那段中文在整个仓库搜不到；vm2api 用 `distill_blocked` 另一套措辞 |
+| 链路/账号级封禁 | 同链路同模型，我并发期间的 curl 请求全部 200（haiku 4s / 多轮+工具 4s / sonnet 3s） |
+| cf.api.fan 是我们自己的面板 | 根路径与 `/api/panel/*`、`/VERSION` 全 404，Cloudflare 前置，是第三方中转 |
+
+**结论**：是**中转侧的时间窗口式判定**，不是账号封禁也不是我们的实现问题——被判到之后一段时间内
+一律 403，窗口过去自动恢复。
+
+**留下了诊断开关**（默认关闭，不产生任何行为）：
+
+```
+存在 /tmp/crag-dump-on  或  环境变量 CRAG_DUMP=1
+→ 把每个 /v1/messages 的原始 body 与请求头写到 /tmp/crag-req-<ms>.json 与 /tmp/crag-hdr-<ms>.json
+```
+
+复发时用它抓一份真实请求，与"能通过的等价请求"逐项比对：
+system 内容/体积、tools 数量与 schema 体积、渲染后 prompt 体积、`metadata.user_id` 形态、
+请求头（anthropic-beta / x-app / UA）、`max_tokens` 与 thinking 配置、总体积。
+**抓完立刻 `rm -f /tmp/crag-dump-on`**（请求体含用户内容）。
+
+**纪律补充**（接 §16.21）：出现 403 时不要"再试一条看看"，那本身就在加重判定；
+应当停下来等窗口过去，并用本地桩（`stub-upstream.mjs`）继续验证行为。
