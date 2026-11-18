@@ -1979,6 +1979,11 @@ const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shap
 
 ### 16.30 第四轮：面板取模型/用量的真实通道是 **exec 子命令**，不是 HTTP
 
+> ⚠️ **本节前提已被推翻（见 §16.32）**：`exec` 的目标二进制是面板硬编码的
+> `/usr/local/bin/kin-worker`（厂商），**不是**我们的 `crag-v2`。本节结论"我们的子命令
+> 被面板调用"是错的；正确事实：我们补的 `oauth` 子命令对面板是死代码，仅作
+> `KIN_WORKER_BIN` 改指时的兜底。
+
 前几轮一直数 `/internal/*` 的 HTTP 路由，漏了更基本的一层：**面板有些能力根本不走 HTTP**。
 
 `go-worker-client.mjs` 的 `callWorkerGet()` 里，真实分支是这样的：
@@ -2021,6 +2026,10 @@ models   {"ok":true,"status":200,"body":{"object":"list","data":[{"id":"claude-f
 三层都要数，只数一层就会像这次一样，面板的可见功能一直静默失败而不报错。
 
 ### 16.31 第五轮：逐端点核对"面板读什么 / 我们给什么"
+
+> ⚠️ **本节 `/internal/identity` 的前提已被推翻（见 §16.32）**：面板**不调用**该端点取
+> 客户机指纹——它用槽内 shell（`guest-identity-reader.mjs:189`）。本次对 identity 的改造
+> 代码本身正确，但对面板无作用（无调用方）。
 
 这一轮不再数键，而是把**每个我们实现的端点**对应的**面板读取代码**翻出来对：
 
@@ -2076,3 +2085,25 @@ mac: 2e:1c:d3:d1:12:50 | root: overlay | pm: apt | dmi_vendor: VMware, Inc.
 **但 `fingerprint.hardware` 仍是 `i3-4170 / 4 GiB`**——不是我们没给，是面板的
 `applyOfficialFingerprintToVm` 有意用"像真人的"官方档位覆盖（Xeon 32 核 62 GB + VMware DMI
 是明确的数据中心特征）。这层由面板决定，我们负责如实上报。
+
+### 16.32 勘误与索引：全量契约核对（见 `docs/CONTRACT_AUDIT.md`）
+
+对面板↔内核的契约面做了五层全量核对（HTTP / exec / kernel.json / worker.json / env），
+另加 manifest 与厂商 `kin-worker` 分界。完整报告与复算命令见 **`docs/CONTRACT_AUDIT.md`**。
+本节只记被推翻的旧结论，避免后人按错的前提继续改：
+
+| 旧结论（本文件小节） | 实际 | 处理 |
+| :--- | :--- | :--- |
+| §16.30 面板 exec **我们**跑 `oauth models/usage/profile` | `WORKER_BIN` 硬编码 `/usr/local/bin/kin-worker`（`slot-oauth.mjs:10`），md5 与我们不同；实测返回 `credential_required` | 我们的子命令保留但为死代码，作 `KIN_WORKER_BIN` 改指兜底 |
+| §16.31 面板靠 `/internal/identity` 取客户机指纹 | 面板用槽内 shell 采集（`guest-identity-reader.mjs:189`），该端点**无调用方** | 代码保留（信息正确），效果对面板为 0 |
+| §16.29 "kernel.json 只有 7 键未读" | 实为 **13 键未读 + 4 键解析未消费**（漏判 `delivery_mode` `runtime_variant` `telemetry` `timezone` `system_layout` `cc_entrypoint`；`request_timeout_seconds` `default_cache_ttl` `cch_enabled` `crag_kernel_version` 只解析不消费） | 以 §CONTRACT_AUDIT §5.1 为准 |
+| "`x-terminal-state` 成功路径不发" | 非流式成功发 `verified`（`gateway.rs:1255,1309,1784,2013,2162`）；流式**不读**该头 | 不构成 gap |
+| "速率头缺失只影响显示" | `account-quota`/`rate-limit-service`/`quota-window`/`upstream-error-policy`（无头即 `crag_opaque_429 → stop`）/`failover-runner`/`retry-after` 都依赖 | **唯一需动手的功能缺口** |
+
+另外两条与部署相关的事实（本文件其他节常被误读）：
+
+- 面板对本槽的推理路由**当前未启用**：`GET /api/panel/vms/vm-crag-01` 的 `account` 为 `null`，
+  `POST /v1/messages` 返回 503 `pool_unavailable`。历史"端到端验证"都是直连内核 TCP `18787`。
+- manifest 的 `sha256["crag-v2"]` 被我们改写（当前 `773769f9…`，与 `sha256sum` 一致，两棵树相同），
+  这是 `verifyCragV2Tree` 能通过的唯一原因；`authorization`/`payload` 仍是厂商原值，
+  校验器不做交叉校验，故未报错。
