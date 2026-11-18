@@ -905,6 +905,23 @@ impl Pool {
             }
         }
 
+        // 上一轮没收尾就来了新的一轮（CC 按 ESC 打断、客户端断连、park 被遗弃）：
+        // CLI 进程仍在跑旧轮，若复用同一个进程，旧轮的输出会串进新请求，
+        // 表现为"打断后后面的消息发不出去"。这里直接换新进程——
+        // 我们每一跳都渲染完整历史，换进程不影响语义。
+        let stuck = match sessions.get(key) {
+            Some(live) => live.turn.lock().await.is_some(),
+            None => false,
+        };
+        if stuck {
+            if let Some(mut live) = sessions.remove(key) {
+                let _ = live.child.start_kill();
+                tokio::spawn(async move {
+                    let _ = live.child.wait().await;
+                });
+            }
+        }
+
         if !sessions.contains_key(key) {
             let live = spawn(&self.host, &args).await?;
             sessions.insert(key.to_string(), live);
