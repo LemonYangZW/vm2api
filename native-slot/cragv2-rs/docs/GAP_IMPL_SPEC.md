@@ -1860,3 +1860,46 @@ container…"），与上游相反 → 已改为 append，并在末尾附一小�
 
 **验证**：165 个 lib 测试通过；渲染层单测断言 `[tool_reference mcp__crag__Bash]` 与
 `[tool result t1 (error)]`。
+
+### 16.27 契约面审计：面板发给内核的 7 个内部字段，我们原来一个都没读
+
+**触发点**：连续几次"照着上游做就好"的教训之后，反过来把上游对内核的契约整份抽出来对了一遍。
+
+上游 `kernel-request.mjs` 定义的内部字段：
+
+```js
+const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shape', 'request_id', 'delivery_mode']
+```
+
+加上协议层另外两个：`crag_prompt`、`crag_options`（还有只在内核消费的 `crag_model`）。
+
+**审计结果（改前）**：`crag_options` / `crag_model` / `gateway_policy` / `request_context` /
+`kin_outbound_shape` / `delivery_mode` / `crag_prompt` —— **一个都没读**，只有 `cache_ttl` 读了。
+
+其中三条是实质性影响：
+
+| 字段 | 上游语义 | 我们原来的行为 |
+| :--- | :--- | :--- |
+| `crag_prompt: {mode, text}` | 面板把 `body.system` **删掉**，改用它下发调用方 system（mode = append/replace） | 完全不读 → 面板发来的请求**没有调用方 system** |
+| `gateway_policy.first_byte_timeout_ms` / `stream_idle_timeout_ms` | 首字节与流空闲的超时 | 一律用写死的 `HOP_TIMEOUT = 180s` |
+| `gateway_policy.session_idle_ttl_seconds` | 会话空闲上限 | 用 kernel.json 里的值，面板改了不生效 |
+| `gateway_policy.queue_wait_ms` | 排队等槽位的上限 | `pool.turn()` 无限等 |
+| `delivery_mode` | realtime / verified（决定能否提前发头） | 忽略，永远按 realtime |
+
+**另外两个能力位**（`rust-kernel-client.mjs` 按它们决定是否走对应流程）：
+
+- `crag_telemetry_apply_v1`：不报 → 面板**永远不会**调 `/internal/v1/telemetry/apply`（我们其实实现了）
+- `gateway_policy_v1`：不报 → 每次路由变更面板都**重启内核**（`routing-runtime.mjs:435`），
+  而不是走热更新。这正是之前观察到的"面板动不动重启槽位"的来源之一。
+
+**本次修复**（`ab204a06`）：
+
+1. 读 `crag_prompt`：`text` 作为 system 文本，`mode === 'replace'` 才替换，否则 append
+2. 读 `gateway_policy`：首字节超时、流空闲超时、`session_idle_ttl_seconds`（`pool.set_idle`）、
+   `queue_wait_ms`（`pool.turn` 外面套 timeout）
+3. health 增报 `crag_telemetry_apply_v1: true`、`gateway_policy_v1: true`、`source: "rust-kernel"`
+
+**验证**：165 个测试通过；health 五个字段齐；带 `gateway_policy` 的真实请求 200（10s，无 403）。
+
+**仍忽略**（已知、且上游有语义的）：`request_context`、`kin_outbound_shape`、`delivery_mode`、
+`crag_options`、`crag_model`。前者是日志/追踪上下文，后两者属于"面板侧请求组装"，我们不在请求链路上。

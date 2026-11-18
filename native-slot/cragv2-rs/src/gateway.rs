@@ -219,6 +219,12 @@ impl GatewayState {
                 "slot"
             },
             "worker_version": VERSION,
+            // 面板按这些能力位决定是否走对应流程（rust-kernel-client.mjs）：
+            //   crag_telemetry_apply_v1 → 才会调 /internal/v1/telemetry/apply
+            //   gateway_policy_v1       → 路由变更时走"热更新"而不是重启内核
+            "crag_telemetry_apply_v1": true,
+            "gateway_policy_v1": true,
+            "source": "rust-kernel",
             // 1.4.139 起面板认这个字段：进程池按需 spawn，空闲时 cli_pid=0 也算健康
             // （rust-kernel-supervisor.mjs: cli_pid > 0 || execution_mode === 'v2_process_pool'）。
             // 不报的话面板会认为内核"没起来"，反复重启槽位。
@@ -1192,6 +1198,25 @@ async fn forward_native(
         .unwrap_or_default()
         .to_string();
 
+    // 面板用 `gateway_policy` 下发超时与会话空闲上限（go-worker-client.mjs），
+    // 内核按它执行，而不是自己拍 180s/600s。
+    let policy = body.get("gateway_policy");
+    let policy_ms = |key: &str| {
+        policy
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_u64())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+    };
+    let queue_wait = policy_ms("queue_wait_ms");
+    if let Some(ttl) = policy
+        .and_then(|p| p.get("session_idle_ttl_seconds"))
+        .and_then(|v| v.as_u64())
+        .filter(|s| *s > 0)
+    {
+        pool.set_idle(std::time::Duration::from_secs(ttl)).await;
+    }
+
     let results = crate::native::tool_results(body);
     // 续跳优先复用 park 中的 CLI 会话；但 print 模式的 CLI 在工具调用挂起期间常常已退出，
     // 复不上就**带完整历史重开一跳**——我们每跳都渲染全量历史，效果等价。
@@ -1274,17 +1299,23 @@ async fn forward_native(
                 config_path.to_string_lossy().to_string(),
             ];
         }
-        let client_system = crate::native::system_text(body);
+        // 面板走 iframe 路径时会把 `body.system` 删掉，改用 `crag_prompt` 下发
+        // （crag-print-prompt.mjs: delete out.system → out.crag_prompt = { mode, text }）。
+        // 不读它的话，面板发的请求就完全没有调用方的 system。
+        let directive = body.get("crag_prompt");
+        let client_system = match directive.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+            Some(text) if !text.is_empty() => Some(text.to_string()),
+            _ => crate::native::system_text(body),
+        };
         let mut system = client_system.clone();
         let mut replace_system = false;
         if has_client_tools {
-            // 注意：**不能替换** system prompt。实测（§16.24）把 system 换成自家 persona 后，
-            // 中转会把带工具的请求一律判成"程序自动化/蒸馏"并 403；保留客户端原始 system、
-            // 只在末尾追加一小段工具路由说明，就恢复正常。
-            let note = "
-
-# Tool routing
-Every tool is exposed to you as an MCP tool named                         `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the instructions                         above mention a tool such as `Bash` or `Read`, call the corresponding                         `mcp__crag__*` tool; bare names are not available in this environment.";
+            // 上游只有 zero 预设才 replace（crag-print-prompt.mjs::mode），其余一律 append。
+            let note = "\n\n# Tool routing\nEvery tool is exposed to you as an MCP tool named `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the instructions above mention a tool such as `Bash` or `Read`, call the corresponding `mcp__crag__*` tool; bare names are not available in this environment.";
+            replace_system = directive
+                .and_then(|d| d.get("mode"))
+                .and_then(|m| m.as_str())
+                == Some("replace");
             system = Some(match client_system {
                 Some(text) => format!("{text}{note}"),
                 None => note.trim_start().to_string(),
@@ -1323,7 +1354,15 @@ Every tool is exposed to you as an MCP tool named                         `mcp__
                 .await
             }
         };
-        match pool.turn(&key, args, frame).await {
+        // 面板用 `gateway_policy.queue_wait_ms` 限定排队等待；不给就无限等（上游语义）。
+        let turn = match queue_wait {
+            Some(limit) => match tokio::time::timeout(limit, pool.turn(&key, args, frame)).await {
+                Ok(done) => done,
+                Err(_) => Err("slot queue wait exceeded".to_string()),
+            },
+            None => pool.turn(&key, args, frame).await,
+        };
+        match turn {
             Ok(rx) => rx,
             Err(error) => {
                 let payload = json!({"type": "error", "error": {"type": "api_error", "code": "cli_spawn_failed", "message": error}});
@@ -1349,7 +1388,10 @@ Every tool is exposed to you as an MCP tool named                         `mcp__
     let mut parked = false;
     let mut dropped: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut failure_code = "api_error";
-    let deadline = tokio::time::Instant::now() + HOP_TIMEOUT;
+    let first_byte_timeout = policy_ms("first_byte_timeout_ms").unwrap_or(HOP_TIMEOUT);
+    let stream_idle_timeout = policy_ms("stream_idle_timeout_ms").unwrap_or(HOP_TIMEOUT);
+    let mut first_event = true;
+    let mut deadline = tokio::time::Instant::now() + first_byte_timeout;
     // SSE 保活：长 thinking 期间也要有字节下行，避免被客户端/中间层判死（对应上游 #997）。
     let mut ping_at = tokio::time::Instant::now() + KEEPALIVE_INTERVAL;
     loop {
@@ -1370,6 +1412,10 @@ Every tool is exposed to you as an MCP tool named                         `mcp__
             ping_at = now + KEEPALIVE_INTERVAL;
             continue;
         };
+        if first_event {
+            first_event = false;
+        }
+        deadline = tokio::time::Instant::now() + stream_idle_timeout;
         ping_at = tokio::time::Instant::now() + KEEPALIVE_INTERVAL;
         // 工具调用被 park：回投合成 tool_use 消息，本跳到此结束。
         if value.get("type").and_then(|v| v.as_str()) == Some(crate::native::PARKED_KIND) {

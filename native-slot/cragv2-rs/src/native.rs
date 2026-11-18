@@ -862,6 +862,8 @@ pub struct Pool {
     idle: Duration,
     /// 并发会话上限（面板 `session_slots`），超出时按 LRU 摘除最久未用者。
     max_sessions: usize,
+    /// 面板下发的空闲上限（None 表示用构造时的默认值）。
+    idle_override: tokio::sync::Mutex<Option<std::time::Duration>>,
     /// MCP 工具等待上限。
     tool_timeout: Duration,
     /// 回调基址（`http://127.0.0.1:<port>/_crag-v2/mcp/<token>` 的前半段）。
@@ -899,6 +901,7 @@ impl Pool {
             host,
             idle,
             max_sessions: max_sessions.clamp(1, 128),
+            idle_override: tokio::sync::Mutex::new(None),
             tool_timeout,
             callback_base: std::sync::Mutex::new(None),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
@@ -927,12 +930,13 @@ impl Pool {
         args: Vec<String>,
         frame: Value,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>, String> {
+        let idle = self.idle_override.lock().await.unwrap_or(self.idle);
         let mut sessions = self.sessions.lock().await;
         let stale: Vec<String> = sessions
             .iter_mut()
             .filter_map(|(id, live)| {
                 let dead = !matches!(live.child.try_wait(), Ok(None));
-                (dead || live.last_used.elapsed() > self.idle).then(|| id.clone())
+                (dead || live.last_used.elapsed() > idle).then(|| id.clone())
             })
             .collect();
         for id in stale {
@@ -1166,6 +1170,13 @@ impl Pool {
                 }
             }
         }
+    }
+
+    /// 面板通过 `gateway_policy.session_idle_ttl_seconds` 下发会话空闲上限，
+    /// 内核应该照办（我们不自己拍一个 600s）。
+    pub async fn set_idle(&self, idle: std::time::Duration) {
+        let mut guard = self.idle_override.lock().await;
+        *guard = Some(idle);
     }
 
     /// park 超时后摘除条目：避免泄漏与「后到的续跳解开一个没人等的调用」。
