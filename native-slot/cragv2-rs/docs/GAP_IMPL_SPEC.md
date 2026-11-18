@@ -1530,3 +1530,29 @@ function renderInitialPrompt(body, prompt) {
 
 单测：`render_initial_prompt_carries_history`（历史包含且本轮不重复）、
 `..._without_history_is_just_current_turn`、`..._renders_tool_blocks`（共 163 项通过）。
+
+### 16.16 对照实测：内核路径下历史带来的内存增量（2026-11-17）
+
+修好历史渲染（§16.15）后必须回答一个问题：把 400K tokens 历史塞进单条 prompt，
+内存到底涨多少？同一槽位、native 通路、模型 `claude-haiku-5-5`，两轮对照：
+
+| 轮次 | 上下文 tokens | 内核 RSS 峰值 | CLI RSS 峰值 | 容器峰值 |
+| :--- | ---: | ---: | ---: | ---: |
+| baseline（无历史） | 14,658 | **5 MB** | 174 MB | 103 MB |
+| history400k | 417,196 | **7 MB** | 181 MB | 118 MB |
+| 增量 | +402K | **+2 MB** | **+7 MB** | +15 MB |
+
+即 **每 100 万 tokens 历史 ≈ 内核 +5 MB、CLI +18 MB、容器 +37 MB**。
+
+推论：
+
+- 之前"1M 上下文 ≈ 50–100 MB 在途开销"的估算**偏高**：单条长字符串的
+  `serde_json::Value` 开销并不大（大字符串是连续缓冲，不是 10× 的对象树）。
+  真实会话里块结构更多，可按 2–3 倍保守估计，仍是几十 MB 而非 GB 级。
+- **内存几乎与上下文长度无关，而与并发会话数线性相关**：每个 CLI 进程
+  固定 ~174 MB（system prompt + tools + 运行时），这才是容量的主项。
+- 因此容量规划：`并发上限 ≈ 容器内存 / 200 MB`，上下文长度只影响个位数百分比；
+  长上下文真正昂贵的是**上游 token 计费**，不是本地内存。
+
+> 注意口径：本表是"单条大字符串"的填充历史；真实 transcript 含大量
+> `tool_use` / `tool_result` 块，`Value` 树开销会更大，故给出 2–3 倍余量。
