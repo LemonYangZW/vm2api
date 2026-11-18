@@ -137,3 +137,54 @@ fn bench_incremental_scan() {
         rows
     );
 }
+
+/// 关键回归：合格回答离文件尾很远时也必须取到。
+///
+/// 这条用例专门堵"从尾部反向读固定窗口"的思路——JSONL 里一行就是一条消息，
+/// 尾部可能是几百条工具轮次 + 一条巨大的 tool_result，窗口里连一条完整候选都没有。
+#[tokio::test]
+async fn answer_far_from_tail_is_still_found() {
+    let path = temp_file("far");
+    let answer = finished_answer("THE-FINAL-ANSWER");
+
+    // 先写回答，然后在它后面堆 200 轮工具调用和一条 ~1 MB 的 tool_result。
+    append(&path, &answer);
+    for index in 0..200 {
+        append(
+            &path,
+            &format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"t{index}\"}}]}}}}\n"
+            ),
+        );
+    }
+    let blob = "x".repeat(1024 * 1024);
+    append(
+        &path,
+        &format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{blob}\"}}}}\n"),
+    );
+
+    let tail_gap = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        tail_gap > 1024 * 1024,
+        "回答到文件尾应超过 1 MB，才能证伪固定窗口反读"
+    );
+
+    let got = cragv2::tui::transcript_answer_file(&path, std::time::Duration::ZERO)
+        .await
+        .expect("应能取到远处的合格回答");
+    let text = serde_json::to_string(&got).unwrap();
+    assert!(text.contains("THE-FINAL-ANSWER"), "取到的必须是那条回答");
+}
+
+/// 尾部只有工具轮次、根本没有合格回答时，不能凭空返回一个。
+#[tokio::test]
+async fn no_answer_in_file_returns_none() {
+    let path = temp_file("none");
+    append(&path, &tool_use_line());
+    append(&path, &tool_use_line());
+    assert!(
+        cragv2::tui::transcript_answer_file(&path, std::time::Duration::ZERO)
+            .await
+            .is_none()
+    );
+}

@@ -215,14 +215,62 @@ fn transcript_of_args(host: &crate::native::Host, args: &[String]) -> Option<Pat
 }
 
 
+/// 若某行是「最终回答」，返回它的 `message`。
+///
+/// 判定口径（计数与取答案共用一份，避免两套口径不一致导致
+/// "计数增加了但取不到新答案"）：`stop_reason` 已定、不是 `tool_use`、
+/// `content` 里没有 `tool_use` 块、且至少有一个 `text` 块。
+fn answer_message(row: &Value) -> Option<&Value> {
+    if row.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+    let message = row.get("message")?;
+    if message.get("stop_reason").map(|v| v.is_null()).unwrap_or(true) {
+        return None;
+    }
+    if message.get("stop_reason").and_then(|v| v.as_str()) == Some("tool_use") {
+        return None;
+    }
+    let blocks = message.get("content")?.as_array()?;
+    let mut has_text = false;
+    for block in blocks {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("tool_use") => return None,
+            Some("text") => has_text = true,
+            _ => {}
+        }
+    }
+    has_text.then_some(message)
+}
+
 /// transcript 增量扫描状态：JSONL 只追加，因此每次只需读新增字节。
-#[derive(Default)]
 struct TailScan {
     offset: u64,
     /// 上次读到的、尚未以换行结尾的残行。
     carry: String,
+    /// 合格回答数（口径见 [`answer_message`]）。
     answers: usize,
+    /// 已收尾的 assistant 行数（`stop_reason` 已定且非 `tool_use`）。
     finished: usize,
+    /// 扫描过程中见到的**最后一条**合格回答。
+    ///
+    /// 这样 `transcript_answer_file` 不需要再读文件，也就不会出现
+    /// "从尾部读固定窗口 → 窗口里没有完整候选行 / 回答离尾部很远 → 漏信息"。
+    last_answer: Option<Value>,
+    touched: std::time::Instant,
+}
+
+impl Default for TailScan {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            carry: String::new(),
+            answers: 0,
+            finished: 0,
+            last_answer: None,
+            touched: std::time::Instant::now(),
+        }
+    }
 }
 
 fn tails() -> &'static Mutex<HashMap<std::path::PathBuf, TailScan>> {
@@ -230,9 +278,22 @@ fn tails() -> &'static Mutex<HashMap<std::path::PathBuf, TailScan>> {
     TAILS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 单行记账：一次解析同时更新两个计数，避免同一行被两种口径各解析一遍。
-fn tally_line(line: &str, answers: &mut usize, finished: &mut usize) {
-    // 便宜的前置过滤：绝大多数行是 user / tool_result，与 assistant 无关。
+/// 缓存条目上限：每个 transcript 只留一条回答，但会话可能很多，仍需上限。
+const TAIL_CACHE_MAX: usize = 64;
+/// 超过这个时间没被轮询的条目视为会话已结束，直接丢弃。
+const TAIL_CACHE_IDLE: Duration = Duration::from_secs(3600);
+
+/// 丢弃某个 transcript 的增量缓存（会话被摘除/文件轮转时调用）。
+pub fn forget_transcript(file: &Path) {
+    tails()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(file);
+}
+
+/// 单行记账：一次解析同时更新两个计数与最后一条合格回答。
+fn tally_line(line: &str, state: &mut TailScan) {
+    // 便宜的前置过滤：绝大多数行与 assistant 无关。
     if !line.contains("assistant") {
         return;
     }
@@ -245,7 +306,6 @@ fn tally_line(line: &str, answers: &mut usize, finished: &mut usize) {
     let Some(message) = row.get("message") else {
         return;
     };
-    // 只认真正收尾的回合：CC 会先调 ToolSearch/工具，那些行也是 assistant。
     let stop = message
         .get("stop_reason")
         .and_then(|v| v.as_str())
@@ -253,35 +313,45 @@ fn tally_line(line: &str, answers: &mut usize, finished: &mut usize) {
     if stop.is_empty() || stop == "tool_use" {
         return;
     }
-    *finished += 1;
-    let has_text = message
-        .get("content")
-        .and_then(|v| v.as_array())
-        .map(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
-        })
-        .unwrap_or(false);
-    if has_text {
-        *answers += 1;
+    state.finished += 1;
+    if let Some(answer) = answer_message(&row) {
+        state.answers += 1;
+        state.last_answer = Some(answer.clone());
     }
 }
 
-/// 增量扫描 transcript，返回 `(带文本的收尾回答数, 已收尾 assistant 数)`。
+/// 增量扫描 transcript，返回 `(合格回答数, 已收尾 assistant 数)`。
 ///
 /// 1M token 的 transcript 有几十 MB，而 `answer_after` 每 150 ms 轮询一次；
-/// 整读 + 全量 `serde` 解析会造成每秒数百 MB 的分配抖动。这里只读追加字节，
-/// 并把「残行」留到下次拼接，O(新增字节) 而非 O(文件大小)。
+/// 整读 + 全量 `serde` 解析会造成每秒数百 MB 的分配抖动，并在单 worker 运行时上
+/// 饿住其它任务。这里只读追加字节，O(新增字节) 而非 O(文件大小)。
 fn scan_transcript(file: &Path) -> (usize, usize) {
     let Ok(len) = std::fs::metadata(file).map(|meta| meta.len()) else {
         return (0, 0);
     };
     let mut guard = tails().lock().unwrap_or_else(|poison| poison.into_inner());
+    let now = std::time::Instant::now();
+    // 顺手清理已结束的会话，避免缓存无界增长。
+    if guard.len() >= TAIL_CACHE_MAX {
+        guard.retain(|_, state| now.duration_since(state.touched) < TAIL_CACHE_IDLE);
+        if guard.len() >= TAIL_CACHE_MAX {
+            let stale = guard
+                .iter()
+                .min_by_key(|(_, state)| state.touched)
+                .map(|(path, _)| path.clone());
+            if let Some(path) = stale {
+                guard.remove(&path);
+            }
+        }
+    }
     let state = guard.entry(file.to_path_buf()).or_default();
+    state.touched = now;
     if len < state.offset {
         // 文件被截断或轮转（CLI 换会话），从头重来。
-        *state = TailScan::default();
+        *state = TailScan {
+            touched: now,
+            ..TailScan::default()
+        };
     }
     if len > state.offset {
         if let Ok(mut handle) = std::fs::File::open(file) {
@@ -297,7 +367,7 @@ fn scan_transcript(file: &Path) -> (usize, usize) {
                         None => 0,
                     };
                     for line in combined[..complete].split('\n') {
-                        tally_line(line, &mut state.answers, &mut state.finished);
+                        tally_line(line, state);
                     }
                     state.carry = combined[complete..].to_string();
                 }
@@ -310,6 +380,11 @@ fn scan_transcript(file: &Path) -> (usize, usize) {
 /// 统计 transcript 里「已收尾且带文本」的 assistant 行数（续跳判新回答用）。
 pub fn count_text_answers(file: &Path) -> usize {
     scan_transcript(file).0
+}
+
+/// 数「已定 stop_reason」的 assistant 行，用来判定一轮 TUI 回合结束。
+fn count_finished_assistant(file: &Path) -> usize {
+    scan_transcript(file).1
 }
 
 /// 等到出现「比 baseline 更新」的带文本回答；最多等 wait。
@@ -332,10 +407,6 @@ pub async fn answer_after(file: &Path, baseline: usize, wait: std::time::Duratio
     }
 }
 
-/// 数「已定 stop_reason」的 assistant 行，用来判定一轮 TUI 回合结束。
-fn count_finished_assistant(file: &Path) -> usize {
-    scan_transcript(file).1
-}
 
 /// 测试用：清空增量缓存，避免用例之间互相污染。
 #[cfg(test)]
@@ -438,50 +509,23 @@ fn interactive_refusal(screen: &str) -> Option<&'static str> {
 ///
 /// 厂商 helper 也是双通道（transcript 尾行 + tap），这里只做最小实现：
 /// 等到出现 stop_reason 已定、且不含 tool_use 的 assistant 行就返回它的 message。
+/// 取最近一条合格回答（见 [`answer_message`]）。
+///
+/// 实现上**不再读文件**：`scan_transcript` 在增量解析时已经记住了最后一条合格
+/// 回答。反向读固定窗口的做法在 JSONL 上不安全——单行可能几十 KB 到 MB 级、
+/// 合格回答离文件尾可能隔着很多轮工具调用，窗口内可能连一条完整记录都没有。
 pub async fn transcript_answer_file(file: &Path, wait: std::time::Duration) -> Option<Value> {
     let deadline = std::time::Instant::now() + wait;
     loop {
-        if let Ok(text) = std::fs::read_to_string(file) {
-            for line in text.lines().rev() {
-                let Ok(row) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if row.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                    continue;
-                }
-                let Some(message) = row.get("message") else {
-                    continue;
-                };
-                if message.get("stop_reason").map(|v| v.is_null()).unwrap_or(true) {
-                    continue;
-                }
-                let has_tool = message
-                    .get("content")
-                    .and_then(|v| v.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-                    })
-                    .unwrap_or(false);
-                // 工具轮次（stop_reason=tool_use）不是最终回答，跳过继续往前找。
-                if has_tool {
-                    continue;
-                }
-                let has_text = message
-                    .get("content")
-                    .and_then(|v| v.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    })
-                    .unwrap_or(false);
-                if !has_text {
-                    continue;
-                }
-                return Some(message.clone());
-            }
+        // 首次调用会把已有内容整体解析一遍（一次性代价），之后只读新增字节。
+        let _ = scan_transcript(file);
+        let cached = tails()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(file)
+            .and_then(|state| state.last_answer.clone());
+        if cached.is_some() {
+            return cached;
         }
         if std::time::Instant::now() >= deadline {
             return None;

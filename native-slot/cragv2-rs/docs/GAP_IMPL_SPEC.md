@@ -1331,10 +1331,36 @@ cp /tmp/pw/src/lib/vm/*.mjs /opt/docker/vm2api/patches/   # 沙盒侧
 回归测试 `tests/transcript_tail.rs`（4 项）：追加可见、残行不计入、截断重置、
 重复轮询稳定。
 
-**剩余的同类热点**（尚未处理，按收益排序）：
+### 16.11 取答案不再读文件：扫描时记住最后一条回答（2026-11-17）
+
+`transcript_answer_file` 原本每轮结束整读一次 transcript 再做**反向逐行**扫描。
+一个自然的想法是"只从尾部反向读固定窗口"，**这是错的**，不能用：
+
+- JSONL 一行 = 一条消息，单行可达几十 KB 到 MB 级，固定窗口可能切成半行；
+- 合格回答离文件尾可能隔着几百轮工具调用，尾部往往是 `tool_result`；
+- 极端情况下窗口里连一条完整候选记录都没有 → **漏信息**。
+
+正确做法是**根本不读文件**：增量扫描（§16.10）既然已经逐行解析，就顺手记住
+最后一条合格回答（`TailScan::last_answer`），取答案变成 O(1) 查表。
+首次调用仍会把已有内容整体解析一遍（一次性代价），之后只读新增字节。
+
+顺带把口径统一成一份 [`answer_message`]：`stop_reason` 已定、不是 `tool_use`、
+`content` 里没有 `tool_use` 块、且含 `text`。原实现里计数用一套（宽松）、
+取答案用另一套（严格），会出现"计数涨了但取到的是上一轮答案"的潜在错配。
+
+内存边界：缓存每个 transcript 只留一条回答，并且有条目上限（64）与空闲清理
+（1 小时）；会话被摘除时可调 `forget_transcript()` 立即释放。
+
+回归测试（`tests/transcript_tail.rs`，共 6 项）：
+
+- `answer_far_from_tail_is_still_found`：回答之后堆 200 轮工具调用 + 一条 1 MB
+  的 `tool_result`，仍必须取到那条回答（专门证伪"尾部窗口反读"）；
+- `no_answer_in_file_returns_none`：只有工具轮次时不能凭空返回；
+- 追加可见 / 残行不计入 / 截断重置 / 重复轮询稳定。
+
+**剩余的同类热点**（尚未处理）：
 
 | 位置 | 现象 | 建议 |
 | :--- | :--- | :--- |
-| `transcript_answer_file` | 每轮结束整读一次（30 MB → ≈1.4 s） | 从文件尾部反向读若干 KB |
-| `gateway.rs:999` | 失败路径整读 `screen.log` | 只读尾部 N KB |
+| `gateway.rs:999` | 失败路径整读 `screen.log` | 只读尾部 N KB（同样是日志，非 JSONL） |
 | `emit_transcript_message` | 会把整个 message `Value` 克隆一次 | 按需借用/取子字段 |
