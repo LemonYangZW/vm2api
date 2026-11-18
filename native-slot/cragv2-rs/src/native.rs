@@ -259,11 +259,14 @@ pub struct Args<'a> {
     /// (文本, 是否替换默认 system prompt)
     pub system_prompt: Option<(&'a str, bool)>,
     pub bare: bool,
-    /// 客户端工具里与 CLI 内建同名的那些（Bash/Read…）。
+    /// 要禁用（或收窄）的内建工具名，对应 `--disallowedTools`。
     ///
-    /// 用 `--disallowedTools` 只禁用**裸名**（内建），保留 `mcp__crag__*`（客户端工具）。
-    /// 早期用 `--tools ""` 会连 MCP 一起清掉，导致 park 永不发生、工具"消失"。
-    pub builtin_blocklist: Vec<String>,
+    /// 不用 `--tools ""`：2.1.321 会把它当成**工具规格**解析（实测产出乱码名
+    /// `mcp__g__3615150`，且连带 MCP 服务器不加载）。只能按名字逐个禁用。
+    pub disallowed_tools: Vec<String>,
+    /// `--allowedTools` 的前缀条目。print 模式下 MCP 工具默认**未授权**，
+    /// 调用会返回权限错误（模型表现为"先把结果告诉你"），必须显式放行。
+    pub allowed_tools: Vec<String>,
 }
 
 impl Args<'_> {
@@ -285,9 +288,15 @@ impl Args<'_> {
         if self.bare {
             v.push("--bare".into());
         }
-        if !self.builtin_blocklist.is_empty() {
+        if !self.allowed_tools.is_empty() {
+            v.push("--allowedTools".into());
+            for name in &self.allowed_tools {
+                v.push(name.clone());
+            }
+        }
+        if !self.disallowed_tools.is_empty() {
             v.push("--disallowedTools".into());
-            for name in &self.builtin_blocklist {
+            for name in &self.disallowed_tools {
                 v.push(name.clone());
             }
         }
@@ -336,7 +345,8 @@ mod tests {
             model: Some("claude-haiku-5-5"),
             system_prompt: Some(("be terse", false)),
             bare: false,
-            builtin_blocklist: Vec::new(),
+            disallowed_tools: Vec::new(),
+        allowed_tools: Vec::new(),
         }
         .to_vec();
         let joined = args.join(" ");
@@ -356,7 +366,8 @@ mod tests {
             model: None,
             system_prompt: Some(("x", true)),
             bare: true,
-            builtin_blocklist: Vec::new(),
+            disallowed_tools: Vec::new(),
+        allowed_tools: Vec::new(),
         }
         .to_vec();
         assert!(args.windows(2).any(|w| w[0] == "--system-prompt" && w[1] == "x"));
@@ -527,6 +538,18 @@ mod tests {
     }
 
     #[test]
+    fn mcp_config_declares_stdio_type() {
+        let (for_cli, _) = mcp_configs(
+            std::path::Path::new("/bin/crag"),
+            std::path::Path::new("/tmp/b.json"),
+            "http://127.0.0.1:1/x",
+            vec![json!({"name": "Bash"})],
+        );
+        assert_eq!(for_cli["mcpServers"]["crag"]["type"], json!("stdio"),
+            "缺 type 时 CC 会静默忽略整个服务器");
+    }
+
+    #[test]
     fn last_user_content_skips_tool_results_and_assistant() {
         let body = serde_json::json!({
             "messages": [
@@ -595,6 +618,22 @@ pub fn tool_results(body: &Value) -> Vec<(String, Vec<Value>, bool)> {
 /// **只映射客户端工具**（带 `input_schema` 的 custom tool）。服务器工具
 /// （`web_search_*` / `advisor_*` / `code_execution_*` 等）由上游自己执行，
 /// 透给 MCP 会让 CLI 发起内核无法满足的调用（上游 issue #1088 的同类故障）。
+/// 客户端工具名列表（用于 `--disallowedTools`：客户端工具以 MCP 形式提供，
+/// 同名内建必须禁掉，否则模型会选内建那个在容器里执行）。
+pub fn client_tool_names(body: &Value) -> Vec<String> {
+    body.get("tools")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+                .filter(|n| !n.is_empty())
+                .map(|n| n.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn mcp_tools(tools: &Value) -> Vec<Value> {
     tools
         .as_array()
@@ -673,7 +712,9 @@ pub fn mcp_configs(
     args.push(bridge_config.to_string_lossy().to_string());
     let for_cli = json!({
         "mcpServers": {
-            "crag": {"command": command, "args": args}
+            // `type` 必填：Claude Code 2.1.321 会**静默丢弃**没有 type 的服务器，
+            // 表现为客户端工具全部消失、模型只能用容器内建 bash（实测踩过）。
+            "crag": {"type": "stdio", "command": command, "args": args}
         }
     });
     let for_bridge = json!({ "crag": { "callbackUrl": callback_url, "tools": tools } });

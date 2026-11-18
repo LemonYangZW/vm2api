@@ -1604,11 +1604,25 @@ crag v2 必须由内核把客户端的工具转成 MCP 再回传，这条回路�
 - 桥二进制在容器内可独立运行：`[crag-mcp] 1 tools -> http://127.0.0.1:…/_crag-v2/mcp/<session>`
 - 内核侧 park → `tool_use_sse` 合成分支存在（TUI 路径已用），native 路径也补了结尾 `pending_calls` 兜底
 
-**当前卡点**：模型侧始终不发起 MCP 调用。最可能的原因是**工具名不一致**——
-客户端 system prompt 写的是 `Bash`，而 CLI 侧只有 `mcp__crag__Bash`；
-上游的做法是用自己的 persona prompt（`crag-print-prompt`）**替换/追加** system，
-在其中按 MCP 名字描述工具，而不是原样透传客户端的 system prompt。
+### 最终定位：四个独立缺陷叠在一起
 
-下一步（确定性验证）：在容器内用**我们的完整参数**手跑一次 CLI，
-带上 `--mcp-config` 与 `--verbose`，观察它实际解析到的工具列表与 tool_use 决策——
-而不是继续靠改参数盲试。
+| # | 缺陷 | 证据 | 修法 |
+| :-- | :--- | :--- | :--- |
+| ① | MCP 配置缺 `"type":"stdio"` | 加 type 后 CLI 工具表才出现 `mcp__crag__Bash` | `mcp_configs()` 补 `type`，加单测断言 |
+| ② | `--tools ""` 被当成**工具规格** | 实测工具表变成乱码 `mcp__g__3615150`，且 MCP 服务器不加载 | 永不使用；改 `--disallowedTools <客户端工具名>` |
+| ③ | MCP 工具在 print 模式**未授权** | 模型原话"返回了权限错误，提示尚未授权" | 加 `--allowedTools mcp__crag` |
+| ④ | park 随 CLI 退出而消失 | 续跳 409 `wrong slot` / 410 `unknown tool_result` | 续跳失败**退回带完整历史的新跳**，不再报错 |
+
+另外：print worker 的 system 必须**替换**（`--system-prompt`）+ 自己的 persona，
+在 persona 里声明"工具以 `mcp__crag__<Name>` 提供"，否则模型按客户端 system 的裸名 `Bash`
+去调内建工具，又回到容器里执行。
+
+### 端到端验证（.67 槽位）
+
+```
+hop1  → {"type":"tool_use","id":"crag_tool_30310bf5_...","name":"Bash"}   容器路径泄漏：0
+hop2  → 最终答案 = /Users/lemon/project（客户端返回的工具结果）            容器路径泄漏：0
+```
+
+流程：模型调 `mcp__crag__Bash` → 内核合成 `tool_use` 回投客户端 → 客户端本地执行 →
+回传 `tool_result` → 内核续跳（park 活着就复用，否则重开一跳）→ 最终答案。

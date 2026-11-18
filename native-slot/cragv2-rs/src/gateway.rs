@@ -1168,71 +1168,25 @@ async fn forward_native(
         .to_string();
 
     let results = crate::native::tool_results(body);
-    let mut rx = if !results.is_empty() {
+    // 续跳优先复用 park 中的 CLI 会话；但 print 模式的 CLI 在工具调用挂起期间常常已退出，
+    // 复不上就**带完整历史重开一跳**——我们每跳都渲染全量历史，效果等价。
+    // 早期直接 409/410，实测会把整条工具链走死（客户端拿不到答案）。
+    let mut reuse = None;
+    if !results.is_empty() {
         // 形状指纹：续跳的历史结构必须与 park 时刻一致（上游 continuationFingerprint 的等价物）。
         let shape = crate::native::history_fingerprint(
             body.get("messages").and_then(|v| v.as_array()).map(|v| v.as_slice()).unwrap_or(&[]),
         );
-        if !pool.check_fingerprint(&key, shape).await {
-            return respond(
-                &mut stream,
-                400,
-                "application/json",
-                serde_json::to_string(&error_body(
-                    "invalid_request_error",
-                    "tool_result history mismatch",
-                ))
-                .unwrap_or_default()
-                .as_bytes(),
-                &[("x-terminal-state", "error")],
-            )
-            .await;
-        }
-        // 续跳：不写 stdin，只把这一跳挂到会话的后续事件上。
-        let (resolved, foreign) = pool.resolve(&key, &results).await;
-        if resolved == 0 && foreign > 0 {
-            return respond(
-                &mut stream,
-                409,
-                "application/json",
-                serde_json::to_string(&error_body(
-                    "invalid_request_error",
-                    "tool_result belongs to another session (continuation dispatched to the wrong slot)",
-                ))
-                .unwrap_or_default()
-                .as_bytes(),
-                &[("x-terminal-state", "error")],
-            )
-            .await;
-        }
-        if resolved == 0 {
-            return respond(
-                &mut stream,
-                410,
-                "application/json",
-                serde_json::to_string(&error_body("invalid_request_error", "unknown tool_result"))
-                    .unwrap_or_default()
-                    .as_bytes(),
-                &[("x-terminal-state", "error")],
-            )
-            .await;
-        }
-        match pool.attach(&key).await {
-            Some(rx) => rx,
-            None => {
-                return respond(
-                    &mut stream,
-                    410,
-                    "application/json",
-                    serde_json::to_string(&error_body("api_error", "session gone"))
-                        .unwrap_or_default()
-                        .as_bytes(),
-                    &[("x-terminal-state", "error")],
-                )
-                .await
+        if pool.check_fingerprint(&key, shape).await {
+            let (resolved, _foreign) = pool.resolve(&key, &results).await;
+            if resolved > 0 {
+                reuse = pool.attach(&key).await;
             }
         }
-    } else {
+    }
+    let mut rx = match reuse {
+        Some(rx) => rx,
+        None => {
         let Some(prompt_text) = crate::native::render_initial_prompt(body) else {
             return respond(
                 &mut stream,
@@ -1295,27 +1249,37 @@ async fn forward_native(
                 config_path.to_string_lossy().to_string(),
             ];
         }
-        let mut system = crate::native::system_text(body);
+        let client_system = crate::native::system_text(body);
+        let mut system = client_system.clone();
+        let mut replace_system = false;
         if has_client_tools {
-            // 客户端 system prompt 里写的是裸工具名（Bash/Read…），而 CLI 侧这些工具以
-            // MCP 形式存在（mcp__crag__Bash）。不指明映射，模型会调用不存在的裸名，
-            // 结果是 stop_reason=tool_use 但没有任何可执行块（工具"消失"）。
-            const NOTE: &str = "
-
-# Tool routing
-Your tools are provided as MCP tools named `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the instructions above mention a tool such as `Bash`, always call the corresponding `mcp__crag__*` tool.";
-            system = Some(match system {
-                Some(text) => format!("{text}{NOTE}"),
-                None => NOTE.trim_start().to_string(),
-            });
+            // 对齐上游 crag-print-prompt：print worker 用 **replace** 的 persona，
+            // 明确告诉模型工具以 mcp__crag__<Name> 提供；原样透传客户端 system 时，
+            // 模型会调裸名（Bash），而裸内建已被禁用/或落到容器内，工具就"消失"了。
+            let mut persona = String::from(
+                "You are the CRAG v2 print worker running inside a Linux container.
+                 All actions must go through the MCP tools provided to you, whose names look like
+                 `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the client instructions
+                 below mention a tool such as `Bash` or `Read`, call the corresponding
+                 `mcp__crag__*` tool instead. You have no direct access to the user's filesystem.
+",
+            );
+            if let Some(text) = client_system.as_deref() {
+                persona.push_str("\n# Client instructions\n");
+                persona.push_str(text);
+                persona.push('\n');
+            }
+            system = Some(persona);
+            replace_system = true;
         }
         let mut args = crate::native::Args {
             session_id: &key,
             mcp_config: None,
             model: Some(model.as_str()).filter(|m| !m.is_empty()),
-            system_prompt: system.as_deref().map(|text| (text, false)),
+            system_prompt: system.as_deref().map(|text| (text, replace_system)),
             bare: false,
-            builtin_blocklist: if has_client_tools { crate::native::mcp_tools(body.get("tools").unwrap_or(&Value::Null)).iter().filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())).collect() } else { Vec::new() },
+            disallowed_tools: if has_client_tools { crate::native::client_tool_names(body) } else { Vec::new() },
+            allowed_tools: if has_client_tools { vec!["mcp__crag".to_string()] } else { Vec::new() },
         }
         .to_vec();
         args.extend(extra);
@@ -1354,6 +1318,7 @@ Your tools are provided as MCP tools named `mcp__crag__<Name>` (for example `mcp
                 )
                 .await;
             }
+        }
         }
     };
 

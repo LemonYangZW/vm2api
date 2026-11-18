@@ -124,6 +124,23 @@ fn license_capabilities_json() -> &'static str {
     r#"{"host_subscription":0,"host_subscription_reclaim":0}"#
 }
 
+/// 桥启动落盘标记：Claude Code 会吞掉子进程 stderr，
+/// 想知道"CLI 到底有没有加载我们的 MCP 服务器"只能自己写文件。
+fn bridge_mark(what: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/crag-bridge.log")
+    {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{stamp} {what}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // 子命令：`crag-v2 mcp-bridge --config <path>`（MCP stdio 工具桥）。
@@ -135,7 +152,8 @@ async fn main() -> ExitCode {
             .and_then(|index| argv.get(index + 1))
             .cloned();
         let Some(path) = config else {
-            eprintln!("[crag-mcp] --config is required");
+            bridge_mark("argv-missing-config");
+        eprintln!("[crag-mcp] --config is required");
             return ExitCode::FAILURE;
         };
         let text = match std::fs::read_to_string(&path) {
@@ -145,6 +163,7 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        bridge_mark("started");
         let config = match BridgeConfig::parse(&text) {
             Ok(config) => config,
             Err(error) => {
