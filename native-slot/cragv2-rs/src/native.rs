@@ -620,6 +620,34 @@ pub fn tool_results(body: &Value) -> Vec<(String, Vec<Value>, bool)> {
 /// 透给 MCP 会让 CLI 发起内核无法满足的调用（上游 issue #1088 的同类故障）。
 /// 客户端工具名列表（用于 `--disallowedTools`：客户端工具以 MCP 形式提供，
 /// 同名内建必须禁掉，否则模型会选内建那个在容器里执行）。
+/// 进程形态指纹：工具集 + model。为空（无工具）时返回 0，表示不需要区分。
+/// 用途见 gateway：会话键带上它，形态一变就换新进程（CLI 参数只在 spawn 生效）。
+pub fn spawn_variant(body: &Value) -> u64 {
+    let tools = body.get("tools").and_then(|v| v.as_array());
+    let Some(tools) = tools.filter(|t| !t.is_empty()) else {
+        return 0;
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for tool in tools {
+        if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+            feed(name.as_bytes());
+        }
+        if let Some(schema) = tool.get("input_schema") {
+            feed(schema.to_string().as_bytes());
+        }
+    }
+    if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        feed(model.as_bytes());
+    }
+    hash
+}
+
 pub fn client_tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
         .and_then(|v| v.as_array())

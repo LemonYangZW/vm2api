@@ -1174,7 +1174,18 @@ async fn forward_native(
         .and_then(|v| v.as_bool())
         .or_else(|| body.get("stream").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    let key = session_key(envelope, body);
+    // 会话键必须带上"进程形态"（工具集 + model）。CLI 的参数只在 spawn 时生效，
+    // 若同一会话先来了无工具的请求、后来才带工具，复用旧进程就会永远没有 MCP 工具
+    // （桩里实测：第二条明明带 tools，`--mcp-config` 却不在进程参数里）。
+    let key = {
+        let base = session_key(envelope, body);
+        let variant = crate::native::spawn_variant(body);
+        if variant == 0 {
+            base
+        } else {
+            format!("{base}#{variant:016x}")
+        }
+    };
     let model = body
         .get("model")
         .and_then(|v| v.as_str())

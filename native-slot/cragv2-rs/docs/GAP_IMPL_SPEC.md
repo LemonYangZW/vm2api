@@ -1817,3 +1817,28 @@ container…"），与上游相反 → 已改为 append，并在末尾附一小�
 2. 真实中转只在"改完之后确认一次"时打一条，且等判定窗口完全过去。
 
 **当前状态**：append 版本已部署（`6014775f`），但**未经真实链路验证**（部署后立刻遇到全局 403）。
+
+### 16.25 用本地桩看出站形态（结论：append 生效；MCP 工具是"延迟加载"）
+
+**方法**：桩跑在宿主网络（`--network host`，端口 18080），槽位 `ANTHROPIC_BASE_URL` 指过去，
+从内核打请求 → 桩记录 CLI 真正发出的 body。全程零真实中转消耗。
+（注意 `kin-eg-px-local` 是 `enable_icc=false`，容器之间不通，所以桩不能用同一网桥。）
+
+**看到的事实**：
+
+1. **system 是 append**：出站 system 是官方三块（billing header / "You are Claude Code…" /
+   8416 字节 agent prompt），我们追加的工具路由说明**在里面**。替换形态已彻底去掉 ✔
+2. `max_tokens 128000`、`stream true`、billing header `cc_version=2.1.321.f4d` —— 都是官方形态
+3. **`mcp__crag__*` 不在 tools 数组里**，但这不是 bug：这个 CLI 构建用**延迟工具加载**，
+   tools 里有 `ToolSearch`（"Fetches full schema definitions for deferred tools…"）
+   和 `DeferredToolPlaceholder`（`defer_loading: true`）。MCP 工具只以**名字**出现在
+   `<system-reminder>` 里，模型要先 `ToolSearch select:<tool>` 取 schema 才能调用。
+4. **真 bug**：同一会话先来无工具请求、后来才带工具时，会**复用第一次 spawn 的进程**，
+   `--mcp-config` 永远不在参数里（实测第二条明明带 tools，进程里没有）。CLI 参数只在
+   spawn 生效，会话键必须带上"进程形态"。
+
+**已修**：`spawn_variant(body)` = 工具集 + model 的 FNV；会话键变成 `<session>#<variant>`，
+形态一变就换新进程。桩上复验：同会话先无工具后有工具 → 第二条进程带上了 `--mcp-config` ✔
+（提交 `47a4b957`）
+
+**副产品**：`CLAUDE_CODE_MAX_RETRIES=0` 已写进槽位 settings，403 时不再 4 连发（实测从 4 条降到 1 条）。
