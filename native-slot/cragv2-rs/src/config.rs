@@ -172,13 +172,10 @@ impl KernelConfig {
     /// `direct`——内核自己拼请求，而面板要用的官方 CLI 从未启动。现在按 provider
     /// 归一到 native。
     pub fn effective_mode(&self) -> String {
-        if let Some(mode) = self.upstream_mode.as_deref() {
-            return mode.trim().to_ascii_lowercase();
-        }
-        if self.provider().as_deref() == Some("local_cli") {
-            return "native".to_string();
-        }
-        "direct".to_string()
+        self.upstream_mode
+            .as_deref()
+            .map(|mode| mode.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "direct".to_string())
     }
 
     /// 是否直连上游（自控 wire）。
@@ -211,16 +208,6 @@ impl KernelConfig {
                 ));
             }
         }
-        // 显式 direct + 面板要求本地 CLI：语义冲突，拒绝启动。
-        if self.upstream_mode.is_some()
-            && self.direct()
-            && self.provider().as_deref() == Some("local_cli")
-        {
-            return Err(
-                "配置矛盾：upstream_mode=\"direct\" 但 provider=\"local_cli\"（面板要求由槽内官方 CLI 发包）；                 请二选一，拒绝静默择一执行"
-                    .to_string(),
-            );
-        }
         // 近义键名的笔误：直接报错并指出正确键名，而不是当作未知字段忽略。
         for near_miss in ["hop_mode", "hop", "transport", "upstream", "mode"] {
             if self.extra.contains_key(near_miss) {
@@ -233,14 +220,19 @@ impl KernelConfig {
         Ok(())
     }
 
-    /// 启动日志用：说明通路来自哪个键，缺省时明确标注"默认值"。
+    /// 启动日志用：说明通路来自哪个键；与面板意图不一致时必须显式告警。
     pub fn mode_label(&self) -> String {
         let mode = self.effective_mode();
         if self.upstream_mode.is_some() {
             return format!("{mode}（来自 upstream_mode）");
         }
         if self.provider().as_deref() == Some("local_cli") {
-            return format!("{mode}（来自 provider=local_cli）");
+            // 面板想"让槽内官方 CLI 发包"，但本内核的 native 通路只把最后一轮 user
+            // 消息交给 CLI（见 native::last_user_content），而实测 CLI 并不自行维护
+            // 会话——切过去会丢多轮历史。因此这里显式告警而不是静默切换或静默忽略。
+            return format!(
+                "{mode}（警告：provider=local_cli 未生效——native 通路尚不支持多轮历史续传；如需强制切换请显式设 upstream_mode=native）"
+            );
         }
         format!("{mode}（未配置 upstream_mode / provider，使用默认值）")
     }
@@ -494,29 +486,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_local_cli_implies_native_not_silent_direct() {
-        // 面板写 provider=local_cli + claude_bin，就是要让官方 CLI 发包。
-        // 早期实现忽略 provider，静默跑成 direct（内核自己拼请求）。
+    fn provider_local_cli_warns_instead_of_silently_switching() {
+        // 面板写 provider=local_cli 想用槽内 CLI 发包，但 native 通路目前不续传历史。
+        // 要求：不切换（否则真实多轮会断），但必须把这件事说出来。
         let mut config = KernelConfig::default();
         config
             .extra
             .insert("provider".into(), serde_json::json!("local_cli"));
-        assert_eq!(config.effective_mode(), "native");
-        assert!(config.is_native());
-        assert!(!config.direct());
-        assert!(config.mode_label().contains("provider=local_cli"));
+        assert_eq!(config.effective_mode(), "direct");
+        let label = config.mode_label();
+        assert!(label.contains("provider=local_cli"));
+        assert!(label.contains("警告"), "必须显式告警：{label}");
     }
 
-    #[test]
-    fn explicit_direct_with_local_cli_is_rejected() {
-        let mut config = KernelConfig::default();
-        config.upstream_mode = Some("direct".into());
-        config
-            .extra
-            .insert("provider".into(), serde_json::json!("local_cli"));
-        let error = config.validate().expect_err("矛盾配置必须报错");
-        assert!(error.contains("local_cli"));
-    }
+
 
     #[test]
     fn claude_bin_wins_over_generic_cli_bin() {
