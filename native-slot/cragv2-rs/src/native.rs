@@ -210,12 +210,27 @@ fn render_block(block: &Value) -> String {
                 .unwrap_or_else(|| "{}".to_string())
         ),
         Some("tool_result") => format!(
-            "[tool result {}]\n{}",
+            "[tool result {}{}]\n{}",
             block
                 .get("tool_use_id")
                 .and_then(|id| id.as_str())
                 .unwrap_or(""),
+            // 上游同样在标签里标 error（`[tool result <id> (error)]`）。
+            if block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                " (error)"
+            } else {
+                ""
+            },
             render_content(block.get("content").unwrap_or(&Value::Null))
+        ),
+        // ToolSearch 的引用块是「仅结果」块，native 历史不接受，上游也是转成文本
+        // `[tool_reference <tool_name>]`（crag-print-prompt.mjs::readOnlyResultBlock）。
+        Some("tool_reference") => format!(
+            "[tool_reference {}]",
+            block
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
         ),
         other => format!(
             "[unsupported content block: {}]",
@@ -535,6 +550,22 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(pool.pids_now().is_empty());
+    }
+
+    #[test]
+    fn renders_tool_reference_and_error_label() {
+        // 与上游 readOnlyResultBlock 对齐：tool_reference 转文本，不落「unsupported」。
+        assert_eq!(
+            render_block(&json!({"type": "tool_reference", "tool_name": "mcp__crag__Bash"})),
+            "[tool_reference mcp__crag__Bash]"
+        );
+        let err = render_block(&json!({
+            "type": "tool_result",
+            "tool_use_id": "t1",
+            "is_error": true,
+            "content": "boom"
+        }));
+        assert!(err.starts_with("[tool result t1 (error)]"), "{err}");
     }
 
     #[test]

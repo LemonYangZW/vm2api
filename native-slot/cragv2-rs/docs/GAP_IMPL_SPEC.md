@@ -1842,3 +1842,21 @@ container…"），与上游相反 → 已改为 append，并在末尾附一小�
 （提交 `47a4b957`）
 
 **副产品**：`CLAUDE_CODE_MAX_RETRIES=0` 已写进槽位 settings，403 时不再 4 连发（实测从 4 条降到 1 条）。
+
+### 16.26 ToolSearch / 延迟工具：上游怎么处理，我们怎么对齐
+
+这个 CLI 构建用**延迟工具加载**：MCP 工具不随请求下发 schema，只在 `<system-reminder>` 里给名字，
+模型必须先调 `ToolSearch`（`select:<tool>`）取 schema。上游在三个地方处理它：
+
+| 位置 | 上游做法 | 我们 |
+| :--- | :--- | :--- |
+| `claude-code-betas.mjs` | tools 里出现 `defer_loading: true` 或 `type` 以 `tool_search_tool_` 开头 → 加 `BETA_ADVANCED_TOOL_USE` 头 | 不涉及：beta 头由 CLI 自己按它的工具集生成（我们不构建请求） |
+| `anthropic-policy.mjs` | `tool_search_tool_result.tool_references[].tool_name` 与 `tool_result` 内嵌的 `tool_reference.tool_name` 都要过 `restoreToolReferenceName()` 做**名字还原** | 不需要：我们的 MCP 工具名不做改写（`mcp__crag__<Name>` 由 CLI 加前缀），回传时桥报的是裸名，往返一致 |
+| `crag-print-prompt.mjs` | "仅结果"块不能进 native 历史：`tool_reference` → 文本 `[tool_reference <tool_name>]`；`tool_result` 的标签带 ` (error)` | 已对齐（本提交）：`render_block` 新增 `tool_reference` 分支与 `is_error` 标签，并加单测 |
+
+**含义**：`--disallowedTools <客户端工具名>` 只是把**内建同名工具**关掉，`ToolSearch` 本身是内建工具、
+不在客户端工具表里，所以不会被禁；延迟加载机制照常工作。模型要拿到 `mcp__crag__Bash` 的 schema，
+仍会走 `ToolSearch`。
+
+**验证**：165 个 lib 测试通过；渲染层单测断言 `[tool_reference mcp__crag__Bash]` 与
+`[tool result t1 (error)]`。
