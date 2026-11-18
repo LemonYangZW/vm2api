@@ -1903,3 +1903,39 @@ const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shap
 
 **仍忽略**（已知、且上游有语义的）：`request_context`、`kin_outbound_shape`、`delivery_mode`、
 `crag_options`、`crag_model`。前者是日志/追踪上下文，后两者属于"面板侧请求组装"，我们不在请求链路上。
+
+### 16.28 契约对齐第二轮：delivery_mode / request_context / capabilities 数组
+
+§16.27 之后继续按上游补齐，并做了**第二次全量检查**。
+
+**新增对齐**（`3bdd2257`）：
+
+| 字段 | 上游语义 | 我们的实现 |
+| :--- | :--- | :--- |
+| `delivery_mode: "verified"` | 只允许 realtime 提前发头；verified 必须"全部产出后再回" | `streaming` 强制为 false，走聚合后一次性 JSON |
+| `request_context.purpose === "auto_mode_classifier"` | 面板的分类器探针，**不能**并入用户会话（`native-handoff.mjs` 就是按这个 purpose 排除的） | 会话键加 `#classifier` 后缀 |
+| `health.capabilities`（数组） | 面板十几处 `capabilities.includes(...)` 决定行为 | 报出我们**确实实现**的 5 项：`official_full / zero / cancel / telemetry / unix_socket_envelope`（与厂商 manifest 声明集一致） |
+
+**第二次检查结果**（逐个字段/能力对源码打勾）：
+
+```
+字段           gateway_policy READ  request_context READ  delivery_mode READ  crag_prompt READ
+               crag_options IGNORED   crag_model IGNORED   kin_outbound_shape IGNORED
+能力           official_full/zero/cancel/telemetry/unix_socket_envelope  ADVERTISED
+未声明          native_handoff_v1  provider_result_v2  provider_managed_tools_v1
+               system_text_cache_v3  generation_controls_v3  linux_tui_native_queue
+               message_threads_beta  caller_cwd
+```
+
+**为什么这三项仍然忽略**（不是为了省事，是确实不适用）：
+
+- `kin_outbound_shape`：只在**内核自己构建请求**（direct 模式）时生效，用于校验收敛的出站字段顺序；
+  native/TUI 通路的出站由官方 CLI 构建，内核无从施加。
+- `crag_options`：上游把 `prompt` 摘掉后，剩下的键**没有任何消费方**（全仓搜不到 `crag_options.`），
+  保留即等价。
+- `crag_model`：面板只在 `health.capabilities` 含 `model_directive` / `linux_tui_pty` 时才下发；
+  我们不声明，所以面板不会发。
+
+**未声明的 8 个能力位**都是"声明了就要承担对应行为"的东西（例如 `provider_managed_tools_v1` 会让面板
+改写 provider 工具、`generation_controls_v3` 会改生成参数下发方式）。**宁可不声明**，也不假装支持——
+静默半支持比缺能力更糟。

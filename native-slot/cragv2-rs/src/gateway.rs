@@ -222,6 +222,16 @@ impl GatewayState {
             // 面板按这些能力位决定是否走对应流程（rust-kernel-client.mjs）：
             //   crag_telemetry_apply_v1 → 才会调 /internal/v1/telemetry/apply
             //   gateway_policy_v1       → 路由变更时走"热更新"而不是重启内核
+            // 面板会读 health.capabilities（数组）来决定一堆行为是否启用
+            // （go-worker-client.mjs / crag-print-prompt.mjs 里十几处 includes 检查）。
+            // 只报**我们确实实现**的：与厂商 manifest 的声明集一致。
+            "capabilities": [
+                "official_full",
+                "zero",
+                "cancel",
+                "telemetry",
+                "unix_socket_envelope",
+            ],
             "crag_telemetry_apply_v1": true,
             "gateway_policy_v1": true,
             "source": "rust-kernel",
@@ -1175,16 +1185,33 @@ async fn forward_native(
     envelope: &Value,
     body: &Value,
 ) -> std::io::Result<()> {
-    let streaming = envelope
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .or_else(|| body.get("stream").and_then(|v| v.as_bool()))
+    // `delivery_mode: "verified"`：面板要求"全部产出后再回"，**不允许提前发头**
+    // （go-worker-client.mjs: only realtime exposes headers before completion）。
+    let verified_delivery = body
+        .get("delivery_mode")
+        .and_then(|v| v.as_str())
+        .map(|m| m == "verified")
         .unwrap_or(false);
+    let streaming = !verified_delivery
+        && envelope
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .or_else(|| body.get("stream").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
     // 会话键必须带上"进程形态"（工具集 + model）。CLI 的参数只在 spawn 时生效，
     // 若同一会话先来了无工具的请求、后来才带工具，复用旧进程就会永远没有 MCP 工具
     // （桩里实测：第二条明明带 tools，`--mcp-config` 却不在进程参数里）。
     let key = {
-        let base = session_key(envelope, body);
+        let mut base = session_key(envelope, body);
+        // `request_context.purpose === "auto_mode_classifier"` 是面板的分类器探针，
+        // 不能混进用户会话（上游在 native-handoff 里就是按这个 purpose 排除的）。
+        if body
+            .pointer("/request_context/purpose")
+            .and_then(|v| v.as_str())
+            == Some("auto_mode_classifier")
+        {
+            base.push_str("#classifier");
+        }
         let variant = crate::native::spawn_variant(body);
         if variant == 0 {
             base
