@@ -877,7 +877,14 @@ impl Pool {
             })
             .collect();
         for id in stale {
-            sessions.remove(&id);
+            // 摘除时必须**杀进程**：只 remove 会留下 `claude --print` 孤儿
+            // （实测一次工具调用后残留 191MB 进程，占着会话名额不放）。
+            if let Some(mut live) = sessions.remove(&id) {
+                let _ = live.child.start_kill();
+                tokio::spawn(async move {
+                    let _ = live.child.wait().await;
+                });
+            }
         }
         // 容量上限：摘掉最久未用且不在当前轮的会话（上游 `session_slots` 语义）。
         while sessions.len() >= self.max_sessions && !sessions.contains_key(key) {
@@ -887,7 +894,12 @@ impl Pool {
                 .map(|(id, _)| id.clone());
             match victim {
                 Some(id) => {
-                    sessions.remove(&id);
+                    if let Some(mut live) = sessions.remove(&id) {
+                        let _ = live.child.start_kill();
+                        tokio::spawn(async move {
+                            let _ = live.child.wait().await;
+                        });
+                    }
                 }
                 None => break,
             }
