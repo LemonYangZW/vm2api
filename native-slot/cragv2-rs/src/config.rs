@@ -59,11 +59,15 @@ pub struct KernelConfig {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
-/// 每个常驻会话的官方 CLI 内存预算（上游实测约 280 MB，见 issue #1092）。
-/// 留出余量取 320 MB，并把内核自身与面板探测算进固定开销。
-pub const SESSION_MEMORY_BUDGET: u64 = 320 * 1024 * 1024;
-/// 内核自身 + 运行时杂项预留。
-pub const KERNEL_RESERVE: u64 = 192 * 1024 * 1024;
+/// 每个常驻会话的官方 CLI 内存预算。
+///
+/// 基准来自上游确认：**一个槽位跑满 CRAG（20 会话）大约要 5 GiB**
+/// （20 × 256 MiB = 5 GiB）。上游 issue #1092 实测单会话约 280 MB，
+/// 我们取 256 MiB 并**不再额外预留**：内核自身空闲只有 1.7 MB（实测），
+/// 余量应当留在每会话预算里，否则 5 GiB 会推导出 17 个会话，与上游结论对不上。
+pub const SESSION_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+/// 内核自身 + 运行时杂项固定预留（实测空闲 1.7 MB，取 0 让基准与 5 GiB 对齐）。
+pub const KERNEL_RESERVE: u64 = 0;
 
 /// 容器内存上限（cgroup v2 `memory.max`，回落 v1 `memory/memory.limit_in_bytes`）。
 /// 返回 `None` 表示无限制/读不到。
@@ -370,10 +374,11 @@ mod tests {
 
     #[test]
     fn session_slots_never_exceed_cgroup_capacity() {
-        // 2 GiB 容器：预留 192 MB 后 / 320 MB 预算 = 5 个会话（配置写 20 也只能用 5）。
-        assert_eq!(capacity_from_limit(2 * 1024 * 1024 * 1024), 5);
-        // 512 MiB 连一个都放不下，也要保底 1（不能启动 0 个会话）。
-        assert_eq!(capacity_from_limit(512 * 1024 * 1024), 1);
+        // 校准基准：5 GiB 容器刚好放满 20 个会话（上游确认的一槽 5G）。
+        assert_eq!(capacity_from_limit(5 * 1024 * 1024 * 1024), 20);
+        // 2 GiB 容器 -> 8 个会话；512 MiB -> 2 个。
+        assert_eq!(capacity_from_limit(2 * 1024 * 1024 * 1024), 8);
+        assert_eq!(capacity_from_limit(512 * 1024 * 1024), 2);
         // 上限与本文件 slots() 的 20 对齐。
         let mut config = KernelConfig::default();
         config.extra.insert("session_slots".into(), serde_json::json!(128));
