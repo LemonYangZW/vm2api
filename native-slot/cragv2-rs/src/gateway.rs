@@ -219,6 +219,10 @@ impl GatewayState {
                 "slot"
             },
             "worker_version": VERSION,
+            // 1.4.139 起面板认这个字段：进程池按需 spawn，空闲时 cli_pid=0 也算健康
+            // （rust-kernel-supervisor.mjs: cli_pid > 0 || execution_mode === 'v2_process_pool'）。
+            // 不报的话面板会认为内核"没起来"，反复重启槽位。
+            "execution_mode": if self.native.is_some() { "v2_process_pool" } else { "single_process" },
             "healthy": alive,
             "ready_slots": ready,
             "closed_slots": closed,

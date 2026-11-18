@@ -1711,3 +1711,50 @@ C  creation=265   read=17252   2s     ← 缓存完整命中，只新增 265 tok
    这次是我在 .67 上违反了自己的规矩）。
 
 **代价**：中转方若再判定一次，可能升级为账号级限制；这个账号是用户的付费通道，不该被我的探针消耗。
+
+### 16.22 跟进上游 1.4.142（沙盒 .67）
+
+**结论**：仅生成 1.4.139 的健康判定契约要补一个字段；其余无需动内核。
+
+| 项 | 变化 |
+| :--- | :--- |
+| 版本 | `main` 1.4.136 → **1.4.142**（ff-only，7 个 tag） |
+| 载荷 | `payload-2026.11.18-crag-3.1.5`（CRAG 3.1.4 → 3.1.5） |
+| CLI | 仍是 `claude-code-2.1.321` → **出站身份不变**，无需改 UA/客户端版本 |
+| `/internal/*` | 无新增/变更 |
+| 面板侧 | `convert.mjs` / `handle-protocol.mjs` / `go-worker-client.mjs` 等大改，属请求组装，内核不做请求 → 不处理 |
+| 健康判定 | `rust-kernel-supervisor.mjs`：`cli_pid > 0 \|\| health.execution_mode === 'v2_process_pool'` |
+
+**唯一内核改动**：`/internal/health` 增报 `"execution_mode": "v2_process_pool"`（native 模式）。
+原生模式空闲时本就没有 CLI 进程（`cli_pid: null`），不报这个字段面板会认为内核没起来、反复重启槽位。
+
+**补丁锚点**：`crag-license.mjs` / `crag-subscription.mjs` / `docker-slot-memory.mjs` 三个锚点全部命中，
+补丁内容与 1.4.136 完全一致（`git diff patches/` 为空，行号未变）。顺手修了
+`tools/panel-patches.mjs` 里 0003 的 `to` 字段——之前 heredoc 把 `\n` 吃成了真换行，工具本身语法错误跑不起来。
+
+**部署（.67 特有）**：docker daemon 连不上 GHCR（EOF）→ 本机 `docker pull` 后
+`docker save | gzip | ssh 'gunzip | docker load'`（1.65GB，41 秒）。升级面板后
+厂商载荷会覆盖 `share/crag/kernels/v2/amd64/crag-v2`，需重新投放我们的二进制 + 两个 manifest。
+
+**验证（本地，不打真实推理）**：
+
+```
+面板 VERSION           1.4.142            ✔
+面板 /                 200                ✔
+槽位 vm-crag-01        running            ✔
+env 覆盖               CRAG_ACTIVATION_URL / CRAG_SUBSCRIPTION_ORIGIN → 127.0.0.1:8099  ✔
+内核两侧哈希          448c85fe（源树 = 槽位）                                    ✔
+/internal/health       healthy:true, execution_mode:v2_process_pool, cli_pid:null ✔
+```
+
+**未解决的：宿主席位（available_seats=0）**
+
+面板的宿主身份走 `/run/crag-host-machine-id`，且要求该挂载的 **statfs 类型** 在
+`SHARED_HOST_ID_FILESYSTEMS`（NFS/FUSE 等共享 fs）白名单里；`.67` 根分区是 ext4，
+bind mount 会被 `readOnlySharedHostId()` 直接拒掉 → 身份不可用 → 席位恒为 0，
+订阅状态停在 `unredeemed`（不影响已有设备授权的槽位，有效期到 2027-11）。
+
+试过用 `mint-host-entitlement.mjs` 以宿主 machine-id 直接落盘，结果订阅变成
+`state:"unavailable"`（面板自算的 host_id 与我们的不一致，校验抛异常）。已回滚到
+`unredeemed` 基线。**要恢复 10 席位，得让面板自己能算出 host_id**（给它挂共享 fs 上的
+machine-id），而不是从外面塞文件。

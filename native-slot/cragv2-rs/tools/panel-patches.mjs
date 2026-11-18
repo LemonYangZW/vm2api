@@ -56,18 +56,14 @@ const EDITS = [
     file: 'src/lib/vm/docker-slot-memory.mjs',
     marker: '宿主不支持 swap 限额时 Docker 只报 swapBytes=-1',
     from: '  if (observed.bytes !== requestedBytes || observed.swapBytes !== requestedBytes) {',
-    to:
-      '  // 宿主不支持 swap 限额时 Docker 只报 swapBytes=-1（视为无上限）；该宿主本身没有
-' +
-      '  // swap，等价于"禁用 swap"，因此不再判为分歧，否则内存永远改不动。
-' +
-      '  if (
-' +
-      '    observed.bytes !== requestedBytes ||
-' +
-      '    (observed.swapBytes !== requestedBytes && observed.swapBytes !== -1)
-' +
+    to: [
+      '  // 宿主不支持 swap 限额时 Docker 只报 swapBytes=-1（视为无上限）；该宿主本身没有',
+      '  // swap，等价于"禁用 swap"，因此不再判为分歧，否则内存永远改不动。',
+      '  if (',
+      '    observed.bytes !== requestedBytes ||',
+      '    (observed.swapBytes !== requestedBytes && observed.swapBytes !== -1)',
       '  ) {',
+    ].join('\n'),
   },
 ]
 
