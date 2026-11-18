@@ -563,17 +563,12 @@ async fn handle_conn(mut stream: Stream, state: Arc<GatewayState>) -> std::io::R
             respond(&mut stream, 200, "application/json", br#"{"ok":true}"#, &[]).await
         }
         ("GET", "/internal/identity") => {
-            // 只回本地身份：没有任何字段会被转发给上游。
+            // 面板把这里的字段合进 VM 指纹（guest-identity.mjs::mergeGuestFingerprint
+            // + normalizeGuestHardware）。客户机事实必须真实采集，不能只报内核自述——
+            // 之前只回 worker 自述，面板那边的 hostname/kernel/os/硬件全是 null。
             let payload = json!({
                 "ok": true,
-                "identity": {
-                    "runtime_kind": "docker",
-                    "dataplane": state.dataplane,
-                    "worker_version": VERSION,
-                    "hop_mode": if state.tui.is_some() { "tui" } else if state.native.is_some() { "native" } else if state.upstream.is_some() { "direct" } else { "slot" },
-                    "device_id": identity::Identity::load().device_id_hint(),
-                    "sessions": state.native.as_ref().map(|p| p.stats_now()).unwrap_or((0, 0)),
-                }
+                "identity": guest_identity(state.as_ref()),
             });
             respond(
                 &mut stream,
@@ -690,6 +685,114 @@ async fn handle_conn(mut stream: Stream, state: Arc<GatewayState>) -> std::io::R
         }
         _ => respond(&mut stream, 404, "application/json", br#"{"ok":false,"error":"not_found"}"#, &[]).await,
     }
+}
+
+
+/// 从容器内部读客户机事实（不联网、不 spawn）。面板只用这些字段做指纹，
+/// 多给的键它不读，不构成额外出站面。
+fn guest_identity(state: &GatewayState) -> Value {
+    fn read(path: &str) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+    fn os_release(key: &str) -> Option<String> {
+        let text = read("/etc/os-release")?;
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .map(|v| v.trim_matches('"').to_string())
+    }
+    fn cpuinfo(field: &str) -> Option<String> {
+        let text = read("/proc/cpuinfo")?;
+        text.lines()
+            .find_map(|line| line.split_once(':').filter(|(k, _)| k.trim() == field))
+            .map(|(_, v)| v.trim().to_string())
+    }
+
+    let cpu_cores = read("/proc/cpuinfo")
+        .map(|t| t.lines().filter(|l| l.starts_with("processor")).count() as u64)
+        .filter(|n| *n > 0);
+    let memory_bytes = read("/proc/meminfo")
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| v.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()))
+        })
+        .map(|kb| kb * 1024);
+    let root_disk = read("/proc/mounts")
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let dev = it.next()?;
+                    let mnt = it.next()?;
+                    (mnt == "/").then(|| dev.to_string())
+                })
+        });
+    let mac = std::fs::read_dir("/sys/class/net")
+        .ok()
+        .and_then(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter(|e| e.file_name() != "lo")
+                .find_map(|e| read(&format!("{}/address", e.path().display())))
+        });
+    let dmi = json!({
+        "sys_vendor": read("/sys/class/dmi/id/sys_vendor"),
+        "product_name": read("/sys/class/dmi/id/product_name"),
+        "product_uuid": read("/sys/class/dmi/id/product_uuid"),
+        "board_name": read("/sys/class/dmi/id/board_name"),
+    });
+    let package_managers = ["apt", "dnf", "apk", "pacman", "yum"]
+        .iter()
+        .filter(|pm| ["/usr/bin/", "/bin/", "/sbin/"].iter().any(|d| std::path::Path::new(&format!("{d}{pm}")).exists()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+
+    json!({
+        "runtime_kind": state
+            .config
+            .as_ref()
+            .and_then(|c| c.extra.get("runtime_kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("docker"),
+        "worker_version": VERSION,
+        "hop_mode": if state.tui.is_some() { "tui" } else if state.native.is_some() { "native" } else { "direct" },
+        "dataplane": state.dataplane,
+        "device_id": identity::Identity::load().device_id_hint(),
+        "session_id": Value::Null,
+        "machine_id": read("/etc/machine-id"),
+        "hostname": read("/proc/sys/kernel/hostname"),
+        "os_id": os_release("ID"),
+        "os_pretty": os_release("PRETTY_NAME"),
+        "os_version": os_release("VERSION_ID"),
+        "kernel_release": read("/proc/sys/kernel/osrelease"),
+        "arch": std::env::consts::ARCH,
+        "goos": std::env::consts::OS,
+        "timezone": read("/etc/timezone"),
+        "locale": std::env::var("LANG").ok(),
+        "shell": std::env::var("SHELL").ok(),
+        "user_agent": crate::protocol::identity::user_agent(),
+        // 面板读的是**嵌套** `identity.hardware`（guest-identity.mjs:139
+        // `guest.hardware != null ? normalizeGuestHardware(guest.hardware)`）；
+        // 平铺的 cpu_model 之类它根本不看。
+        "hardware": {
+            "cpu_model": cpuinfo("model name"),
+            "cpu_cores": cpu_cores,
+            "memory_bytes": memory_bytes,
+            "root_disk": root_disk,
+            "mac": mac,
+            "dmi": dmi,
+            "shell": std::env::var("SHELL").ok(),
+            "package_managers": if package_managers.is_empty() { Value::Null } else { Value::String(package_managers) },
+            "observed_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        },
+        "sessions": state.native.as_ref().map(|p| p.stats_now()).unwrap_or((0, 0)),
+    })
 }
 
 /// 上游 1.4.133 起的遥测契约：确认原生遥测启动策略。

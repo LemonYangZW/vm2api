@@ -2019,3 +2019,60 @@ models   {"ok":true,"status":200,"body":{"object":"list","data":[{"id":"claude-f
 **教训（写进方法论）**：清点契约面时，"HTTP 路由"只是其中一层。还有
 ① exec 子命令（`oauth <op>`、`--license-capabilities`）；② 环境变量；③ 配置文件键。
 三层都要数，只数一层就会像这次一样，面板的可见功能一直静默失败而不报错。
+
+### 16.31 第五轮：逐端点核对"面板读什么 / 我们给什么"
+
+这一轮不再数键，而是把**每个我们实现的端点**对应的**面板读取代码**翻出来对：
+
+| 端点 | 面板读的 | 我们的实现 | 结论 |
+| :--- | :--- | :--- | :--- |
+| `/internal/v1/telemetry/apply` | `body.applied/enabled/scope/upload_confirmed` | 全都有 | ✅ 早就对齐 |
+| `/internal/v1/cancel` | 只 `.resume()` 排空，不读 body | `{"ok":true}` | ✅ |
+| `/internal/forward` | api-kernel-client 用 | 有 | ✅（非本通路） |
+| 响应头 `x-usage` / `x-model` / `x-stop-reason` | `streamMetaFromHeaders()` 解析 | 未发 | ✅ 可选——面板自己从 SSE 组装 `assembler.message`，这三个头只是捷径 |
+| `/internal/identity` | **客户机指纹**（见下） | 原来只回内核自述 | ❌ **实质错** |
+
+**`/internal/identity` 的真问题**：面板把它当作**客户机事实**用：
+
+```js
+const guest = res.body?.identity && typeof res.body.identity === 'object' ? res.body.identity : res.body
+current.fingerprint = mergeGuestFingerprint(current.fingerprint, guest)
+const guestHw = guest.hardware != null ? normalizeGuestHardware(guest.hardware) : null
+```
+
+要的是 `hostname / os_id / os_pretty / kernel_release / arch / goos / machine_id /
+timezone / locale / device_id`，**外加嵌套的 `hardware` 对象**（`cpu_model`、`cpu_cores`、
+`memory_bytes`、`root_disk`、`mac`、`dmi`、`shell`、`package_managers`）。
+我们原来只回 `runtime_kind/dataplane/worker_version/hop_mode/device_id/sessions`——
+面板那边 hostname / os / 内核 / 硬件**全是 null**。
+
+**改法**（`773769f9`）：容器内真实采集，不联网、不 spawn：
+
+| 来源 | 字段 |
+| :--- | :--- |
+| `/proc/sys/kernel/hostname`、`osrelease` | `hostname`、`kernel_release` |
+| `/etc/os-release`（ID / PRETTY_NAME / VERSION_ID） | `os_id`、`os_pretty`、`os_version` |
+| `/etc/machine-id`、`/etc/timezone`、`LANG` | `machine_id`、`timezone`、`locale` |
+| `/proc/cpuinfo` | `cpu_model`、`cpu_cores` |
+| `/proc/meminfo` MemTotal | `memory_bytes` |
+| `/proc/mounts`（挂 `/` 的设备） | `root_disk` |
+| `/sys/class/net/*/address`（跳过 lo） | `mac` |
+| `/sys/class/dmi/id/*` | `dmi.{sys_vendor,product_name,product_uuid,board_name}` |
+| `/usr/bin`、`/bin`、`/sbin` 探测 | `package_managers` |
+
+**踩到的第二个坑（同一轮内）**：先写成**平铺** `cpu_model`，面板仍拿不到——它只读
+**嵌套** `identity.hardware`。改成嵌套后才有值。
+
+**实测**（槽内 `curl /internal/identity`）：
+
+```
+cpu: Intel(R) Xeon(R) Silver 4210R CPU @ 2.40GHz | cores: 32 | mem_GB: 62.9
+mac: 2e:1c:d3:d1:12:50 | root: overlay | pm: apt | dmi_vendor: VMware, Inc.
+```
+
+面板侧 `POST /api/panel/vms/vm-crag-01/collect-identity` 现在拿到
+`hostname=ms-7851-c7c21f`、`os_pretty=Ubuntu 24.04.5 LTS`、`guest_machine_id=...`。
+
+**但 `fingerprint.hardware` 仍是 `i3-4170 / 4 GiB`**——不是我们没给，是面板的
+`applyOfficialFingerprintToVm` 有意用"像真人的"官方档位覆盖（Xeon 32 核 62 GB + VMware DMI
+是明确的数据中心特征）。这层由面板决定，我们负责如实上报。
