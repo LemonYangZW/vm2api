@@ -475,6 +475,12 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(addr) = config.tcp_listen.as_deref() {
+        match cragv2::gateway::serve_tcp(addr, bound.clone()).await {
+            Ok(bound) => eprintln!("[crag] tcp listen: {bound}"),
+            Err(error) => eprintln!("[crag] tcp listen {addr}: {error}"),
+        }
+    }
     eprintln!(
         "[crag] {VERSION} listening on {} (slots={slots}, cli_pid={:?}, dataplane={})",
         bound.display(),

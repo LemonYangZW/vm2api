@@ -36,6 +36,8 @@ pub struct KernelConfig {
     /// hop 模式：`direct`（自控 h2/TLS，crag v2 原生形态）或 `slot`（交给槽位 CLI）。
     #[serde(default)]
     pub upstream_mode: Option<String>,
+    /// 额外 TCP 监听（`host:port`）；供同网段标准客户端直连，默认关闭。
+    pub tcp_listen: Option<String>,
     /// 自定义根证书（企业代理 / 私有网关）；缺省用系统根证书。
     #[serde(default)]
     pub upstream_ca: Option<String>,

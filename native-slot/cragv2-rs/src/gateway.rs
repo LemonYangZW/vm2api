@@ -276,6 +276,37 @@ pub async fn serve(path: impl AsRef<Path>, state: Arc<GatewayState>) -> std::io:
     Ok(bound)
 }
 
+/// 额外监听一个 TCP 端口，把连接**字节级桥接**到内核自己的 UDS。
+///
+/// 为什么这样而不是复用 handler：`Stream` 在 Unix 下是 `UnixStream`，
+/// handler 的整条签名都按它写死了。桥接只做 `copy_bidirectional`，
+/// 不用改动任何请求处理逻辑，也不引入平台条件编译。
+pub async fn serve_tcp(
+    addr: &str,
+    socket: std::path::PathBuf,
+) -> std::io::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(mut unix) => {
+                        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut unix).await;
+                    }
+                    Err(error) => eprintln!("[crag] tcp bridge: {error}"),
+                }
+            });
+        }
+    });
+    Ok(bound)
+}
+
 /// 非 Unix 平台：同名接口走本机 TCP（`KIN_KERNEL_TCP`，默认 `127.0.0.1:0`），
 /// 返回实际监听地址，便于离线联调。
 #[cfg(not(unix))]
@@ -620,12 +651,20 @@ fn telemetry_apply_response(enabled: bool) -> (u16, Value) {
 }
 
 fn authorized(state: &GatewayState, headers: &HashMap<String, String>) -> bool {
+    // 内部调用用 x-kin-internal-token；标准 Anthropic 客户端只会带 x-api-key 或
+    // Authorization: Bearer，故把它们当作同一凭据的别名，直连时也有可用形式。
     let Some(expected) = state.token.as_deref() else {
         return true;
     };
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")));
     headers
         .get("x-kin-internal-token")
-        .or_else(|| headers.get("x-internal-token"))
+        .map(String::as_str)
+        .or_else(|| headers.get("x-internal-token").map(String::as_str))
+        .or_else(|| headers.get("x-api-key").map(String::as_str))
+        .or(bearer)
         .is_some_and(|value| value == expected)
 }
 
@@ -2120,3 +2159,32 @@ mod tests {
         host.close().await;
     }
 }
+
+    /// 认证只看凭据本身，抽成纯函数便于不构造整个网关状态。
+    fn token_matches(token: Option<&str>, headers: &HashMap<String, String>) -> bool {
+        let Some(expected) = token else { return true };
+        let bearer = headers
+            .get("authorization")
+            .and_then(|value| value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")));
+        headers
+            .get("x-kin-internal-token")
+            .map(String::as_str)
+            .or_else(|| headers.get("x-internal-token").map(String::as_str))
+            .or_else(|| headers.get("x-api-key").map(String::as_str))
+            .or(bearer)
+            .is_some_and(|value| value == expected)
+    }
+
+    #[test]
+    fn accepts_standard_anthropic_auth_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("x-api-key".to_string(), "tok".to_string());
+        assert!(token_matches(Some("tok"), &headers), "x-api-key 应可作为凭据");
+        headers.clear();
+        headers.insert("authorization".to_string(), "Bearer tok".to_string());
+        assert!(token_matches(Some("tok"), &headers), "Bearer 应可作为凭据");
+        headers.clear();
+        headers.insert("x-api-key".to_string(), "wrong".to_string());
+        assert!(!token_matches(Some("tok"), &headers), "错误凭据必须拒绝");
+        assert!(token_matches(None, &headers), "未配置 token 时不校验");
+    }

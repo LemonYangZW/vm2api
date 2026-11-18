@@ -1449,3 +1449,39 @@ CLI 选择压缩而不是报错——上下文从 **867 K 塌回 168 K**（摘�
 `native.rs::last_user_content` 的注释写"会话由 CLI 自己维护"，但实测 CLI 并未维护，
 所以 native 通路目前是"每轮独立"。这也是 `provider: local_cli` 暂不自动切换为
 native 的原因（见 §16.12），已改为启动时显式告警。
+
+### 16.14 直连形态：内核对外暴露 TCP + 标准认证头（2026-11-17）
+
+临时形态（中转供货）需要**本地 Claude Code 直连槽位**，而内核原本只监听 UDS，
+且认证只认 `x-kin-internal-token` —— 标准 Anthropic 客户端两样都满足不了。
+
+改动两处：
+
+1. **认证头别名**：`authorized()` 除 `x-kin-internal-token` / `x-internal-token` 外，
+   也接受 `x-api-key` 与 `Authorization: Bearer <token>`，
+   这样 `ANTHROPIC_API_KEY` 直接填内核 token 即可（单测 `accepts_standard_anthropic_auth_headers`）。
+2. **可选 TCP 监听**（配置 `tcp_listen: "0.0.0.0:18787"`，默认关闭）：
+   TCP 连接**字节级桥接**到内核自己的 UDS（`copy_bidirectional`）。
+   没有让 TCP 复用 handler 的原因是 `Stream` 在 Unix 下就是 `UnixStream`，
+   handler 全链路按它写死；桥接不动任何请求逻辑，也不需要条件编译。
+
+链路（临时形态）：
+
+```
+本地 Claude Code → http://<宿主>:18787 → (DNAT) → 容器 bridge IP:18787
+   → 字节桥接 → /run/kin/kernel.sock → 内核(native) → 官方 CLI → 中转
+```
+
+实测：
+
+```
+宿主 → 容器 IP:18787（x-api-key=内核 token）→ message_start，model=claude-haiku-5-5 ✔
+另一容器 → 192.168.1.x:18787/internal/health → 401（DNAT 生效，缺 token）✔
+```
+
+**已知限制（临时形态可接受，转为真实账号后应重新评估）**：
+
+- native 通路不续传历史（§16.13），多轮对话会丢上下文；
+- 绕过面板的配额/统计/多槽调度，仅适合单槽自用；
+- 容器 `bridge` 网卡是手工附加的，面板重建容器会丢失；
+- `tcp_listen` 写在内核配置里，DNAT 规则在 iptables 里，两者都不随面板迁移。
