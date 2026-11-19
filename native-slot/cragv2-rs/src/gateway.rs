@@ -206,6 +206,20 @@ impl GatewayState {
             }
             (None, pid) => (pid, (0usize, 0usize), Vec::new()),
         };
+        // TUI 模式也会建 native 池（MCP 桥要用），所以必须优先报 tui，
+        // 否则面板会看到 hop_mode=native 而实际走的是 PTY。
+        let hop_mode = if self.tui.is_some() {
+            "tui"
+        } else if self.native.is_some() {
+            "native"
+        } else if self.upstream.is_some() {
+            "direct"
+        } else {
+            "slot"
+        };
+        let provider = if self.tui.is_some() || self.native.is_some() { "local_cli" } else { "http" };
+        let inflight = self.inflight.load(std::sync::atomic::Ordering::Relaxed);
+        let config = self.config.as_deref();
         json!({
             "ok": alive,
             "engine": "rust",
@@ -218,17 +232,7 @@ impl GatewayState {
                 .unwrap_or(self.slots as usize),
             "dataplane": self.dataplane,
             "runtime_variant": "crag-v2",
-            // TUI 模式也会建 native 池（MCP 桥要用），所以必须优先报 tui，
-            // 否则面板会看到 hop_mode=native 而实际走的是 PTY。
-            "hop_mode": if self.tui.is_some() {
-                "tui"
-            } else if self.native.is_some() {
-                "native"
-            } else if self.upstream.is_some() {
-                "direct"
-            } else {
-                "slot"
-            },
+            "hop_mode": hop_mode,
             "worker_version": VERSION,
             // 面板按这些能力位决定是否走对应流程（rust-kernel-client.mjs）：
             //   crag_telemetry_apply_v1 → 才会调 /internal/v1/telemetry/apply
@@ -236,12 +240,18 @@ impl GatewayState {
             // 面板会读 health.capabilities（数组）来决定一堆行为是否启用
             // （go-worker-client.mjs / crag-print-prompt.mjs 里十几处 includes 检查）。
             // 只报**我们确实实现**的：与厂商 manifest 的声明集一致。
+            // `prompt_append` / `prompt_replace`：面板 `gateCragBody` 用
+            // `health.capabilities.includes("prompt_" + mode)` 决定保不保留 `crag_prompt`，
+            // 而 `prepareCragPrintBody` 又无条件删掉 `body.system`。不声明这两个位，
+            // 调用方的 system 在面板侧就被永久丢弃（不是样式问题，是内容丢失）。
             "capabilities": [
                 "official_full",
                 "zero",
                 "cancel",
                 "telemetry",
                 "unix_socket_envelope",
+                "prompt_append",
+                "prompt_replace",
             ],
             "crag_telemetry_apply_v1": true,
             "gateway_policy_v1": true,
@@ -262,17 +272,43 @@ impl GatewayState {
             "slots_per_worker": slots,
             "cli_pid": pid,
             "recovering": false,
-            "provider": if self.tui.is_some() || self.native.is_some() { "local_cli" } else { "http" },
-            "active": self.inflight.load(std::sync::atomic::Ordering::Relaxed),
-            "waiting": sessions
-                .0
-                .saturating_sub(self.inflight.load(std::sync::atomic::Ordering::Relaxed)),
+            "provider": provider,
+            "active": inflight,
+            "waiting": sessions.0.saturating_sub(inflight),
             "queued": sessions.1,
             "pids": pids,
             "cli_restarts": 0,
+            // 面板 `rust-kernel-supervisor.mjs:668-671` 只在
+            // `prewarm_enabled` 是布尔且 active/waiting/active_requests/queued/cleaning
+            // 全是整数时才走精确占用分支；缺一个就退回保守估算（容易误判“忙”）。
+            "active_requests": inflight,
+            "cleaning": 0,
+            "prewarm_enabled": false,
+            // `kernelSlotsDiffer` 拿它和配置里的槽位数收敛；不报就永远不收敛。
+            "capacity": slots,
+            // 只放非敏感项：token / 代理地址 / 凭据路径一律不进这个对象。
+            "effective_config": {
+                "dataplane": self.dataplane,
+                "hop_mode": hop_mode,
+                "provider": provider,
+                "slots_per_worker": slots,
+                "vm_id": config
+                    .and_then(|c| c.extra.get("vm_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                "upstream_base": config.and_then(|c| c.upstream_base.clone()).unwrap_or_default(),
+                "persona_preset": config.and_then(|c| c.persona_preset.clone()).unwrap_or_default(),
+                "proxy": config.and_then(|c| c.proxy_url.as_ref()).is_some(),
+            },
+            // 授权闸在控制面（自签包 + 面板准入），内核侧不设门。
+            // 面板 `crag-runtime-inventory.mjs:51` 要求 `=== true` 才认为槽位 reachable，
+            // 不报或报 false 会让这个槽在所有运行时盘点里变成 unknown。
+            "license_valid": true,
             "telemetry_ready": false,
             "telemetry": Value::Null,
             "vm_telemetry": Value::Null,
+            // 3.1.6 的原生遥测内容我们还没做，**不声明**——声明了面板就会当真。
+            "crag_telemetry_content_v1": false,
         })
     }
 }
@@ -318,6 +354,7 @@ pub async fn serve(path: impl AsRef<Path>, state: Arc<GatewayState>) -> std::io:
 /// 为什么这样而不是复用 handler：`Stream` 在 Unix 下是 `UnixStream`，
 /// handler 的整条签名都按它写死了。桥接只做 `copy_bidirectional`，
 /// 不用改动任何请求处理逻辑，也不引入平台条件编译。
+#[cfg(unix)]
 pub async fn serve_tcp(
     addr: &str,
     socket: std::path::PathBuf,
@@ -1311,6 +1348,17 @@ async fn stream_tui(
     .await
 }
 
+/// `crag_prompt.mode` / `persona_preset` 决定 `--system-prompt` 还是 `--append-system-prompt`
+/// （上游 `crag-print-prompt.mjs::mode`：`zero` → replace，`official_full` → append）。
+/// 这个判断与“是否带客户端工具”无关：无工具请求也必须能 replace。
+fn system_replace_mode(
+    directive: Option<&Value>,
+    config: Option<&crate::config::KernelConfig>,
+) -> bool {
+    directive.and_then(|d| d.get("mode")).and_then(|m| m.as_str()) == Some("replace")
+        || config.and_then(|c| c.persona_preset.as_deref()) == Some("zero")
+}
+
 /// 原生 CLI 通路：内核不拼请求，把本轮 user 消息交给官方 `claude`，
 /// 再把它的 `stream_event` 原样转成 SSE 回投控制面。
 ///
@@ -1481,21 +1529,14 @@ async fn forward_native(
             _ => crate::native::system_text(body),
         };
         let mut system = client_system.clone();
-        let mut replace_system = false;
         if has_client_tools {
-            // 上游只有 zero 预设才 replace（crag-print-prompt.mjs::mode），其余一律 append。
             let note = "\n\n# Tool routing\nEvery tool is exposed to you as an MCP tool named `mcp__crag__<Name>` (for example `mcp__crag__Bash`). When the instructions above mention a tool such as `Bash` or `Read`, call the corresponding `mcp__crag__*` tool; bare names are not available in this environment.";
-            replace_system = directive
-                .and_then(|d| d.get("mode"))
-                .and_then(|m| m.as_str())
-                == Some("replace")
-                // 面板的 persona_preset：`zero` 才 replace，其余（含 official_full）append。
-                || config.and_then(|c| c.persona_preset.as_deref()) == Some("zero");
             system = Some(match client_system {
                 Some(text) => format!("{text}{note}"),
                 None => note.trim_start().to_string(),
             });
         }
+        let replace_system = system_replace_mode(directive, config);
         let mut args = crate::native::Args {
             session_id: &key,
             mcp_config: None,
@@ -2414,7 +2455,33 @@ mod tests {
         assert_eq!(health["engine"], "rust");
         assert_eq!(health["ready_slots"], 3);
         assert_eq!(health["runtime_variant"], "crag-v2");
+        // 面板的运行时盘点/看门狗硬依赖这几项（crag-runtime-inventory、rust-kernel-supervisor）。
+        assert!(health["effective_config"].is_object(), "缺 effective_config 则 internalTokenAuthenticated 永远不为 true");
+        assert_eq!(health["license_valid"], true, "crag-runtime-inventory 要求 === true 才 reachable");
+        for key in ["active", "waiting", "active_requests", "queued", "cleaning"] {
+            assert!(health[key].is_i64() || health[key].is_u64(), "{key} 必须是整数");
+        }
+        assert!(health["prewarm_enabled"].is_boolean());
+        assert_eq!(health["capacity"], 3);
+        let caps = health["capabilities"].as_array().expect("capabilities 数组");
+        for cap in ["prompt_append", "prompt_replace"] {
+            assert!(caps.iter().any(|c| c == cap), "{cap} 不声明则面板会删掉 crag_prompt");
+        }
         host.close().await;
+    }
+
+    #[test]
+    fn crag_prompt_replace_does_not_require_client_tools() {
+        // 无工具路径也必须是 replace，否则 `--system-prompt` 退化成 append。
+        assert!(system_replace_mode(Some(&json!({"mode": "replace"})), None));
+        assert!(!system_replace_mode(Some(&json!({"mode": "append"})), None));
+        assert!(!system_replace_mode(None, None), "无指令、非 zero 预设必须 append");
+        let mut zero = crate::config::KernelConfig::default();
+        zero.persona_preset = Some("zero".into());
+        assert!(system_replace_mode(None, Some(&zero)));
+        let mut full = crate::config::KernelConfig::default();
+        full.persona_preset = Some("official_full".into());
+        assert!(!system_replace_mode(None, Some(&full)));
     }
 }
 

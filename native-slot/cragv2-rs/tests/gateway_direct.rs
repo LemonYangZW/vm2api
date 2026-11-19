@@ -131,7 +131,8 @@ async fn direct_hop_injects_billing_stamps_wire_and_streams() {
     let system = sent["system"].as_array().expect("billing 头应被注入 system");
     let text = system[0]["text"].as_str().unwrap();
     assert!(text.contains("x-anthropic-billing-header:"), "{text}");
-    assert!(text.contains("cc_version=2.1.303;"), "{text}");
+    // 版本号来自 `cragv2::VERSION`，升 CLI 版本时不必再改测试。
+    assert!(text.contains(&format!("cc_version={};", cragv2::VERSION)), "{text}");
     let stamped = text.split("cch=").nth(1).and_then(|r| r.get(..5)).unwrap().to_string();
     assert_ne!(stamped, "00000", "wire body must be stamped");
     let raw = serde_json::to_string(&sent).unwrap();

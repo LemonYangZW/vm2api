@@ -606,6 +606,8 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // 非 Unix 平台的 `serve` 本身就监听本机 TCP，不需要这条桥。
+    #[cfg(unix)]
     if let Some(addr) = config.tcp_listen.as_deref() {
         match cragv2::gateway::serve_tcp(addr, bound.clone()).await {
             Ok(bound) => eprintln!("[crag] tcp listen: {bound}"),
