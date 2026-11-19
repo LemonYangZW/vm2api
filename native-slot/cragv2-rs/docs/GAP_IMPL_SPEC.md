@@ -2099,6 +2099,7 @@ mac: 2e:1c:d3:d1:12:50 | root: overlay | pm: apt | dmi_vendor: VMware, Inc.
 | §16.29 "kernel.json 只有 7 键未读" | 实为 **13 键未读 + 4 键解析未消费**（漏判 `delivery_mode` `runtime_variant` `telemetry` `timezone` `system_layout` `cc_entrypoint`；`request_timeout_seconds` `default_cache_ttl` `cch_enabled` `crag_kernel_version` 只解析不消费） | 以 §CONTRACT_AUDIT §5.1 为准 |
 | "`x-terminal-state` 成功路径不发" | 非流式成功发 `verified`（`gateway.rs:1255,1309,1784,2013,2162`）；流式**不读**该头 | 不构成 gap |
 | "速率头缺失只影响显示" | `account-quota`/`rate-limit-service`/`quota-window`/`upstream-error-policy`（无头即 `crag_opaque_429 → stop`）/`failover-runner`/`retry-after` 都依赖 | **唯一需动手的功能缺口** |
+| 审计草稿：manifest 哈希写成 `dd1fad83…` | 那是 08:00 构建的二进制哈希（已被替换）；当前两棵树均为 `773769f9…` | 证据值已更正，见 `CONTRACT_AUDIT.md` §10 |
 
 另外两条与部署相关的事实（本文件其他节常被误读）：
 

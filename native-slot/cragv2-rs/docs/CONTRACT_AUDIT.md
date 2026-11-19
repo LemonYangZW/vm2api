@@ -18,7 +18,8 @@
 4. **推理通道当前未启用**：面板 `account: null`，`POST /v1/messages` 返回 503 `pool_unavailable`。
    此前所有"端到端验证"都是直连内核 TCP `18787`，不是面板路由。
 5. 配置层：`kernel.json` 41 键 = **24 键消费 / 4 键解析未消费 / 13 键未读**；
-   `worker.json` 18 键我们完全不读；环境变量面板注入 7 个，我们直接读 3 个。
+   `worker.json` 18 键我们完全不读；环境变量面板注入 7 个，我们读取 3 个
+   （`HOME` 间接、`LANG`/`TZ` 直接）。
 
 ---
 
@@ -174,7 +175,7 @@ POST /v1/messages (面板边缘)  → 503 {"error":{"code":"pool_unavailable","m
 | :--- | :--- | :--- | :--- |
 | `HOME` | `/home/kincli` | 间接（`protocol/identity.rs:96`、`tui.rs:170,205`） | 无 |
 | `CLAUDE_CONFIG_DIR` | `/home/kincli/.claude` | 否（子进程继承） | 无（`settings.json` 生效） |
-| `TZ` | `Asia/Shanghai` | 否 | **有（轻微）**：identity 报 `/etc/timezone`=`Etc/UTC` |
+| `TZ` | `Asia/Shanghai` | 是（系统提示，`protocol/system.rs:39`） | **有（轻微）**：identity 报 `/etc/timezone`=`Etc/UTC`，系统提示用 `Asia/Shanghai`（双来源） |
 | `LANG` | `en_US.UTF-8` | 是（`gateway.rs:774`） | 无 |
 | `KIN_VM_ID` | `vm-crag-01` | 否 | 无（`vm_id` 来自 kernel.json） |
 | `KIN_VM_NAME` | `crag-01` | 否 | 无 |
@@ -289,7 +290,7 @@ POST /v1/messages (面板边缘)  → 503 {"error":{"code":"pool_unavailable","m
 | 10 | 面板 `account: null` → 推理通道未启用 | 部署缺口 | 503 `pool_unavailable`；`account: null` | 是（若做端到端） | 小-中 | 真实消耗额度 |
 | 11 | 推理 admission（`licenseCheck` + `cragV2KernelActive`，`rust-kernel-client.mjs:29-36`）能否通过 | 未验证 | 代码存在、未触发 | 待验 | — | 可能被 license 拦下 |
 | 12 | `/internal/v1/codex/responses` 通道 | 已排除 | 仅 `isCodexVm` 槽位；我们回 404 `codex_unsupported` | — | — | — |
-| 13 | `TZ=Asia/Shanghai` 未反映到 identity `timezone`（报 `Etc/UTC`） | 不一致（轻微） | 容器 env 实测 vs `gateway.rs:774` | 可选是 | 小 | 指纹字段不一致 |
+| 13 | `TZ=Asia/Shanghai` 未反映到 identity `timezone`（报 `Etc/UTC`） | 不一致（轻微） | `gateway.rs:773` 读 `/etc/timezone` vs `protocol/system.rs:39` 读 `TZ` | 可选是 | 小 | 指纹与系统提示时区不一致 |
 
 ---
 
